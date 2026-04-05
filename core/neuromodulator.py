@@ -2,7 +2,7 @@ from collections import deque
 
 import numpy as np
 
-from config import NeuromodulatorConfig
+from .config import NeuromodulatorConfig
 
 
 class NeuromodulatorSystem:

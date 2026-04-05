@@ -80,9 +80,31 @@ class NeuromodulatorConfig:
 
 
 @dataclass(frozen=True, kw_only=True)
+class SequenceMemoryConfig:
+    """
+    Hyperparameters for temporal sequence learning.
+
+    learning_rate: Speed of temporal Hebbian weight updates.
+    decay:         Multiplicative decay applied after each update to prevent
+                   unbounded weight growth (applied per-step, so effective
+                   half-life ≈ -1/ln(decay) steps).
+    max_weight:    Hard ceiling for transition weights.
+    """
+    learning_rate: float = 0.01
+    decay: float = 0.999
+    max_weight: float = 1.0
+
+
+@dataclass(frozen=True, kw_only=True)
 class WorldModelConfig:
     """
     Hyperparameters for the World Model (internal environment simulator).
+
+    NOTE: This component uses gradient descent on MSE, which is not
+    biologically plausible.  In a fully SNN-based architecture, the world
+    model should be realised by higher cortical layers learning via
+    STDP / predictive coding.  Kept here as a functional approximation
+    for the MVP; replace with SNN-based prediction in future iterations.
 
     learning_rate: Gradient descent step for transition prediction weights.
     """

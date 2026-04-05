@@ -1,15 +1,15 @@
 import unittest
 import numpy as np
 
-from config import PredictiveCodingConfig
-from predictive_coding import PredictiveCodingLayer
+from core.config import PredictiveCodingConfig
+from core.predictive_coding import PredictiveCodingLayer
 
 
 class TestPredictiveCodingLayer(unittest.TestCase):
     """
     Unit tests for PredictiveCodingLayer.
 
-    Validates three core contracts:
+    Validates three neuro_mvp contracts:
       A) Prediction error arithmetic.
       B) ACh-gated bottom-up / top-down blending.
       C) Feedback weight shape, update, and state management.

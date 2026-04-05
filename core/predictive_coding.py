@@ -1,6 +1,7 @@
 import numpy as np
-from config import PredictiveCodingConfig
-from competitive_layer import CompetitiveLIFLayer
+from .config import PredictiveCodingConfig
+from .competitive_layer import CompetitiveLIFLayer
+from .spike_encoder import PoissonEncoder
 
 
 class PredictiveCodingLayer(CompetitiveLIFLayer):
@@ -30,6 +31,8 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         self.pc_config = config or PredictiveCodingConfig()
         super().__init__(num_inputs, num_neurons, self.pc_config)
 
+        self._encoder = PoissonEncoder()
+
         # Top-down feedback weights: this layer → layer below  (num_neurons × num_inputs)
         self.feedback_w: np.ndarray = np.random.uniform(
             0.0, 0.1, (num_neurons, num_inputs)
@@ -55,9 +58,12 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
 
         Steps:
           1. Compute signed prediction error  (actual − top-down prediction).
-          2. Build effective input as an ACh-weighted blend of raw signal and prediction.
-          3. Delegate to CompetitiveLIFLayer (LIF + k-WTA inhibition).
-          4. Update feedback weights: neurons that fired strengthen their
+          2. Build effective firing rate as an ACh-weighted blend of raw
+             signal and top-down prediction.
+          3. Convert the blended rate to binary Poisson spikes so that
+             the LIF layer and its STDP traces receive proper discrete events.
+          4. Delegate to CompetitiveLIFLayer (LIF + k-WTA inhibition).
+          5. Update feedback weights: neurons that fired strengthen their
              predictions for the positive-error input components.
 
         Args:
@@ -71,15 +77,20 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # 1. Prediction error: what surprised us at this level?
         self.prediction_error = pre_f32 - self.top_down_prediction
 
-        # 2. ACh-gated effective input
+        # 2. ACh-gated effective rate (continuous blend)
         #    High ACh  → lean on raw data;  Low ACh → lean on prior prediction
-        effective_input = (
+        blended_rate = (
             self.ach_level * pre_f32
-            + (1.0 - self.ach_level) * np.clip(self.top_down_prediction, 0.0, None)
-        ).astype(np.float32)
+            + (1.0 - self.ach_level) * np.clip(self.top_down_prediction, 0.0, 1.0)
+        )
 
-        # 3. Standard LIF + k-WTA integration
-        spikes = super().forward(effective_input)
+        # 3. Convert blended rate → binary spikes via Poisson encoding
+        #    This ensures the LIF layer receives proper discrete events,
+        #    keeping STDP trace bookkeeping (x_pre) physically correct.
+        effective_spikes = self._encoder.encode(np.clip(blended_rate, 0.0, 1.0))
+
+        # 4. Standard LIF + k-WTA integration
+        spikes = super().forward(effective_spikes)
 
         # 4. Feedback weight update (Hebbian predictive rule)
         #    Only the positive part of the error is learned — neurons should

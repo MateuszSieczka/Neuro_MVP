@@ -1,5 +1,5 @@
 import numpy as np
-from config import WorkingMemoryConfig
+from .config import WorkingMemoryConfig
 
 
 class WorkingMemoryModule:

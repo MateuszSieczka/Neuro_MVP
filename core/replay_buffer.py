@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -9,15 +9,19 @@ import numpy as np
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from neuron import LIFLayer
-    from world_model import WorldModel
-    from neuromodulator import NeuromodulatorSystem
+    from .neuron import LIFLayer
+    from .world_model import WorldModel
+    from .neuromodulator import NeuromodulatorSystem
 
 
 @dataclass
 class Experience:
     """
     Atomic unit of episodic memory.
+
+    Stores a full transition snapshot including per-layer eligibility traces,
+    allowing replay to restore the learning state of an entire layer hierarchy
+    (not just a single isolated layer).
 
     All arrays are deep-copied on construction so stored experiences are
     never aliased to the live network state.
@@ -26,14 +30,16 @@ class Experience:
     action: int                   # Integer action index executed
     reward: float                 # Extrinsic reward received
     next_state: np.ndarray        # Spike-rate representation after action
-    eligibility_traces: np.ndarray  # Snapshot of layer.e at this timestep
+    layer_traces: dict[str, np.ndarray]  # layer_name → eligibility trace snapshot
     prediction_error: np.ndarray  # World model error at this timestep
 
     def __post_init__(self) -> None:
         # Defensive copies — caller should not mutate stored experiences
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
-        self.eligibility_traces = self.eligibility_traces.copy()
+        self.layer_traces = {
+            name: trace.copy() for name, trace in self.layer_traces.items()
+        }
         self.prediction_error = self.prediction_error.copy()
 
 
@@ -52,8 +58,12 @@ class ReplayBuffer:
     three-factor STDP rule to correctly assign credit to the synapses that
     led to the outcome (and not merely followed it).
 
+    Multi-layer support:
+      Experiences store eligibility traces per named layer (layer_traces dict),
+      allowing sleep_phase to restore the full hierarchy's learning state during
+      consolidation — not just a single isolated layer.
+
     Design constraints:
-      - state_size must equal num_neurons of the layer passed to sleep_phase().
       - Buffer is a fixed-capacity FIFO (deque with maxlen). Oldest entries are
         silently dropped when capacity is exceeded.
     """
@@ -72,7 +82,7 @@ class ReplayBuffer:
         action: int,
         reward: float,
         next_state: np.ndarray,
-        eligibility_traces: np.ndarray,
+        layer_traces: dict[str, np.ndarray],
         prediction_error: np.ndarray,
     ) -> None:
         """
@@ -80,6 +90,14 @@ class ReplayBuffer:
 
         All arrays are copied internally — the caller may safely modify them
         after this call without corrupting stored data.
+
+        Args:
+            state:            State before action.
+            action:           Integer action index.
+            reward:           Extrinsic reward received.
+            next_state:       State after action.
+            layer_traces:     Dict mapping layer name → eligibility trace snapshot.
+            prediction_error: World model error at this timestep.
         """
         self._buffer.append(
             Experience(
@@ -87,7 +105,7 @@ class ReplayBuffer:
                 action=action,
                 reward=reward,
                 next_state=next_state,
-                eligibility_traces=eligibility_traces,
+                layer_traces=layer_traces,
                 prediction_error=prediction_error,
             )
         )
@@ -98,7 +116,7 @@ class ReplayBuffer:
 
     def sleep_phase(
         self,
-        layer: LIFLayer,
+        layers: dict[str, LIFLayer],
         world_model: WorldModel,
         neuromodulator: NeuromodulatorSystem,
         n_experiences: int | None = None,
@@ -107,14 +125,15 @@ class ReplayBuffer:
         Consolidate recent experience through reverse-order replay.
 
         For each replayed experience (latest → earliest):
-          1. Restore the stored eligibility traces into the layer.
+          1. Restore the stored eligibility traces into ALL matching layers
+             in the hierarchy (not just one isolated layer).
           2. Update the world model with the observed transition.
-          3. Apply a dopamine-weighted STDP update to the layer.
+          3. Apply a dopamine-weighted STDP update to each layer, using
+             the world model error as the third factor.
 
         Args:
-            layer:          The LIFLayer (or subclass) whose weights to update.
-                            Its num_neurons MUST equal the state_size used when
-                            experiences were collected.
+            layers:         Dict mapping layer name → LIFLayer (or subclass).
+                            Names must match those used in store().
             world_model:    WorldModel to refine during consolidation.
             neuromodulator: Source of dopaminergic modulation signal.
             n_experiences:  How many of the most recent experiences to replay.
@@ -135,17 +154,20 @@ class ReplayBuffer:
 
         # Hippocampal reverse replay: most recent experience first
         for exp in reversed(experiences):
-            # 1. Restore eligibility traces from this historical timestep
-            layer.e = exp.eligibility_traces.copy()
+            # 1. Restore eligibility traces for ALL layers in the hierarchy
+            for name, layer in layers.items():
+                if name in exp.layer_traces:
+                    layer.e = exp.layer_traces[name].copy()
 
             # 2. Update world model; get refined prediction error
             world_error = world_model.update(exp.state, exp.action, exp.next_state)
 
             # 3. Three-factor STDP: dopamine × eligibility × prediction error
-            #    Only positive reward drives potentiation; negative reward is
-            #    handled by sign of world_error (depression via negative dw).
-            m_t = neuromodulator.learning_rate_modulation * max(0.0, exp.reward)
-            layer.update_weights(m_t=m_t, pred_error=world_error)
+            #    Use signed reward (not max(0, reward)) so that negative rewards
+            #    can drive synaptic depression for aversive learning.
+            m_t = neuromodulator.learning_rate_modulation * exp.reward
+            for layer in layers.values():
+                layer.update_weights(m_t=m_t, pred_error=world_error)
 
             errors.append(world_model.prediction_error)
 

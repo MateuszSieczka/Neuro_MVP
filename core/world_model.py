@@ -1,6 +1,6 @@
 import numpy as np
 
-from config import WorldModelConfig
+from .config import WorldModelConfig
 
 
 class WorldModel:

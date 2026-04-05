@@ -1,15 +1,15 @@
 import unittest
 import numpy as np
 
-from config import WorkingMemoryConfig
-from working_memory import WorkingMemoryModule
+from core.config import WorkingMemoryConfig
+from core.working_memory import WorkingMemoryModule
 
 
 class TestWorkingMemoryModule(unittest.TestCase):
     """
     Unit tests for WorkingMemoryModule.
 
-    Validates four core contracts:
+    Validates four neuro_mvp contracts:
       A) ACh-controlled gate (open / closed routing).
       B) Hebbian lateral weight learning and no-self-connection invariant.
       C) Content tracking and state management.

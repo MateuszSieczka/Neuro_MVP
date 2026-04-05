@@ -1,6 +1,6 @@
 import numpy as np
-from config import KWTAConfig
-from neuron import LIFLayer
+from .config import KWTAConfig
+from .neuron import LIFLayer
 
 
 class CompetitiveLIFLayer(LIFLayer):
@@ -51,7 +51,7 @@ class CompetitiveLIFLayer(LIFLayer):
             self.last_winners = np.array([], dtype=np.int32)
             return
 
-            # 1. Ścisłe i STABILNE k-WTA
+        # 1. Strict and STABLE k-WTA
         sorted_indices = np.argsort(self.window_spike_counts, kind='stable')
         winner_indices = sorted_indices[-self.kwta_config.k_winners:]
 
@@ -74,6 +74,7 @@ class CompetitiveLIFLayer(LIFLayer):
 
         # 6. Zabezpieczenie fizyki błony przed "tarczą refrakcyjną"
         self.refrac_count[losers_mask] = 0
+
     def _reset_window(self) -> None:
         """Resets the spike counter for the next window."""
         self.window_spike_counts.fill(0)

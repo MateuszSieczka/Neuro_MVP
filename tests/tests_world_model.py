@@ -1,8 +1,8 @@
 import unittest
 import numpy as np
 
-from config import WorldModelConfig
-from world_model import WorldModel
+from core.config import WorldModelConfig
+from core.world_model import WorldModel
 
 
 class TestWorldModel(unittest.TestCase):

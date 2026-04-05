@@ -11,7 +11,14 @@ dependencies = [
     "matplotlib (>=3.10.8,<4.0.0)"
 ]
 
-
+[tool.poetry]
+packages = [{include = "core"}]
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["tests_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

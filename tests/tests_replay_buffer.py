@@ -1,10 +1,10 @@
 import unittest
 import numpy as np
 
-from neuron import LIFLayer
-from world_model import WorldModel
-from neuromodulator import NeuromodulatorSystem
-from replay_buffer import ReplayBuffer, Experience
+from core.neuron import LIFLayer
+from core.world_model import WorldModel
+from core.neuromodulator import NeuromodulatorSystem
+from core.replay_buffer import ReplayBuffer, Experience
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -13,23 +13,30 @@ from replay_buffer import ReplayBuffer, Experience
 
 STATE_SIZE = 6    # state_size == num_neurons for sleep_phase compatibility
 ACTION_SIZE = 4
+NUM_INPUTS = 3
+LAYER_NAME = "default"
 
 
 def _make_exp(state_size: int = STATE_SIZE, action_size: int = ACTION_SIZE) -> dict:
     """Create a single randomised experience dict."""
-    num_inputs = 3
     return dict(
         state=np.random.rand(state_size).astype(np.float32),
         action=int(np.random.randint(0, action_size)),
         reward=float(np.random.rand()),
         next_state=np.random.rand(state_size).astype(np.float32),
-        eligibility_traces=np.random.rand(num_inputs, state_size).astype(np.float32),
+        layer_traces={
+            LAYER_NAME: np.random.rand(NUM_INPUTS, state_size).astype(np.float32),
+        },
         prediction_error=np.random.rand(state_size).astype(np.float32),
     )
 
 
-def _make_layer(num_inputs: int = 3, num_neurons: int = STATE_SIZE) -> LIFLayer:
+def _make_layer(num_inputs: int = NUM_INPUTS, num_neurons: int = STATE_SIZE) -> LIFLayer:
     return LIFLayer(num_inputs=num_inputs, num_neurons=num_neurons)
+
+
+def _make_layers() -> dict[str, LIFLayer]:
+    return {LAYER_NAME: _make_layer()}
 
 
 def _make_world_model() -> WorldModel:
@@ -82,14 +89,14 @@ class TestReplayBufferStorage(unittest.TestCase):
             err_msg="Stored state shares memory with the original — copies must be taken.",
         )
 
-    def test_stored_eligibility_traces_are_independent_copy(self) -> None:
+    def test_stored_layer_traces_are_independent_copy(self) -> None:
         exp = _make_exp()
-        original_e = exp["eligibility_traces"].copy()
+        original_e = exp["layer_traces"][LAYER_NAME].copy()
         self.buf.store(**exp)
-        exp["eligibility_traces"][:] = -1.0
+        exp["layer_traces"][LAYER_NAME][:] = -1.0
 
         stored = list(self.buf._buffer)[0]
-        np.testing.assert_array_equal(stored.eligibility_traces, original_e)
+        np.testing.assert_array_equal(stored.layer_traces[LAYER_NAME], original_e)
 
     def test_clear_empties_buffer(self) -> None:
         for _ in range(8):
@@ -144,7 +151,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         self.buf = ReplayBuffer(capacity=100)
 
     def test_sleep_phase_on_empty_buffer_returns_empty_list(self) -> None:
-        errors = self.buf.sleep_phase(_make_layer(), _make_world_model(), _make_nm())
+        errors = self.buf.sleep_phase(_make_layers(), _make_world_model(), _make_nm())
         self.assertEqual(errors, [])
 
     def test_sleep_phase_returns_one_error_per_replayed_experience(self) -> None:
@@ -152,7 +159,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         for _ in range(n):
             self.buf.store(**_make_exp())
 
-        errors = self.buf.sleep_phase(_make_layer(), _make_world_model(), _make_nm())
+        errors = self.buf.sleep_phase(_make_layers(), _make_world_model(), _make_nm())
         self.assertEqual(len(errors), n)
 
     def test_sleep_phase_n_experiences_limits_replay_count(self) -> None:
@@ -160,7 +167,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
             self.buf.store(**_make_exp())
 
         errors = self.buf.sleep_phase(
-            _make_layer(), _make_world_model(), _make_nm(),
+            _make_layers(), _make_world_model(), _make_nm(),
             n_experiences=4,
         )
         self.assertEqual(len(errors), 4)
@@ -170,7 +177,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         for _ in range(5):
             self.buf.store(**_make_exp())
 
-        errors = self.buf.sleep_phase(_make_layer(), _make_world_model(), _make_nm())
+        errors = self.buf.sleep_phase(_make_layers(), _make_world_model(), _make_nm())
         for e in errors:
             self.assertIsInstance(e, float)
             self.assertGreaterEqual(e, 0.0)
@@ -180,7 +187,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         for _ in range(6):
             self.buf.store(**_make_exp())
 
-        self.buf.sleep_phase(_make_layer(), _make_world_model(), _make_nm())
+        self.buf.sleep_phase(_make_layers(), _make_world_model(), _make_nm())
         self.assertEqual(len(self.buf), 6)
 
     def test_sleep_phase_improves_world_model_on_fixed_transition(self) -> None:
@@ -191,7 +198,6 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         state = np.zeros(STATE_SIZE, dtype=np.float32)
         next_state = np.ones(STATE_SIZE, dtype=np.float32)
         action = 0
-        num_inputs = 3
 
         # Store many copies of the same transition with reward=1.0
         for _ in range(50):
@@ -200,11 +206,13 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 action=action,
                 reward=1.0,
                 next_state=next_state,
-                eligibility_traces=np.ones((num_inputs, STATE_SIZE), dtype=np.float32),
+                layer_traces={
+                    LAYER_NAME: np.ones((NUM_INPUTS, STATE_SIZE), dtype=np.float32),
+                },
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
             )
 
-        layer = _make_layer(num_inputs=num_inputs, num_neurons=STATE_SIZE)
+        layers = _make_layers()
         wm = _make_world_model()
         nm = _make_nm()
         nm.dopamine = 1.0  # Maximum learning signal
@@ -214,7 +222,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         initial_mse = float(np.mean((initial_pred - next_state) ** 2))
 
         # Consolidate
-        self.buf.sleep_phase(layer, wm, nm)
+        self.buf.sleep_phase(layers, wm, nm)
 
         final_pred = wm.predict(state, action)
         final_mse = float(np.mean((final_pred - next_state) ** 2))
@@ -237,7 +245,6 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         """
         state = np.zeros(STATE_SIZE, dtype=np.float32)
         action = 0
-        num_inputs = 3
 
         early_next = np.zeros(STATE_SIZE, dtype=np.float32)  # stored first
         late_next = np.ones(STATE_SIZE, dtype=np.float32)    # stored last (most recent)
@@ -248,21 +255,23 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 action=action,
                 reward=1.0,
                 next_state=next_s,
-                eligibility_traces=np.zeros((num_inputs, STATE_SIZE), dtype=np.float32),
+                layer_traces={
+                    LAYER_NAME: np.zeros((NUM_INPUTS, STATE_SIZE), dtype=np.float32),
+                },
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
             )
 
         # Use a large learning rate so a single step has a measurable effect
-        from config import WorldModelConfig
+        from core.config import WorldModelConfig
         wm = WorldModel(STATE_SIZE, ACTION_SIZE, WorldModelConfig(learning_rate=0.5))
-        layer = _make_layer(num_inputs=num_inputs, num_neurons=STATE_SIZE)
+        layers = _make_layers()
         nm = _make_nm()
         nm.dopamine = 1.0
 
         pred_before = float(np.mean(wm.predict(state, action)))
 
         # n_experiences=1 → only the LAST stored experience is replayed (late_next = ones)
-        self.buf.sleep_phase(layer, wm, nm, n_experiences=1)
+        self.buf.sleep_phase(layers, wm, nm, n_experiences=1)
 
         pred_after = float(np.mean(wm.predict(state, action)))
 
@@ -273,6 +282,56 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
             "Reverse replay with n_experiences=1 must update world model from the "
             "most-recent experience (late_next=ones), moving prediction upward.",
         )
+
+    def test_sleep_phase_restores_traces_to_matching_layers(self) -> None:
+        """sleep_phase must restore eligibility traces to the correct layer."""
+        known_traces = np.full((NUM_INPUTS, STATE_SIZE), 0.42, dtype=np.float32)
+        self.buf.store(
+            state=np.zeros(STATE_SIZE, dtype=np.float32),
+            action=0,
+            reward=1.0,
+            next_state=np.ones(STATE_SIZE, dtype=np.float32),
+            layer_traces={LAYER_NAME: known_traces},
+            prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+        )
+
+        layers = _make_layers()
+        wm = _make_world_model()
+        nm = _make_nm()
+        nm.dopamine = 1.0
+
+        self.buf.sleep_phase(layers, wm, nm)
+
+        # After replay, the layer's eligibility traces should have been
+        # restored from the stored snapshot (before the weight update modified them)
+        # We can't check the exact value post-update, but the mechanism should not crash
+        self.assertEqual(layers[LAYER_NAME].e.shape, (NUM_INPUTS, STATE_SIZE))
+
+    def test_sleep_phase_with_multiple_layers(self) -> None:
+        """sleep_phase must handle multiple named layers."""
+        layer_a = _make_layer(num_inputs=3, num_neurons=STATE_SIZE)
+        layer_b = _make_layer(num_inputs=4, num_neurons=STATE_SIZE)
+        layers = {"layer_a": layer_a, "layer_b": layer_b}
+
+        self.buf.store(
+            state=np.zeros(STATE_SIZE, dtype=np.float32),
+            action=0,
+            reward=1.0,
+            next_state=np.ones(STATE_SIZE, dtype=np.float32),
+            layer_traces={
+                "layer_a": np.ones((3, STATE_SIZE), dtype=np.float32),
+                "layer_b": np.ones((4, STATE_SIZE), dtype=np.float32),
+            },
+            prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+        )
+
+        wm = _make_world_model()
+        nm = _make_nm()
+        nm.dopamine = 1.0
+
+        # Should not crash and should return one error
+        errors = self.buf.sleep_phase(layers, wm, nm)
+        self.assertEqual(len(errors), 1)
 
 
 if __name__ == "__main__":

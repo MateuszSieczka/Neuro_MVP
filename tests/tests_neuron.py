@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from neuron import LIFLayer
+from core.neuron import LIFLayer
 
 
 class TestLIFLayer(unittest.TestCase):

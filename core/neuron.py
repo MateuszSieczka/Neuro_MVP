@@ -1,5 +1,5 @@
 import numpy as np
-from config import LIFConfig
+from .config import LIFConfig
 
 
 class LIFLayer:

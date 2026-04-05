@@ -1,8 +1,9 @@
 import unittest
 import numpy as np
 
-from config import NeuromodulatorConfig
-from neuromodulator import NeuromodulatorSystem
+
+from core.config import NeuromodulatorConfig
+from core.neuromodulator import NeuromodulatorSystem
 
 
 class TestNeuromodulatorSystem(unittest.TestCase):

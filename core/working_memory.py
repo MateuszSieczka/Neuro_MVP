@@ -73,7 +73,8 @@ class WorkingMemoryModule:
         # Zanik śladu zawartości: wolniejszy niż tau_m, by atraktor przetrwał refrakcję.
         # Używamy tau_m z konfiguracji (300 ms dla WM), co daje ≈ exp(-1/300) ≈ 0.9967.
         self._content_decay: float = float(np.exp(-self.config.dt / self.config.tau_m))
-
+        # Inicjalizacja atrybutu, którego oczekuje system podczas uczenia / konsolidacji
+        self.prediction_error: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
     # ------------------------------------------------------------------
     # Gating interface
     # ------------------------------------------------------------------
@@ -220,3 +221,4 @@ class WorkingMemoryModule:
         self.refrac_count.fill(0)
         self.has_spiked.fill(False)
         self.content.fill(0.0)
+        self.prediction_error.fill(0.0)

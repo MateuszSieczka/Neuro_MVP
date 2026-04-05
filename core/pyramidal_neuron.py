@@ -104,7 +104,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
         )
 
         # Top-down prediction received via receive_prediction()
-        self.top_down_prediction: np.ndarray = np.zeros(num_inputs, dtype=np.float32)
+        self.top_down_prediction: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
 
         # ── Burst state ───────────────────────────────────────────────
         self.is_burst: np.ndarray = np.zeros(num_neurons, dtype=bool)
@@ -146,7 +146,8 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.x_pre[pre_active] += 1.0
 
         # ── 1. Integracja apikalna ─────────────────────────────────────
-        apical_current = self.top_down_prediction.astype(np.float32) @ self.w_apical
+        apical_current = self.top_down_prediction.astype(np.float32)
+
         self.v_apical = (
                 self.v_apical * self._apical_decay
                 + apical_current * (1.0 - self._apical_decay)

@@ -42,7 +42,7 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         relaxation_rate: float = 0.1
 
         # Top-down prediction currently received from the layer above
-        self.top_down_prediction: np.ndarray = np.zeros(num_inputs, dtype=np.float32)
+        self.top_down_prediction: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
 
         # Signed prediction error computed on last forward pass
         self.prediction_error: np.ndarray = np.zeros(num_inputs, dtype=np.float32)

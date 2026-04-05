@@ -145,7 +145,7 @@ class SNNWorldModel:
         state_spikes: np.ndarray,
         action: int | np.ndarray,
         actual_next_state: np.ndarray,
-            m_t: float = 1.0,
+        m_t: float = 1.0,
     ) -> np.ndarray:
         """
         Observe a real transition and update the decoder (Hebbian).
@@ -169,22 +169,25 @@ class SNNWorldModel:
         actual = actual_next_state.astype(np.float32)
         predicted = np.clip(internal_spikes @ self.w_decode, 0.0, 1.0)
 
-        # Błąd na poziomie przewidywania przyszłości (tylko dla dekodera i ciekawości)
+        # Błąd dekodera
         self.prediction_error = actual - predicted
         self.prediction_error_scalar = float(np.mean(self.prediction_error ** 2))
         self._error_history.append(self.prediction_error_scalar)
 
-        # USUNIĘTE: encoder_credit_error i sztuczne wymuszanie błędu.
-        # Enkoder uczy się na podstawie własnego błędu PC (jeśli wywołamy update_weights).
-        # Przekazujemy neuromodulator, aby zachować zgodność z układem nagrody.
-        self._encoder.update_weights(m_t=m_t, pred_error=self._encoder.prediction_error)
+        # Propagacja błędu przyszłości z dekodera do enkodera
+        # gradient dekodera = błąd * wagi dekodera (wstecz)
+        decoder_gradient = self.prediction_error @ self.w_decode.T
 
-        # Hebbian decoder update
+        # Łączymy lokalny błąd Predictive Coding enkodera z gradientem z dekodera
+        # Dzięki temu enkoder uczy się kompresować stan ORAZ przewidywać przyszłość
+        combined_error = self._encoder.prediction_error + decoder_gradient
+        self._encoder.update_weights(m_t=m_t, pred_error=combined_error)
+
+        # Aktualizacja Hebbowska dekodera
         if np.any(internal_spikes > 0):
             dw = self.config.decode_lr * np.outer(
                 internal_spikes, self.prediction_error
             )
-            # Mnożymy przez m_t, aby dopamina kontrolowała również dekoder
             self.w_decode += dw * m_t
             np.clip(self.w_decode, -1.0, 1.0, out=self.w_decode)
 

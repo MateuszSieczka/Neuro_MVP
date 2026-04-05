@@ -115,6 +115,9 @@ class NetworkGraph:
         # Bufor historii do synchronizacji Modalności
         self._output_history: dict[str, deque[np.ndarray]] = {}
         self._max_delay: int = 0
+
+        self._concat_offsets: dict[tuple[str, str], int] = {}
+
     # ------------------------------------------------------------------
     # Layer registration
     # ------------------------------------------------------------------
@@ -249,8 +252,7 @@ class NetworkGraph:
             if hasattr(layer, "trigger_phase_reset") and phase_reset:
                 layer.trigger_phase_reset()
 
-        # 3. Feedback pass (top-down predictions)
-                # ZMODYFIKOWANE: Dynamiczne cięcie predykcji dla warstw 'concat'
+                # 3. Feedback pass (top-down predictions)
                 for conn in self._connections:
                     if conn.connection_type == "feedback":
                         src = self._layers[conn.source]
@@ -259,23 +261,14 @@ class NetworkGraph:
                         if hasattr(src, "generate_prediction") and hasattr(tgt, "receive_prediction"):
                             prediction = src.generate_prediction()
 
-                            # Jeśli wymiary pasują idealnie (pojedyncze źródło / sum)
-                            if prediction.shape[0] == tgt.num_inputs:
+                            # Predykcja top-down docelowo mapuje się na NEURONY warstwy niższej
+                            if prediction.shape[0] == tgt.num_neurons:
                                 tgt.receive_prediction(prediction)
-                            # Jeśli predykcja jest większa (pochodzi z concat), znajdź offset
-                            elif prediction.shape[0] > tgt.num_inputs:
-                                # Oblicz offset na podstawie wszystkich połączeń feedforward do 'src'
-                                offset = 0
-                                for ff_conn in self._connections:
-                                    if ff_conn.target == conn.source and ff_conn.connection_type == "feedforward":
-                                        ff_src = self._layers[ff_conn.source]
-                                        if ff_conn.source == conn.target:
-                                            # Znaleźliśmy docelowy fragment
-                                            sliced_pred = prediction[offset: offset + tgt.num_inputs]
-                                            tgt.receive_prediction(sliced_pred)
-                                            break
-                                        # Dodajemy rozmiar wejścia, bo concat działa na wyjściach poprzednich warstw
-                                        offset += ff_src.num_neurons
+                            elif prediction.shape[0] > tgt.num_neurons:
+                                # Bezpieczne cięcie dla złączonych wejść
+                                offset = self._concat_offsets.get((conn.target, conn.source), 0)
+                                sliced_pred = prediction[offset: offset + tgt.num_neurons]
+                                tgt.receive_prediction(sliced_pred)
 
         # 4. Feedforward pass (bottom-up)
         for name in self._order:
@@ -482,6 +475,18 @@ class NetworkGraph:
 
         self._order = sorted_order
         self._order_dirty = False
+
+        # Pre-kalkulacja twardych mapowań offsetów dla concat
+        self._concat_offsets.clear()
+        for target_name in self._layers:
+            current_offset = 0
+            for conn in self._connections:
+                if conn.target == target_name and conn.connection_type == "feedforward":
+                    src_layer = self._layers[conn.source]
+                    if conn.aggregation_mode == "concat":
+                        # Zapisujemy dokładny początek wyjścia danego źródła w wektorze złączonym
+                        self._concat_offsets[(conn.source, conn.target)] = current_offset
+                        current_offset += src_layer.num_neurons
 
     # ------------------------------------------------------------------
     # State management

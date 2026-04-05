@@ -18,30 +18,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class Experience:
-    """
-    Atomic unit of episodic memory.
-
-    Stores a full transition snapshot including per-layer eligibility traces,
-    allowing replay to restore the learning state of an entire layer hierarchy
-    (not just a single isolated layer).
-
-    All arrays are deep-copied on construction so stored experiences are
-    never aliased to the live network state.
-    """
-    state: np.ndarray             # Spike-rate representation before action
-    action: int                   # Integer action index executed
-    reward: float                 # Extrinsic reward received
-    next_state: np.ndarray        # Spike-rate representation after action
-    layer_traces: dict[str, np.ndarray]  # layer_name → eligibility trace snapshot
-    prediction_error: np.ndarray  # World model error at this timestep
+    state: np.ndarray
+    action: int
+    reward: float
+    next_state: np.ndarray
+    layer_traces: dict[str, np.ndarray]
+    layer_outputs: dict[str, np.ndarray]  # DODANE: Wyjścia z warstw do nauki sekwencyjnej
+    prediction_error: np.ndarray
 
     def __post_init__(self) -> None:
-        # Defensive copies — caller should not mutate stored experiences
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
-        self.layer_traces = {
-            name: trace.copy() for name, trace in self.layer_traces.items()
-        }
+        self.layer_traces = {name: trace.copy() for name, trace in self.layer_traces.items()}
+        # DODANE: Kopiowanie wyjść
+        self.layer_outputs = {name: out.copy() for name, out in self.layer_outputs.items()}
         self.prediction_error = self.prediction_error.copy()
 
 
@@ -78,40 +68,15 @@ class ReplayBuffer:
     # Storage
     # ------------------------------------------------------------------
 
-    def store(
-        self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        layer_traces: dict[str, np.ndarray],
-        prediction_error: np.ndarray,
-    ) -> None:
-        """
-        Store a single timestep transition.
-
-        All arrays are copied internally — the caller may safely modify them
-        after this call without corrupting stored data.
-
-        Args:
-            state:            State before action.
-            action:           Integer action index.
-            reward:           Extrinsic reward received.
-            next_state:       State after action.
-            layer_traces:     Dict mapping layer name → eligibility trace snapshot.
-            prediction_error: World model error at this timestep.
-        """
+    def store(self, state, action, reward, next_state, layer_traces, layer_outputs, prediction_error) -> None:
+        # Zmiana sygnatury store, aby przyjmowała layer_outputs
         self._buffer.append(
             Experience(
-                state=state,
-                action=action,
-                reward=reward,
-                next_state=next_state,
-                layer_traces=layer_traces,
+                state=state, action=action, reward=reward, next_state=next_state,
+                layer_traces=layer_traces, layer_outputs=layer_outputs,
                 prediction_error=prediction_error,
             )
         )
-
     # ------------------------------------------------------------------
     # Offline consolidation (sleep / SWR replay)
     # ------------------------------------------------------------------
@@ -164,7 +129,9 @@ class ReplayBuffer:
         if sequence_memories is not None:
             for exp in experiences:
                 for name, seq_mem in sequence_memories.items():
-                    seq_mem.observe(exp.state)
+                    # POPRAWKA Błędu 2A: Przekazujemy lokalne wyjście warstwy, nie globalny stan
+                    if name in exp.layer_outputs:
+                        seq_mem.observe(exp.layer_outputs[name])
             for seq_mem in sequence_memories.values():
                 seq_mem.reset_state()
 

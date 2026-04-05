@@ -169,15 +169,27 @@ class LIFLayer:
     def update_weights(self, m_t: float, pred_error: np.ndarray) -> None:
         """
         Three-factor STDP: Δw = lr × m_t × e × pred_error.
-
-        Args:
-            m_t:        Dopaminergic modulation (scalar).
-            pred_error: Prediction error vector (num_neurons,).
+        Dynamicznie rzutuje pred_error, aby pasował do wymiarów śladu e (num_inputs, num_neurons).
         """
         if np.isclose(m_t, 0.0):
             return
-        dw = self.config.learning_rate * m_t * self.e * pred_error
+
+        # POPRAWKA Błędu B: Bezpieczny broadcasting w NumPy
+        if pred_error.shape[0] == self.num_inputs:
+            # Błąd pochodzi z przestrzeni wejść (Predictive Coding)
+            error_signal = pred_error[:, np.newaxis]
+        elif pred_error.shape[0] == self.num_neurons:
+            # Błąd pochodzi z przestrzeni wyjść (Standardowy LIF / BG)
+            error_signal = pred_error[np.newaxis, :]
+        else:
+            raise ValueError(f"Shape mismatch: pred_error {pred_error.shape} nie pasuje do wejść ({self.num_inputs}) ani neuronów ({self.num_neurons}).")
+
+        dw = self.config.learning_rate * m_t * self.e * error_signal
         self.w += dw
+
+        # Ochrona przed wybuchem wag
+        np.clip(self.w, 0.0, 1.0, out=self.w)
+
 
     # ------------------------------------------------------------------
     # State management

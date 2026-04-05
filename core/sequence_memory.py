@@ -198,3 +198,29 @@ class SequenceMemory:
         """Full reset including learned weights."""
         self.reset_state()
         self.transition_w.fill(0.0)
+
+
+class HierarchicalSequenceMemory(SequenceMemory):
+    """
+    Ignoruje mikro-kroki; rejestruje przejścia stanów tylko w momentach
+    o wysokim natężeniu istotności (np. szczyty błędu / uderzenia Noradrenaliny).
+    """
+
+    def __init__(
+            self,
+            num_neurons: int,
+            config: SequenceMemoryConfig | None = None,
+            salience_threshold: float = 0.5
+    ) -> None:
+        super().__init__(num_neurons, config)
+        self.salience_threshold = salience_threshold
+
+    def observe(self, current_pattern: np.ndarray, salience: float = 0.0) -> np.ndarray:
+        """
+        Ocenia krok pod kątem wagi informacyjnej przed wykonaniem Hebbian Update.
+        """
+        if salience >= self.salience_threshold:
+            return super().observe(current_pattern)
+
+        # Jeśli szum: brak błędu temporalnego, stan wewnętrzny bez zmian.
+        return np.zeros(self.num_neurons, dtype=np.float32)

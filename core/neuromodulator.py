@@ -45,7 +45,7 @@ class NeuromodulatorSystem:
     def update(
         self,
         prediction_error: np.ndarray,
-        reward: float = 0.0,
+        td_error: float = 0.0,
         novelty: float | None = None,
     ) -> None:
         """
@@ -54,27 +54,20 @@ class NeuromodulatorSystem:
         Args:
             prediction_error: Signed error vector from a PredictiveCodingLayer
                               (or any layer). Shape: (n,).
-            reward:           External reward signal from the environment (any scale;
-                              internally the *change* relative to history is used).
             novelty:          Optional explicit novelty signal in [0, 1].
                               When None, inferred as clipped mean |error|.
         """
         error_magnitude = float(np.mean(np.abs(prediction_error)))
-
         if novelty is None:
             novelty = float(np.clip(error_magnitude, 0.0, 1.0))
 
-        # Reward prediction error: how much better/worse than expected?
-        avg_reward = float(np.mean(self._reward_history)) if self._reward_history else 0.0
-        rpe = float(np.clip(reward - avg_reward + 0.5, 0.0, 1.0))  # shift to [0,1]
+        # ZMIANA: Dopamina jest w 100% sterowana błędem z Basal Ganglia
+        # Skalujemy td_error do przedziału dopaminergicznego [0, 1] (bazowo 0.5)
+        rpe_signal = float(np.clip(td_error + 0.5, 0.0, 1.0))
 
-        self._error_history.append(error_magnitude)
-        self._reward_history.append(reward)
-
-        # ── Dopamine: phasic reward prediction error ──────────────────
         self.dopamine = (
-            self.dopamine * self.config.da_decay
-            + rpe * (1.0 - self.config.da_decay)
+                self.dopamine * self.config.da_decay
+                + rpe_signal * (1.0 - self.config.da_decay)
         )
 
         # ── Acetylcholine: novelty / uncertainty ──────────────────────

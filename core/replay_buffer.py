@@ -8,6 +8,8 @@ import numpy as np
 # TYPE_CHECKING guard keeps runtime imports clean while allowing type hints
 from typing import TYPE_CHECKING
 
+from . import SequenceMemory
+
 if TYPE_CHECKING:
     from .neuron import LIFLayer
     from .world_model import WorldModel
@@ -120,6 +122,7 @@ class ReplayBuffer:
         world_model: WorldModel,
         neuromodulator: NeuromodulatorSystem,
         n_experiences: int | None = None,
+        sequence_memories: dict[str, SequenceMemory] | None = None,
     ) -> list[float]:
         """
         Consolidate recent experience through reverse-order replay.
@@ -148,7 +151,19 @@ class ReplayBuffer:
 
         experiences = list(self._buffer)
         if n_experiences is not None:
-            experiences = experiences[-n_experiences:]  # take most recent N
+            experiences = experiences[-n_experiences:] #Take most recent n
+
+        # DODANE: Odtwarzanie w przód (Forward replay) dla pamięci sekwencyjnej
+        # Zapewnia naukę poprawnych związków A -> B (przyczynowych)
+        if sequence_memories is not None:
+            for exp in experiences:
+                for name, seq_mem in sequence_memories.items():
+                    # Upraszczamy: przesyłamy zrekonstruowany stan układu
+                    seq_mem.observe(exp.state)
+
+            # Zapobiega przenikaniu ostatniego stanu ze snu do przebudzenia
+            for seq_mem in sequence_memories.values():
+                seq_mem.reset_state()
 
         errors: list[float] = []
 

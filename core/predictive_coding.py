@@ -38,6 +38,9 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
             0.0, 0.1, (num_neurons, num_inputs)
         ).astype(np.float32)
 
+        relaxation_steps: int = 10
+        relaxation_rate: float = 0.1
+
         # Top-down prediction currently received from the layer above
         self.top_down_prediction: np.ndarray = np.zeros(num_inputs, dtype=np.float32)
 
@@ -47,6 +50,8 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # Acetylcholine level (set externally by NeuromodulatorSystem)
         # Controls bottom-up vs top-down weighting of effective input.
         self.ach_level: float = 0.8
+
+        self.error_spikes: np.ndarray = np.zeros(num_inputs, dtype=bool)
 
     # ------------------------------------------------------------------
     # Core dynamics
@@ -74,36 +79,40 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         """
         pre_f32 = pre_spikes.astype(np.float32)
 
-        # 1. Prediction error: what surprised us at this level?
-        self.prediction_error = pre_f32 - self.top_down_prediction
+        # Pętla relaksacji (minimalizacja Wolnej Energii wg Bogacza)
+        for i in range(self.pc_config.relaxation_steps):
+            # 1. Błąd predykcji obecnego stanu (co niższa warstwa mówi vs co myślimy)
 
-        # 2. ACh-gated effective rate (continuous blend)
-        #    High ACh  → lean on raw data;  Low ACh → lean on prior prediction
-        blended_rate = (
-            self.ach_level * pre_f32
-            + (1.0 - self.ach_level) * np.clip(self.top_down_prediction, 0.0, 1.0)
-        )
+            self.prediction_error = pre_f32 - self.top_down_prediction
 
-        # 3. Convert blended rate → binary spikes via Poisson encoding
-        #    This ensures the LIF layer receives proper discrete events,
-        #    keeping STDP trace bookkeeping (x_pre) physically correct.
-        effective_spikes = self._encoder.encode(np.clip(blended_rate, 0.0, 1.0))
 
-        # 4. Standard LIF + k-WTA integration
-        spikes = super().forward(effective_spikes)
+            # 2. Transpozycja wag predykcyjnych
+            # Błąd propagowany w górę wymusza zmianę potencjału v
+            error_gradient = self.prediction_error @ self.feedback_w.T
 
-        # 4. Feedback weight update (Hebbian predictive rule)
-        #    Only the positive part of the error is learned — neurons should
-        #    learn to predict inputs they underestimated, not suppress over-predictions.
-        if np.any(self.has_spiked):
-            positive_error = np.clip(self.prediction_error, 0.0, None)
-            dw = self.pc_config.feedback_learning_rate * np.outer(
-                self.has_spiked.astype(np.float32), positive_error
-            )
-            self.feedback_w += dw
-            np.clip(self.feedback_w, 0.0, 1.0, out=self.feedback_w)
+            if np.linalg.norm(error_gradient) < self.pc_config.relaxation_threshold:
+                break
 
-        return spikes
+            # 3. Aktualizacja potencjału (gradient descent po Wolnej Energii)
+            self.v += self.pc_config.relaxation_rate * error_gradient
+            np.clip(self.v, self.config.v_reset, self.config.v_thresh + 10.0, out=self.v)
+
+        # Faza Generowania Impulsu po relaksacji (standardowy LIF / k-WTA)
+        in_refrac = self.refrac_count > 0
+        self.refrac_count[in_refrac] -= 1
+
+        # Wykorzystujemy zrelaksowany potencjał v do oceny spike'ów
+        thresh = self.v_thresh_adaptive if getattr(self, '_homeostatic', False) else self.config.v_thresh
+        self.has_spiked = (self.v >= thresh) & ~in_refrac
+
+        self.v[self.has_spiked] = self.config.v_reset
+        self.refrac_count[self.has_spiked] = self.config.refrac_period
+
+        # Zwracamy błąd po relaksacji jako twarde impulsy do nauki sieci
+        positive_error = np.clip(self.prediction_error, 0.0, 1.0) * self.ach_level
+        self.error_spikes = self._encoder.encode(positive_error).astype(bool)
+
+        return self.error_spikes.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Prediction interface
@@ -140,6 +149,27 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         """
         self.ach_level = float(np.clip(ach, 0.0, 1.0))
 
+    # Override update_weights to train the backward matrix
+    def update_weights(self, m_t: float, pred_error: np.ndarray) -> None:
+        """
+        Updates feedforward weights via STDP and backward weights via
+        Dendritic Error Learning (alignment with forward activity).
+        """
+        super().update_weights(m_t, pred_error)
+
+        if np.any(self.has_spiked):
+            dw = self.pc_config.feedback_learning_rate * np.outer(
+                self.has_spiked.astype(np.float32), self.prediction_error
+            )
+            self.feedback_w += dw * m_t
+
+            # NORMALIZACJA (Zapobiega wybuchowi wag feedbacku)
+            if self.pc_config.feedback_norm:
+                norms = np.linalg.norm(self.feedback_w, axis=1, keepdims=True) + 1e-8
+                self.feedback_w /= norms
+            else:
+                np.clip(self.feedback_w, 0.0, 1.0, out=self.feedback_w)
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -149,3 +179,4 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         super().reset_state()
         self.top_down_prediction.fill(0.0)
         self.prediction_error.fill(0.0)
+

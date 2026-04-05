@@ -28,6 +28,12 @@ class CompetitiveLIFLayer(LIFLayer):
         self._phase_reset_pending = True
 
     def forward(self, pre_spikes: np.ndarray) -> np.ndarray:
+        # POPRAWKA Bug C: Proaktywna inhibicja PRZED detekcją spike'ów.
+        # Neurony, które strzeliły za dużo w bieżącym oknie, dostają karę odejmowaną
+        # od v *zanim* zdążą wyemitować kolejny impuls. Dzięki temu k-WTA działa
+        # prewencyjnie, a nie jako post-hoc korekta po fakcie.
+        self._apply_proactive_inhibition()
+
         spikes = super().forward(pre_spikes)
 
         self.window_spike_counts += spikes.astype(np.int32)
@@ -42,6 +48,30 @@ class CompetitiveLIFLayer(LIFLayer):
             self._reset_window()
 
         return spikes
+
+    def _apply_proactive_inhibition(self) -> None:
+        """
+        Ciągła inhibicja boczna aplikowana PRZED detekcją spike'ów.
+
+        Dla każdego neuronu oblicza nadwyżkę aktywności ponad jego oczekiwany
+        udział (total_spikes * k / N). Neurony z nadwyżką dostają ujemny prąd
+        proporcjonalny do tej nadwyżki, co zmniejsza ich szansę na wystrzelenie
+        w bieżącym kroku. Neurony poniżej progu k-WTA nie są dotknięte.
+
+        Biologiczny odpowiednik: toniczna inhibicja z interneuronów GABAergicznych,
+        które śledzą historię aktywności i aktywnie tłumią „nadaktywnych" sąsiadów.
+        """
+        if self._current_window_size == 0 or self.kwta_config.k_winners >= self.num_neurons:
+            return
+        total = int(np.sum(self.window_spike_counts))
+        if total == 0:
+            return
+        # Oczekiwany udział dla k zwycięzców (proporcja k/N całkowitej aktywności)
+        expected_per_neuron = total * self.kwta_config.k_winners / self.num_neurons
+        excess = np.maximum(0.0, self.window_spike_counts.astype(np.float32) - expected_per_neuron)
+        # Inhibicja skalowana przez okno, by siła na krok była stała niezależnie od długości okna
+        inhibition = excess * (self.kwta_config.i_inh / self._current_window_size)
+        self.v -= inhibition
 
     def _update_kwta_homeostasis(self, current_window_size: int) -> None:
         # (Keep the existing implementation of this method)

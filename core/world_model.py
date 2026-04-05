@@ -202,6 +202,11 @@ class SNNWorldModel:
         (no weight updates) and decodes to get the predicted next state.
         Novelty is measured as the magnitude of change relative to recent history.
 
+        POPRAWKA Bug 3: Zapisujemy i przywracamy PEŁNY stan enkodera, nie tylko
+        top_down_prediction. Enkoder to kompletny neuron LIF z membraną, refrakcją,
+        śladami i licznikami k-WTA — forward() modyfikuje je wszystkie.
+        Bez pełnego przywracania wyobraźnia niszczy rzeczywisty stan sieci.
+
         Args:
             current_state_spikes: Current state spike pattern (state_size,).
             candidate_actions:    List of integer action indices.
@@ -212,18 +217,44 @@ class SNNWorldModel:
         recent_errors = self._error_history[-20:] if self._error_history else [0.5]
         avg_baseline = float(np.mean(recent_errors)) + 1e-8
 
-        # Save encoder state so rehearsal is non-destructive
-        saved_td = self._encoder.top_down_prediction.copy()
+        enc = self._encoder
+
+        # POPRAWKA Bug 3: Pełna migawka stanu enkodera przed symulacją.
+        saved_state = {
+            "v": enc.v.copy(),
+            "has_spiked": enc.has_spiked.copy(),
+            "refrac_count": enc.refrac_count.copy(),
+            "x_pre": enc.x_pre.copy(),
+            "x_post": enc.x_post.copy(),
+            "e": enc.e.copy(),
+            "top_down_prediction": enc.top_down_prediction.copy(),
+            "prediction_error": enc.prediction_error.copy(),
+        }
+        # Pola specyficzne dla CompetitiveLIFLayer (k-WTA)
+        if hasattr(enc, "window_spike_counts"):
+            saved_state["window_spike_counts"] = enc.window_spike_counts.copy()
+            saved_state["_current_window_size"] = enc._current_window_size
+            saved_state["_phase_reset_pending"] = enc._phase_reset_pending
+        # Pola homeostazy
+        if hasattr(enc, "avg_rate"):
+            saved_state["avg_rate"] = enc.avg_rate.copy()
+        if hasattr(enc, "v_thresh_adaptive"):
+            saved_state["v_thresh_adaptive"] = enc.v_thresh_adaptive.copy()
 
         results: dict[int, dict] = {}
         for action in candidate_actions:
             combined = self._build_input(current_state_spikes, action)
-            # Forward pass without weight update; encoder has no external
-            # side-effects here because update_weights() is separate.
-            internal = self._encoder.forward(combined).astype(np.float32)
+            # Przywracamy stan przed każdą kandydaturą, by kandydaci nie wpływali na siebie
+            enc.v[:] = saved_state["v"]
+            enc.has_spiked[:] = saved_state["has_spiked"]
+            enc.refrac_count[:] = saved_state["refrac_count"]
+            enc.x_pre[:] = saved_state["x_pre"]
+            enc.x_post[:] = saved_state["x_post"]
+            enc.e[:] = saved_state["e"]
+
+            internal = enc.forward(combined).astype(np.float32)
             predicted_next = np.clip(internal @ self.w_decode, 0.0, 1.0)
 
-            # Novelty: how much does the predicted state differ from current?
             state_change = float(
                 np.mean(np.abs(predicted_next - current_state_spikes[:self.state_size]))
             )
@@ -234,8 +265,24 @@ class SNNWorldModel:
                 "familiarity": 1.0 - novelty,
             }
 
-        # Restore top-down prediction (forward() may have overwritten it)
-        self._encoder.top_down_prediction = saved_td
+        # POPRAWKA Bug 3: Przywracamy pełny stan po zakończeniu symulacji.
+        enc.v[:] = saved_state["v"]
+        enc.has_spiked[:] = saved_state["has_spiked"]
+        enc.refrac_count[:] = saved_state["refrac_count"]
+        enc.x_pre[:] = saved_state["x_pre"]
+        enc.x_post[:] = saved_state["x_post"]
+        enc.e[:] = saved_state["e"]
+        enc.top_down_prediction[:] = saved_state["top_down_prediction"]
+        enc.prediction_error[:] = saved_state["prediction_error"]
+        if "window_spike_counts" in saved_state:
+            enc.window_spike_counts[:] = saved_state["window_spike_counts"]
+            enc._current_window_size = saved_state["_current_window_size"]
+            enc._phase_reset_pending = saved_state["_phase_reset_pending"]
+        if "avg_rate" in saved_state:
+            enc.avg_rate[:] = saved_state["avg_rate"]
+        if "v_thresh_adaptive" in saved_state:
+            enc.v_thresh_adaptive[:] = saved_state["v_thresh_adaptive"]
+
         return results
 
     def curiosity_signal(

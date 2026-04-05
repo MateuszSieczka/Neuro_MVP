@@ -250,17 +250,32 @@ class NetworkGraph:
                 layer.trigger_phase_reset()
 
         # 3. Feedback pass (top-down predictions)
-        #    Shape guard: only deliver if prediction dim matches target num_inputs.
-        for conn in self._connections:
-            if conn.connection_type == "feedback":
-                src = self._layers[conn.source]
-                tgt = self._layers[conn.target]
-                if hasattr(src, "generate_prediction") and hasattr(
-                    tgt, "receive_prediction"
-                ):
-                    prediction = src.generate_prediction()
-                    if prediction.shape[0] == tgt.num_inputs:
-                        tgt.receive_prediction(prediction)
+                # ZMODYFIKOWANE: Dynamiczne cięcie predykcji dla warstw 'concat'
+                for conn in self._connections:
+                    if conn.connection_type == "feedback":
+                        src = self._layers[conn.source]
+                        tgt = self._layers[conn.target]
+
+                        if hasattr(src, "generate_prediction") and hasattr(tgt, "receive_prediction"):
+                            prediction = src.generate_prediction()
+
+                            # Jeśli wymiary pasują idealnie (pojedyncze źródło / sum)
+                            if prediction.shape[0] == tgt.num_inputs:
+                                tgt.receive_prediction(prediction)
+                            # Jeśli predykcja jest większa (pochodzi z concat), znajdź offset
+                            elif prediction.shape[0] > tgt.num_inputs:
+                                # Oblicz offset na podstawie wszystkich połączeń feedforward do 'src'
+                                offset = 0
+                                for ff_conn in self._connections:
+                                    if ff_conn.target == conn.source and ff_conn.connection_type == "feedforward":
+                                        ff_src = self._layers[ff_conn.source]
+                                        if ff_conn.source == conn.target:
+                                            # Znaleźliśmy docelowy fragment
+                                            sliced_pred = prediction[offset: offset + tgt.num_inputs]
+                                            tgt.receive_prediction(sliced_pred)
+                                            break
+                                        # Dodajemy rozmiar wejścia, bo concat działa na wyjściach poprzednich warstw
+                                        offset += ff_src.num_neurons
 
         # 4. Feedforward pass (bottom-up)
         for name in self._order:
@@ -473,11 +488,14 @@ class NetworkGraph:
     # ------------------------------------------------------------------
 
     def reset_state(self) -> None:
-        """Reset all layers, sequence memories, and global timestep."""
+        """Reset all layers, sequence memories, global timestep, and delay buffers."""
         for layer in self._layers.values():
             if hasattr(layer, "reset_state"):
                 layer.reset_state()
         for sm in self._sequence_memories.values():
             sm.reset_state()
         self.timestep = 0
+        # POPRAWKA Bug 2: Czyścimy historię opóźnień, by duchy z poprzedniego
+        # epizodu nie przenikały do następnego przez połączenia delayed.
+        self._output_history.clear()
         # Note: do NOT reset _order_dirty; the topology hasn't changed.

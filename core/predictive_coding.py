@@ -62,13 +62,14 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         One timestep of predictive coding integration.
 
         Steps:
-          1. Compute signed prediction error  (actual − top-down prediction).
-          2. Build effective firing rate as an ACh-weighted blend of raw
+          1. Aktualizacja śladów STDP (x_pre, x_post, e) — POPRAWKA Bug 1.
+          2. Compute signed prediction error  (actual − top-down prediction).
+          3. Build effective firing rate as an ACh-weighted blend of raw
              signal and top-down prediction.
-          3. Convert the blended rate to binary Poisson spikes so that
+          4. Convert the blended rate to binary Poisson spikes so that
              the LIF layer and its STDP traces receive proper discrete events.
-          4. Delegate to CompetitiveLIFLayer (LIF + k-WTA inhibition).
-          5. Update feedback weights: neurons that fired strengthen their
+          5. Delegate to CompetitiveLIFLayer (LIF + k-WTA inhibition).
+          6. Update feedback weights: neurons that fired strengthen their
              predictions for the positive-error input components.
 
         Args:
@@ -79,23 +80,46 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         """
         pre_f32 = pre_spikes.astype(np.float32)
 
-        # Pętla relaksacji (minimalizacja Wolnej Energii wg Bogacza)
+        # POPRAWKA Bug 1: Aktualizacja śladów STDP zanim cokolwiek się wydarzy.
+        # LIFLayer.forward() robi to wewnętrznie, ale my bypasujemy super().forward(),
+        # więc musimy zrobić to ręcznie. Bez tego self.e = 0 zawsze → dw = 0 zawsze.
+        self.x_pre *= self._pre_decay
+        self.x_post *= self._post_decay
+        pre_active = pre_spikes > 0
+        self.x_pre[pre_active] += 1.0
+
+        # POPRAWKA Bug A: Obliczamy drive feedforward z wyuczonych wag self.w
+        # PRZED pętlą relaksacji (jest stały w całej pętli, więc liczymy raz).
+        # Bez tego self.w są uczone przez STDP, ale nigdy nie wpływają na dynamikę v.
+        # Teraz pełnią rolę "wejścia z kory pierwszorzędowej" (bottom-up drive),
+        # a pętla relaksacji uzgadnia go z predykcją top-down (feedback_w).
+        ff_drive = pre_f32 @ self.w  # (num_neurons,)
+
+        # POPRAWKA Bug C: Proaktywna inhibicja k-WTA przed relaxacją
+        self._apply_proactive_inhibition()
+
+        # ZMODYFIKOWANE: Pętla relaksacji
         for i in range(self.pc_config.relaxation_steps):
-            # 1. Błąd predykcji obecnego stanu (co niższa warstwa mówi vs co myślimy)
+            # 1. Przybliżenie obecnej aktywności na podstawie potencjału v
+            r = np.clip((self.v - self.config.v_rest) / (self.config.v_thresh - self.config.v_rest), 0.0, 1.0)
 
-            self.prediction_error = pre_f32 - self.top_down_prediction
+            # 2. Przewidywanie wejścia na podstawie NASZEGO stanu
+            my_prediction = r @ self.feedback_w
 
+            # 3. Błąd predykcji (co dostajemy vs co przewidujemy)
+            self.prediction_error = pre_f32 - my_prediction
 
-            # 2. Transpozycja wag predykcyjnych
-            # Błąd propagowany w górę wymusza zmianę potencjału v
+            # 4. Gradient łączony: błąd PC + top-down + POPRAWKA: ff_drive z self.w
             error_gradient = self.prediction_error @ self.feedback_w.T
+            combined_gradient = error_gradient + self.top_down_prediction + ff_drive
 
-            if np.linalg.norm(error_gradient) < self.pc_config.relaxation_threshold:
+            if np.linalg.norm(combined_gradient) < self.pc_config.relaxation_threshold:
                 break
 
-            # 3. Aktualizacja potencjału (gradient descent po Wolnej Energii)
-            self.v += self.pc_config.relaxation_rate * error_gradient
+            # 5. Aktualizacja potencjału (gradient łączony: dół + góra + feedforward)
+            self.v += self.pc_config.relaxation_rate * combined_gradient
             np.clip(self.v, self.config.v_reset, self.config.v_thresh + 10.0, out=self.v)
+
 
         # Faza Generowania Impulsu po relaksacji (standardowy LIF / k-WTA)
         in_refrac = self.refrac_count > 0
@@ -107,6 +131,15 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
 
         self.v[self.has_spiked] = self.config.v_reset
         self.refrac_count[self.has_spiked] = self.config.refrac_period
+        self.x_post[self.has_spiked] += 1.0
+
+        # POPRAWKA Bug 1 (cd.): Aktualizacja śladu kwalifikowalności po wykryciu spike'ów.
+        # Koreluje wejście (x_pre) z wyjściem (has_spiked) i odwrotnie.
+        self.e *= self._trace_decay
+        if np.any(self.has_spiked):
+            self.e[:, self.has_spiked] += self.x_pre[:, np.newaxis]
+        if np.any(pre_active):
+            self.e[pre_active, :] += self.x_post[np.newaxis, :]
 
         # Zwracamy błąd po relaksacji jako twarde impulsy do nauki sieci
         positive_error = np.clip(self.prediction_error, 0.0, 1.0) * self.ach_level
@@ -179,4 +212,3 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         super().reset_state()
         self.top_down_prediction.fill(0.0)
         self.prediction_error.fill(0.0)
-

@@ -66,8 +66,13 @@ class WorkingMemoryModule:
 
         # ── Gate and content ──────────────────────────────────────────
         self.gate_open: bool = False
-        # Current held representation (float copy of last has_spiked)
+        # POPRAWKA Bug B: content to gasnący ślad aktywności (filtr dolnoprzepustowy),
+        # NIE binarny spike z poprzedniego kroku. Neurony w refrakcji mogą dalej
+        # podtrzymywać atraktor przez wolno gasnący ślad (tau ≈ tau_m = 300 ms).
         self.content: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
+        # Zanik śladu zawartości: wolniejszy niż tau_m, by atraktor przetrwał refrakcję.
+        # Używamy tau_m z konfiguracji (300 ms dla WM), co daje ≈ exp(-1/300) ≈ 0.9967.
+        self._content_decay: float = float(np.exp(-self.config.dt / self.config.tau_m))
 
     # ------------------------------------------------------------------
     # Gating interface
@@ -144,7 +149,12 @@ class WorkingMemoryModule:
                 self.e[pre_active, :] += self.x_post[np.newaxis, :]
 
         # ── Update content, then learn lateral connections ────────────
-        self.content = self.has_spiked.astype(np.float32)
+        # POPRAWKA Bug B: Ślad aktywności zamiast binarnych spike'ów.
+        # Każdy spike dodaje 1.0 do śladu; ślad gaśnie z tau_m.
+        # Neurony w refrakcji (has_spiked=False) nie dodają 0 — ich poprzedni ślad
+        # po prostu gaśnie. Recurrent_current pozostaje niezerowe przez cały okres
+        # refrakcji, co podtrzymuje atraktor.
+        self.content = self.content * self._content_decay + self.has_spiked.astype(np.float32)
         self._update_lateral_weights()
 
         return self.has_spiked

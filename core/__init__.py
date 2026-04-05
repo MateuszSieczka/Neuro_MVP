@@ -13,7 +13,7 @@ from .predictive_coding import PredictiveCodingLayer
 from .neuromodulator import NeuromodulatorSystem
 from .working_memory import WorkingMemoryModule
 from .replay_buffer import ReplayBuffer, Experience
-from .world_model import WorldModel
+from .world_model import SNNWorldModel
 from .spike_encoder import PoissonEncoder
 from .sequence_memory import SequenceMemory
 from .network import NetworkGraph, LayerConnection

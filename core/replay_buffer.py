@@ -8,7 +8,7 @@ import numpy as np
 # TYPE_CHECKING guard keeps runtime imports clean while allowing type hints
 from typing import TYPE_CHECKING
 
-from . import SequenceMemory
+from .sequence_memory import SequenceMemory
 
 if TYPE_CHECKING:
     from .neuron import LIFLayer
@@ -123,6 +123,7 @@ class ReplayBuffer:
         neuromodulator: NeuromodulatorSystem,
         n_experiences: int | None = None,
         sequence_memories: dict[str, SequenceMemory] | None = None,
+        gamma: float = 0.99,
     ) -> list[float]:
         """
         Consolidate recent experience through reverse-order replay.
@@ -134,13 +135,19 @@ class ReplayBuffer:
           3. Apply a dopamine-weighted STDP update to each layer, using
              the world model error as the third factor.
 
+        POPRAWKA Bug C: Zamiast używać exp.reward (które wynosi 0.0 dla większości
+        kroków), obliczamy skumulowany zwrot G_t w tył (Monte Carlo return):
+            G_t = r_t + γ * G_{t+1}
+        Dzięki temu kroki POPRZEDZAJĄCE nagrodę otrzymują kredyt,
+        realizując prawdziwe odwrotne odtwarzanie w stylu hipokampalnym.
+
         Args:
             layers:         Dict mapping layer name → LIFLayer (or subclass).
-                            Names must match those used in store().
             world_model:    WorldModel to refine during consolidation.
             neuromodulator: Source of dopaminergic modulation signal.
             n_experiences:  How many of the most recent experiences to replay.
                             None → replay entire buffer.
+            gamma:          Czynnik dyskontowy dla obliczania skumulowanego zwrotu.
 
         Returns:
             List of per-experience world model MSE values (in replay order,
@@ -151,24 +158,30 @@ class ReplayBuffer:
 
         experiences = list(self._buffer)
         if n_experiences is not None:
-            experiences = experiences[-n_experiences:] #Take most recent n
+            experiences = experiences[-n_experiences:]
 
         # DODANE: Odtwarzanie w przód (Forward replay) dla pamięci sekwencyjnej
-        # Zapewnia naukę poprawnych związków A -> B (przyczynowych)
         if sequence_memories is not None:
             for exp in experiences:
                 for name, seq_mem in sequence_memories.items():
-                    # Upraszczamy: przesyłamy zrekonstruowany stan układu
                     seq_mem.observe(exp.state)
-
-            # Zapobiega przenikaniu ostatniego stanu ze snu do przebudzenia
             for seq_mem in sequence_memories.values():
                 seq_mem.reset_state()
 
         errors: list[float] = []
 
-        # Hippocampal reverse replay: most recent experience first
+        # POPRAWKA Bug C: Wstępne obliczenie skumulowanych zwrotów G_t = r_t + γ*G_{t+1}
+        # Iterujemy od najnowszego do najstarszego (tak jak potem robimy replay),
+        # kumulując zwrot do tyłu.
+        cumulative_returns: list[float] = []
+        G = 0.0
         for exp in reversed(experiences):
+            G = exp.reward + gamma * G
+            cumulative_returns.append(G)
+        # cumulative_returns[0] = G dla najnowszego exp; odwrócimy dostęp poniżej.
+
+        # Hippocampal reverse replay: most recent experience first
+        for i, exp in enumerate(reversed(experiences)):
             # 1. Restore eligibility traces for ALL layers in the hierarchy
             for name, layer in layers.items():
                 if name in exp.layer_traces:
@@ -177,12 +190,30 @@ class ReplayBuffer:
             # 2. Update world model; get refined prediction error
             world_error = world_model.update(exp.state, exp.action, exp.next_state)
 
-            # 3. Three-factor STDP: dopamine × eligibility × prediction error
-            #    Use signed reward (not max(0, reward)) so that negative rewards
-            #    can drive synaptic depression for aversive learning.
-            m_t = neuromodulator.learning_rate_modulation * exp.reward
+            # 3. Three-factor STDP: dopamina × skumulowany_zwrot × ślad × błąd_predykcji
+            # POPRAWKA Bug B: Używamy lokalnego błędu predykcji każdej warstwy (num_neurons,),
+            # NIE globalnego world_error (state_size,). LIFLayer.update_weights robi:
+            #   dw = lr * m_t * e * pred_error
+            # gdzie e ma kształt (num_inputs, num_neurons). Broadcast NumPy wymaga
+            # pred_error o kształcie (num_neurons,) — globalny błąd świata o innym
+            # rozmiarze powoduje ValueError (crash).
+            G_t = cumulative_returns[i]
+            m_t = neuromodulator.learning_rate_modulation * G_t
             for layer in layers.values():
-                layer.update_weights(m_t=m_t, pred_error=world_error)
+                local_error = getattr(layer, 'prediction_error', None)
+                num_neurons = getattr(layer, 'num_neurons', None)
+                if (local_error is not None
+                        and num_neurons is not None
+                        and local_error.shape[0] == num_neurons):
+                    # Warstwa PC/Pyramidal: używa swojego własnego, lokalnego błędu
+                    layer.update_weights(m_t=m_t, pred_error=local_error)
+                elif num_neurons is not None:
+                    # Prosta warstwa LIF bez prediction_error: neutralny, jednorodny sygnał
+                    # (odpowiednik "brak korekty", nie destabilizuje wag)
+                    layer.update_weights(
+                        m_t=m_t,
+                        pred_error=np.ones(num_neurons, dtype=np.float32),
+                    )
 
             errors.append(world_model.prediction_error)
 

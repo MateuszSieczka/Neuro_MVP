@@ -82,7 +82,12 @@ class PyramidalLayer(CompetitiveLIFLayer):
         # Disable parent's homeostatic update — we run our own combined
         # (homeostatic + apical modulation) version in _update_adaptive_threshold.
         super().__init__(num_inputs, num_neurons, self.pyr_config)
-        self._homeostatic = False  # suppress LIFLayer._update_homeostatic()
+        self._homeostatic = False      # suppress LIFLayer._update_homeostatic()
+        self._homeostatic_kwta = False  # POPRAWKA Bug D: suppress CompetitiveLIFLayer._update_kwta_homeostasis()
+        # Bez tego v_thresh_adaptive jest modyfikowane z dwóch miejsc naraz:
+        # 1) _update_adaptive_threshold() co krok (lokalny LR)
+        # 2) _update_kwta_homeostasis() przy każdym resecie fazy (okno * LR)
+        # Efekt: destabilizacja progu i schizofreniczne zachowanie homeostazy.
 
         # ── Apical compartment weights ────────────────────────────────
         # Tied to feedback direction: w_apical.T maps spikes → input space,
@@ -132,6 +137,14 @@ class PyramidalLayer(CompetitiveLIFLayer):
     def forward(self, pre_spikes: np.ndarray) -> np.ndarray:
         pre_f32 = pre_spikes.astype(np.float32)
 
+        # POPRAWKA Bug 1: Aktualizacja śladów STDP na początku kroku.
+        # PyramidalLayer nie wywołuje super().forward(), więc LIFLayer nigdy nie aktualizuje
+        # x_pre, x_post ani e. Bez tego self.e = 0 zawsze → update_weights() nic nie robi.
+        self.x_pre *= self._pre_decay
+        self.x_post *= self._post_decay
+        pre_active = pre_spikes > 0
+        self.x_pre[pre_active] += 1.0
+
         # ── 1. Integracja apikalna ─────────────────────────────────────
         apical_current = self.top_down_prediction.astype(np.float32) @ self.w_apical
         self.v_apical = (
@@ -146,18 +159,34 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.plateau_timer[self.in_plateau] -= 1
 
         # ── 3. Relaksacja Bogacza (Faza Ingerencji) ────────────────────
-        # Zamiast mechanicznie pchać sygnał, pozwalamy potencjałowi v osiągnąć
-        # równowagę między wejściem z dołu (pre_f32) a przewidywaniem z góry.
+        # POPRAWKA Bug A: Obliczamy drive feedforward z basal weights (self.w)
+        # przed pętlą relaksacji. Pełni rolę "wejścia bazalnego" (thalamic drive),
+        # uzgadnianego z predykcją apikalną (w_apical). Bez tego self.w było uczone
+        # przez STDP, ale NIGDY nie wpływało na dynamikę v — sieć była "ślepa" na
+        # wyuczone wzorce feedforward.
+        ff_drive = pre_f32 @ self.w  # (num_neurons,) — stały przez całą pętlę
+
+        # POPRAWKA Bug C: Proaktywna inhibicja k-WTA przed relaksacją i detekcją spike'ów
+        self._apply_proactive_inhibition()
+
         relaxation_steps = getattr(self.pyr_config, 'relaxation_steps', 10)
         relaxation_rate = getattr(self.pyr_config, 'relaxation_rate', 0.1)
 
         for _ in range(relaxation_steps):
-            self.prediction_error = pre_f32 - self.top_down_prediction
-            # Sprzężone wagi w_apical ściągają potencjał w stronę minimalizacji błędu
-            error_gradient = self.prediction_error @ self.w_apical
-            self.v += relaxation_rate * error_gradient
-            np.clip(self.v, getattr(self.pyr_config, 'v_reset', -75.0), getattr(self.pyr_config, 'v_thresh', -55.0) + 10.0, out=self.v)
+            r = np.clip((self.v - getattr(self.pyr_config, 'v_rest', -70.0)) / (
+                        getattr(self.pyr_config, 'v_thresh', -55.0) - getattr(self.pyr_config, 'v_rest', -70.0)), 0.0,
+                        1.0)
+            my_prediction = r @ self.w_apical.T
 
+            self.prediction_error = pre_f32 - my_prediction
+            error_gradient = self.prediction_error @ self.w_apical
+
+            # POPRAWKA Bug A: Gradient łączony = PC error + apical top-down + basal ff_drive
+            combined_gradient = error_gradient + ff_drive
+
+            self.v += relaxation_rate * combined_gradient
+            np.clip(self.v, getattr(self.pyr_config, 'v_reset', -75.0),
+                    getattr(self.pyr_config, 'v_thresh', -55.0) + 10.0, out=self.v)
         # ── 4. Nieliniowy efektywny próg ────────────────────────
         effective_thresh = (
                 self.v_thresh_adaptive
@@ -184,9 +213,25 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.refrac_count[self.has_spiked] = getattr(self.pyr_config, 'refrac_period', 2)
 
         self.x_post[self.has_spiked] += 1.0
-        # W tym miejscu wywołujemy super().forward TYLKO po to, by zaktualizować k-WTA i bazowe trace'y
-        # Wymaga to lekkiego hacku, by rodzic nie nadpisał naszego v.
-        # Czystym podejściem jest użycie has_spiked ustalonego przez naszą relaksację.
+
+        # POPRAWKA Bug 1 (cd.): Aktualizacja śladu kwalifikowalności.
+        # Musi być tutaj, przed wzmocnieniem burst (krok 6), które mnożył będzie
+        # już wypełniony ślad e zamiast zerowej macierzy.
+        self.e *= self._trace_decay
+        if np.any(self.has_spiked):
+            self.e[:, self.has_spiked] += self.x_pre[:, np.newaxis]
+        if np.any(pre_active):
+            self.e[pre_active, :] += self.x_post[np.newaxis, :]
+
+        # ZMODYFIKOWANE: Ręczna integracja k-WTA bez niszczenia self.v
+        self.window_spike_counts += self.has_spiked.astype(np.int32)
+        self._current_window_size += 1
+
+        if getattr(self, '_phase_reset_pending', False):
+            self._apply_lateral_inhibition()
+            if getattr(self, '_homeostatic_kwta', False) and self._current_window_size > 0:
+                self._update_kwta_homeostasis(self._current_window_size)
+            self._reset_window()
         spikes = self.has_spiked.copy()
 
         self.v_thresh_adaptive = homeostatic_thresh

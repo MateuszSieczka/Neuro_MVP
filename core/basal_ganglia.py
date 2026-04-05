@@ -9,6 +9,7 @@ class ContinuousBGConfig:
     critic_lr: float = 0.005
     actor_lr: float = 0.001
     tau_e: float = 200.0
+    tau_hidden: float = 20.0  # Stała czasowa membrany warstwy ukrytej Krytyka (ms)
     dt: float = 1.0
     exploration_noise: float = 0.2  # Odchylenie standardowe szumu
     hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
@@ -33,6 +34,8 @@ class SNNDeepCritic:
         self.e_h = np.zeros((state_size, config.hidden_size), dtype=np.float32)
         self.e_v = np.zeros(config.hidden_size, dtype=np.float32)
         self._trace_decay = np.exp(-self.config.dt / self.config.tau_e)
+        # Poprawny biologiczny zanik membrany: exp(-dt/tau_hidden) zamiast hardcoded 0.8
+        self._mem_decay: float = float(np.exp(-self.config.dt / self.config.tau_hidden))
 
         # Potencjał dla neuronów ukrytych (uproszczony LIF dla krytyka)
         self.v_hidden = np.zeros(config.hidden_size, dtype=np.float32)
@@ -44,7 +47,7 @@ class SNNDeepCritic:
         state_f32 = state_spikes.astype(np.float32)
 
         # 1. Integracja warstwy ukrytej
-        self.v_hidden = self.v_hidden * 0.8 + np.dot(state_f32, self.w_h)
+        self.v_hidden = self.v_hidden * self._mem_decay + np.dot(state_f32, self.w_h)
         spikes = (self.v_hidden > 0.5).astype(np.float32)
         self.v_hidden[spikes > 0] = 0.0
 

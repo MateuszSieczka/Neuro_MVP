@@ -1,8 +1,9 @@
 import unittest
 import numpy as np
 
+from core.config import SNNWorldModelConfig
 from core.neuron import LIFLayer
-from core.world_model import WorldModel
+from core.world_model import SNNWorldModel
 from core.neuromodulator import NeuromodulatorSystem
 from core.replay_buffer import ReplayBuffer, Experience
 
@@ -39,8 +40,8 @@ def _make_layers() -> dict[str, LIFLayer]:
     return {LAYER_NAME: _make_layer()}
 
 
-def _make_world_model() -> WorldModel:
-    return WorldModel(state_size=STATE_SIZE, action_size=ACTION_SIZE)
+def _make_world_model() -> SNNWorldModel:
+    return SNNWorldModel(state_size=STATE_SIZE, action_size=ACTION_SIZE)
 
 
 def _make_nm() -> NeuromodulatorSystem:
@@ -263,7 +264,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
 
         # Use a large learning rate so a single step has a measurable effect
         from core.config import WorldModelConfig
-        wm = WorldModel(STATE_SIZE, ACTION_SIZE, WorldModelConfig(learning_rate=0.5))
+        wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(feedback_learning_rate=0.5))
         layers = _make_layers()
         nm = _make_nm()
         nm.dopamine = 1.0

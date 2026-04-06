@@ -17,6 +17,7 @@ class ContinuousBGConfig:
     tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
     w_clip: float = 3.0      # Synaptic saturation for actor: max |w| (receptor density / spine volume)
     w_clip_critic: float = 2.5  # Tighter clip for critic — stabilizes backprop through w_v
+    td_rms_decay: float = 0.999  # Slow decay for running RMS of TD error (adaptive DA gain)
 
 
 class SNNDeepCritic:
@@ -97,7 +98,7 @@ class SNNDeepCritic:
     def update(self, td_error: float) -> None:
         """Biologiczna reguła uczenia: δ × ślad kwalifikowalności.
 
-        Warstwa wyjściowa (w_v): prosta reguła Hebba modulowana dopaminą:
+        Warstwa wyjściowa (w_v): reguła Hebba modulowana dopaminą:
             Δw_v = lr × δ × e_v
 
         Warstwa ukryta (w_h): TD error jest propagowany wstecz przez w_v,
@@ -105,10 +106,10 @@ class SNNDeepCritic:
         plastyczność korowo-prążkowiową.  Pochodna tanh' modeluje
         nieliniową odpowiedź dendrytyczną neuronu postsynaptycznego.
 
-        Stabilność zapewniają:
-        - bounded activation (tanh ∈ [-1,1]) → bounded traces
-        - weight decay (homeostaza synaptyczna / synaptic scaling)
-        - TD clipping (ograniczony wpływ ekstremalnych zdarzeń)
+        Per-synapse bounds are enforced by:
+        - trace clips (±2.0): Ca²⁺ saturation in dendritic spines
+        - weight clips (±2.5): receptor density / spine volume limits
+        - TD clipping: bounded influence of extreme events
         """
         td_error = float(np.clip(td_error, -10.0, 10.0))
 
@@ -169,7 +170,18 @@ class SNNContinuousActor:
     gdzie ∇ log π(a|s) = state ⊗ (one_hot(a) - π(·|s))
     Biologicznie: wybrany neuron MSN (D1) ma pozytywny ślad,
     niewybrany (D2) — negatywny proporcjonalnie do π.
+
+    Homeostatic synaptic scaling (Turrigiano 2008):
+    Each MSN (output neuron) maintains its total afferent synaptic
+    strength near a target level. If the column norm grows beyond
+    target, all incoming synapses to that neuron are multiplicatively
+    scaled down. This prevents policy lock-in from monotonic weight
+    growth while preserving the RELATIVE structure of learned weights.
     """
+
+    # Target L2 norm per MSN column — set from init scale.
+    # Biological: the target firing rate that homeostatic scaling maintains.
+    _HOMEOSTATIC_TARGET: float = 1.0
 
     def __init__(self, state_size: int, motor_dim: int, internal_dim: int, config: ContinuousBGConfig):
         self.config = config
@@ -245,10 +257,30 @@ class SNNContinuousActor:
         return motor_action, internal_action
 
     def update(self, td_error: float) -> None:
-        """Policy gradient: δ × eligibility trace."""
+        """Policy gradient: δ × eligibility trace + homeostatic scaling.
+
+        Per-synapse Hebbian update followed by per-neuron (column)
+        homeostatic normalization (Turrigiano 2008).
+
+        The scaling preserves relative weight structure (which input
+        features matter more for each action) while bounding absolute
+        magnitude. This prevents the monotonic weight growth that
+        causes policy lock-in during long successful episodes.
+        """
         td_error = float(np.clip(td_error, -10.0, 10.0))
 
         self.w_mu += self.config.actor_lr * td_error * self.e_actor
+
+        # Homeostatic synaptic scaling: per-column (per-MSN) normalization.
+        # Each column of w_mu represents all afferent synapses to one MSN.
+        # If column norm exceeds target, scale down multiplicatively.
+        # This is a slow process (hours in biology) — we apply it every step
+        # but the effect is gentle (only kicks in when norm exceeds target).
+        for j in range(self.action_dim):
+            col_norm = np.linalg.norm(self.w_mu[:, j])
+            if col_norm > self._HOMEOSTATIC_TARGET:
+                self.w_mu[:, j] *= self._HOMEOSTATIC_TARGET / col_norm
+
         np.clip(self.w_mu, -self.config.w_clip, self.config.w_clip, out=self.w_mu)
 
     def get_action(self) -> int:
@@ -281,6 +313,36 @@ class BasalGangliaAGISystem:
         self.actor = SNNContinuousActor(state_size, motor_dim, internal_dim, self.config)
         self.last_v = 0.0
 
+        # Adaptive DA gain (Tobler, Fiorillo & Schultz 2005):
+        # VTA dopamine neurons adapt their response gain to the variance
+        # of recent rewards — larger variance → lower gain per unit RPE.
+        # This prevents weight explosions during high-variance phases
+        # and amplifies learning during low-variance consolidation.
+        # Implemented as running RMS of TD error, used to normalize
+        # the plasticity signal (td / rms(td)).
+        self._td_rms: float = 1.0  # Start at 1.0 to avoid division by near-zero
+
+    def normalize_td(self, td_error: float) -> float:
+        """Adaptive DA gain normalization (Tobler et al. 2005).
+
+        VTA dopamine neurons adapt their gain to the range of recent
+        reward prediction errors, but preserve proportional responses
+        within that range.
+
+        Key: we normalize by max(rms, 1.0) — NOT by rms alone.
+        - When RMS < 1 (early learning, small errors): signal passes unchanged
+        - When RMS > 1 (large errors, instability): signal is damped
+        This preserves the learning signal during normal operation
+        and only kicks in as a stabilizer during high-variance phases.
+        """
+        decay = self.config.td_rms_decay
+        self._td_rms = float(np.sqrt(
+            decay * self._td_rms ** 2 + (1 - decay) * td_error ** 2
+        ))
+        # Only damp when RMS exceeds baseline (1.0)
+        rms = max(self._td_rms, 1.0)
+        return float(np.clip(td_error / rms, -5.0, 5.0))
+
     def step(self, state_spikes: np.ndarray, reward: float, is_terminal: bool = False) -> Tuple[
         np.ndarray, np.ndarray, float]:
         current_v = self.critic.forward(state_spikes)
@@ -291,9 +353,12 @@ class BasalGangliaAGISystem:
         else:
             td_error = reward + self.config.gamma * current_v - self.last_v
 
+        # Adaptive normalization before plasticity
+        norm_td = self.normalize_td(td_error)
+
         # Aktualizacja
-        self.critic.update(td_error)
-        self.actor.update(td_error)
+        self.critic.update(norm_td)
+        self.actor.update(norm_td)
 
         # Akcja na kolejny krok
         motor_action, internal_action = self.actor.forward(state_spikes)
@@ -302,7 +367,9 @@ class BasalGangliaAGISystem:
         return motor_action, internal_action, td_error
 
     def reset_state(self) -> None:
-        """Reset all transient state between episodes. Learned weights are preserved."""
+        """Reset all transient state between episodes. Learned weights are preserved.
+        NOTE: _td_rms is NOT reset — it's a slow statistic across episodes.
+        """
         self.last_v = 0.0
         self.critic.reset_state()
         self.actor.reset_state()

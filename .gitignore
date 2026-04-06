@@ -178,6 +178,9 @@ cython_debug/
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
+.vs/Neuro_MVP.slnx/FileContentIndex/
+.vs/Neuro_MVP/CopilotIndices/
+
 .cursorindexingignore
 .vs/Neuro_MVP.slnx/FileContentIndex/30ae695f-7672-4042-af3d-2dbebd2f940f.vsidx
 .vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/CodeChunks.db
@@ -304,3 +307,4 @@ cython_debug/
 .vs/Neuro_MVP.slnx/FileContentIndex/4a22399d-c691-44ee-a7bd-fdbcce8ab226.vsidx
 .vs/Neuro_MVP.slnx/FileContentIndex/d8f1d4ec-9ffd-4b78-b1fd-0e0ddd7a6743.vsidx
 .vs/Neuro_MVP.slnx/FileContentIndex/f384c9b9-6b5e-4cc4-83e8-ca4fe8be80f4.vsidx
+.vs/Neuro_MVP.slnx/copilot-chat/422d52dd/sessions/5f4bae2b-7f69-4ae0-a1f1-32e8c0c341cf

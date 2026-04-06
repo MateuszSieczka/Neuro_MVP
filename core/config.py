@@ -159,16 +159,34 @@ class WorkingMemoryConfig(LIFConfig):
 class NeuromodulatorConfig:
     """
     Hyperparameters for the four-channel neuromodulatory system.
+
+    Each modulator may operate in two modes:
+
+    - **Phasic**: fast, per-step response to momentary signals (burst firing).
+    - **Tonic**: slow, sustained baseline tracking average conditions.
+
+    Dopamine is the primary example of this dual mode (Grace 1991):
+    phasic DA encodes reward-prediction-error (RPE), while tonic DA from
+    VTA tracks average reward rate and gates consolidation (Niv et al. 2007).
     """
+    # Phasic channel time-constants (per-step low-pass filters)
     da_decay: float = 0.95
     ach_decay: float = 0.90
     ne_decay: float = 0.93
     sero_decay: float = 0.97
 
+    # Tonic DA (VTA background firing): tracks relative performance.
+    # Updated episodically (not per-step). Decay of 0.9 means
+    # time constant ≈ 10 episodes — slow enough for stability,
+    # fast enough to respond to sustained improvement.
+    tonic_da_decay: float = 0.9
+
+    # Baselines: resting-state levels before any experience
     baseline_da: float = 0.5
     baseline_ach: float = 0.5
     baseline_ne: float = 0.3
     baseline_sero: float = 0.6
+    baseline_tonic_da: float = 0.0   # No tonic reward signal before any episodes
 
 
 @dataclass(frozen=True, kw_only=True)

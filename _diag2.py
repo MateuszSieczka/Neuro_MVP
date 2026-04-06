@@ -67,6 +67,6 @@ for ep in range(120):
             f"Δw_mu={dw_mu:.4f} | "
             f"|e_a|={np.mean(np.abs(a.e_actor)):.3f} | "
             f"noise={a.noise_scale:.3f} act_bias={act_ratio:.2f} "
-            f"ema_r={agent._avg_episode_reward:.0f}"
+            f"NE={agent.neuromod.noradrenaline:.3f} 5HT={agent.neuromod.serotonin:.3f}"
         )
 env.close()

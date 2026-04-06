@@ -41,11 +41,6 @@ class SNNAgent(Agent):
             gamma=0.95, critic_lr=0.01, actor_lr=0.005,
             exploration_noise=0.3, hidden_size=64,
         )
-        
-        # Zapisujemy wartości bazowe dla homeostazy neuromodulacyjnej
-        self._base_actor_lr = self._bg_config.actor_lr
-        self._base_critic_lr = self._bg_config.critic_lr
-        self._base_noise = self._bg_config.exploration_noise
 
         self.bg = BasalGangliaAGISystem(
             state_size=bg_input_size, motor_dim=n_actions,
@@ -66,8 +61,8 @@ class SNNAgent(Agent):
         self._trace = np.zeros(state_size, dtype=np.float32)
         self._last_td_error: float = 0.0
         self._step_count: int = 0
-        self._episode_reward: float = 0.0     # Running reward for current episode
-        self._avg_episode_reward: float = 0.0  # EMA of episode rewards (ventral striatum)
+        self._episode_return: float = 0.0   # Accumulated return for tonic DA
+        self._episode_steps: int = 0
 
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
         if not self._use_trace:
@@ -111,32 +106,34 @@ class SNNAgent(Agent):
 
         clipped_td = float(np.clip(td_error, -10.0, 10.0))
 
-        # --- Modulacja plastyczności przez dopaminę tonową ---
-        # Biologicznie: VTA utrzymuje tonowy poziom DA proporcjonalny
-        # do uśrednionej nagrody. Wysoka tonic DA → zmniejszona odpowiedź
-        # na phasic DA → mniejsza plastyczność (konsolidacja).
-        # Niska tonic DA → pełna plastyczność (eksploracja/uczenie).
-        #
-        # Implementacja: skalujemy efektywny TD error przez czynnik
-        # zależny od _avg_episode_reward. Gdy avg>200, agent już
-        # „wie" co robić — dalsze uczenie jest głównie szumem.
-        if self._avg_episode_reward > 200.0:
-            # Płynna redukcja: 200→scale=1.0, 400→0.3, 500→0.15
-            consolidation = (self._avg_episode_reward - 200.0) / 300.0
-            consolidation = min(consolidation, 1.0)
-            plasticity_scale = max(0.15, 1.0 - 0.85 * consolidation)
-        else:
-            plasticity_scale = 1.0
+        # 2. Adaptive DA gain normalization (Tobler, Fiorillo & Schultz 2005)
+        #    VTA dopamine neurons scale their phasic burst magnitude inversely
+        #    with the variance of recent reward prediction errors. This is a
+        #    fundamental property of midbrain DA signaling:
+        #    - High variance → low gain → prevents weight explosions
+        #    - Low variance → high gain → fine-tuning during consolidation
+        #    The BG system maintains a running RMS of TD error for this.
+        norm_td = self.bg.normalize_td(clipped_td)
 
-        # 2. Aktualizacja obu modułów z modulowanym sygnałem
-        self.bg.critic.update(clipped_td * plasticity_scale)
-        self.bg.actor.update(clipped_td * plasticity_scale)
+        # 3. Consolidation-gated plasticity modulation
+        #    Biological basis (Niv et al. 2007; Doya 2002):
+        #    Plasticity decreases when the agent is BOTH:
+        #    (a) consistently rewarded (high tonic DA from VTA), AND
+        #    (b) making stable predictions (high serotonin from raphe).
+        #    Gate = sqrt(tonic_DA × 5-HT), requiring both signals.
+        #    Gentle scaling: gate=0 → 1.0, gate=0.7 → 0.59, gate=1.0 → 0.5
+        gate = self.neuromod.consolidation_gate
+        plasticity_scale = 1.0 / (1.0 + gate)
+
+        self.bg.critic.update(norm_td * plasticity_scale)
+        self.bg.actor.update(norm_td * plasticity_scale)
 
         self._last_td_error = td_error
 
-        # 3. Aktualizacja Neuromodulatora
-        # NM musi otrzymać SUROWY sygnał, by prawidłowo wyzwolić skok Noradrenaliny (NE=1.0)
-        # co skompresuje ślady (tau) po każdym upadku.
+        # 4. Neuromodulator update (raw TD for proper NE/DA/5-HT dynamics)
+        #    Note: neuromod receives RAW td_error, not normalized — the phasic
+        #    DA sigmoid and NE channels need the actual error magnitude to
+        #    properly track surprise and RPE direction.
         if self._use_wm:
             state_f32 = state.astype(np.float32)
             next_f32 = next_state.astype(np.float32)
@@ -149,72 +146,48 @@ class SNNAgent(Agent):
             )
         else:
             # Soft-normalize TD error to [0,1] for neuromodulator.
-            # sigmoid(|δ|) smoothly maps small errors→~0 and large errors→~1,
-            # unlike hard clip which saturates at |δ|>1.
             norm_td = float(abs(td_error) / (1.0 + abs(td_error)))
             self.neuromod.update(
                 prediction_error=np.array([norm_td], dtype=np.float32),
-                td_error=td_error, novelty=0.0
+                td_error=td_error, novelty=0.0,
             )
 
-        # 4. Neuromodulacyjna Plastyczność (Zamknięcie pętli autotuningu)
+        # 4b. Episode-level tonic DA update (ventral striatum → VTA)
+        self._episode_return += reward
+        self._episode_steps += 1
+        if done:
+            self.neuromod.update_tonic_da(self._episode_return, self._episode_steps)
+            self._episode_return = 0.0
+            self._episode_steps = 0
+
+        # 5. NE-driven trace compression (closed loop: TD → NM → BG timescales)
         self.bg.set_plasticity_timescales(ne=self.neuromod.tau_compression)
 
         if self._use_wm:
             self.neuromod.apply_to_layer(self.world_model)
 
-        # 5. Adaptacja eksploracji — sygnał konwergencji oparty na nagrodach.
-        # Biologicznie: brzuszne prążkowie (ventral striatum) śledzi średnią nagrodę.
-        # Wysoka nagroda → aktywacja VTA → dopamina tonowa → redukcja szumu.
-        # Niska nagroda → spadek tonu → wzrost eksploracji.
+        # 6. Exploration control: serotonin primary + tonic DA floor
+        #    Primary signal: serotonin — prediction accuracy.
+        #    (1-sero)² drives noise. Works well for dense reward.
         #
-        # Używamy EMA nagrody epizodowej zamiast serotoniny (która wymaga
-        # skonwergowanego krytyka). To jest bardziej bezpośredni sygnał sukcesu.
-        self._episode_reward += reward
-        if done:
-            ep_reward = self._episode_reward
-            self._episode_reward = 0.0
-
-            # EMA z α=0.2
-            self._avg_episode_reward = (
-                0.8 * self._avg_episode_reward + 0.2 * ep_reward
-            )
-
-            # Adaptacja eksploracji — podwójny sygnał z surprise detection:
-            # 1. Bieżący epizod (szybka informacja zwrotna)
-            # 2. EMA (stabilność — czy agent konsekwentnie jest dobry?)
-            # 3. Surprise — nagły spadek poniżej oczekiwań (phasic DA dip)
-            #
-            # Biologicznie: dopamina tonowa (VTA) podąża za średnią nagrodą (EMA),
-            # podczas gdy phasic DA reaguje na bieżące zdarzenie.
-            # Niespodziewany upadek po dobrej serii → duży phasic DA dip →
-            # natychmiastowy wzrost eksploracji (locus coeruleus → NE burst).
-            ema_good = self._avg_episode_reward > 100.0  # EMA > 100 kroków
-            current_good = ep_reward > 200.0              # Ten epizod > 200 kroków
-
-            # Surprise detection: bieżący wynik znacząco poniżej oczekiwanego
-            surprise = (self._avg_episode_reward > 300.0 and
-                        ep_reward < 0.5 * self._avg_episode_reward)
-
-            if surprise:
-                # Niespodziewany upadek — phasic DA dip → natychmiastowy
-                # wzrost szumu + przywrócenie plastyczności.
-                # Biologicznie: LC burst resetuje eksplorację.
-                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale + 0.15)
-            elif ema_good and current_good:
-                # Oba sygnały pozytywne → pewna redukcja
-                self.bg.actor.noise_scale = max(0.05, self.bg.actor.noise_scale * 0.85)
-            elif not ema_good and not current_good:
-                # Oba negatywne → wzrost eksploracji
-                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale * 1.10)
-            # Mieszane sygnały (bez surprise) → bez zmiany
+        #    Floor from tonic DA stagnation: when tonic_da ≈ 0.5 for many
+        #    episodes (agent stuck at neutral — neither improving nor
+        #    declining), maintain minimum noise to escape local optima.
+        #    This addresses the sparse-reward trap (MountainCar):
+        #    critic converges to V=-20, TD→0, sero→1, noise→0, stuck.
+        #
+        #    Stagnation = 1 - |2×tda - 1|: max (1.0) at tda=0.5,
+        #    zero at tda=0 or tda=1.  Scaled by 0.05 for a gentle floor.
+        sero_noise = (1.0 - self.neuromod.serotonin) ** 2
+        stagnation = 1.0 - abs(2.0 * self.neuromod.tonic_da - 1.0)
+        noise_floor = 0.15 * stagnation
+        self.bg.actor.noise_scale = max(noise_floor, sero_noise)
 
         self._step_count += 1
 
     def reset(self) -> None:
         self.bg.reset_state()
         self._trace = np.zeros(self.state_size, dtype=np.float32)
-        self._episode_reward = 0.0
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()

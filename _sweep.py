@@ -26,7 +26,7 @@ def run_spark_benchmark():
     
     nm_cfg = NeuromodulatorConfig() # Używamy domyślnych, zbalansowanych wartości
 
-    n_ep = 120
+    n_ep = 200
     scores = []
 
     print(f"--- Benchmark zbieżności dla CartPole (Cel: <= 80-100 epizodów) ---")
@@ -53,7 +53,7 @@ def run_spark_benchmark():
         scores.append(final_score)
         
         # Opcjonalnie: możemy też sprawdzić, w którym epizodzie agent pierwszy raz wbił max
-        first_solved = next((i for i, log in enumerate(result.episode_logs) if log.total_reward >= 490), ">120")
+        first_solved = next((i for i, log in enumerate(result.episode_logs) if log.total_reward >= 490), f">{n_ep}")
         
         print(f"Seed {seed:3d} | Średni wynik (ost. 20 ep): {final_score:5.0f}/500 | Pierwszy sukces w ep: {first_solved}")
         env.close()

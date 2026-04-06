@@ -151,11 +151,16 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         if np.any(pre_active):
             self.e[pre_active, :] += self.x_post[np.newaxis, :]
 
-        # Zwracamy błąd po relaksacji jako twarde impulsy do nauki sieci
+        # Error spikes remain accessible as an attribute for consumers that need them,
+        # but the layer's OUTPUT is has_spiked (num_neurons) — consistent with
+        # LIFLayer.forward() and PyramidalLayer.forward().
+        # Biologicznie: szlaki feedforward korowe transmitują wzorce impulsów
+        # (firing rates neuronów piramidalnych), a nie surowe sygnały błędu.
+        # Błąd jest wewnętrznym sygnałem księgowym warstwy.
         positive_error = np.clip(self.prediction_error, 0.0, 1.0) * self.ach_level
         self.error_spikes = self._encoder.encode(positive_error).astype(bool)
 
-        return self.error_spikes.astype(np.float32)
+        return self.has_spiked.astype(np.float32)
 
     # ------------------------------------------------------------------
     # Prediction interface
@@ -211,7 +216,7 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
                 norms = np.linalg.norm(self.feedback_w, axis=1, keepdims=True) + 1e-8
                 self.feedback_w /= norms
             else:
-                np.clip(self.feedback_w, 0.0, 1.0, out=self.feedback_w)
+                np.clip(self.feedback_w, -1.0, 2.0, out=self.feedback_w)
 
     # ------------------------------------------------------------------
     # State management

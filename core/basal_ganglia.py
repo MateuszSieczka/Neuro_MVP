@@ -63,17 +63,32 @@ class SNNDeepCritic:
 
     def update(self, td_error: float) -> None:
         """Propagacja wsteczna błędu TD przez warstwy ukryte za pomocą śladów."""
+        # Normalizacja śladów kwalifikowalności: zapobiega katastrofalnym
+        # aktualizacjom, gdy ślady akumulują się przez długi epizod.
+        # Biologiczny odpowiednik: ograniczona pojemność znaczników synaptycznych.
+        e_v_scale = max(np.linalg.norm(self.e_v), 1.0)
+        e_h_scale = max(np.linalg.norm(self.e_h), 1.0)
+
         # Update warstwy wyjściowej
-        dw_v = self.config.critic_lr * td_error * self.e_v
+        dw_v = self.config.critic_lr * td_error * (self.e_v / e_v_scale)
 
         # Odsprzęgnięty backprop do warstwy ukrytej (przybliżenie liniowe)
         backward_error = td_error * self.w_v
-        dw_h = self.config.critic_lr * self.e_h * backward_error[np.newaxis, :]
+        dw_h = self.config.critic_lr * (self.e_h / e_h_scale) * backward_error[np.newaxis, :]
 
         self.w_v += dw_v
         self.w_h += dw_h
         np.clip(self.w_v, -10.0, 10.0, out=self.w_v)
         np.clip(self.w_h, -10.0, 10.0, out=self.w_h)
+
+
+    def reset_state(self) -> None:
+        """Reset transient state (membrane, traces). Weights are preserved."""
+        self.v_hidden.fill(0.0)
+        self.last_hidden_spikes.fill(0.0)
+        self.hidden_firing_rate.fill(0.0)
+        self.e_h.fill(0.0)
+        self.e_v.fill(0.0)
 
 
 class SNNContinuousActor:
@@ -127,6 +142,11 @@ class SNNContinuousActor:
         np.clip(self.w_mu, -5.0, 5.0, out=self.w_mu)
 
 
+    def reset_state(self) -> None:
+        """Reset transient traces. Weights are preserved."""
+        self.e_actor.fill(0.0)
+
+
 class BasalGangliaAGISystem:
     def __init__(self, state_size: int, motor_dim: int, internal_dim: int = 1,
                  config: ContinuousBGConfig | None = None):
@@ -154,3 +174,9 @@ class BasalGangliaAGISystem:
         self.last_v = 0.0 if is_terminal else current_v
 
         return motor_action, internal_action, td_error
+
+    def reset_state(self) -> None:
+        """Reset all transient state between episodes. Learned weights are preserved."""
+        self.last_v = 0.0
+        self.critic.reset_state()
+        self.actor.reset_state()

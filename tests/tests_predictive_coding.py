@@ -58,21 +58,29 @@ class TestPredictiveCodingLayer(unittest.TestCase):
         self.assertTrue(np.all(v_high_w >= v_low_w))
 
     def test_ach_modulation_on_errors(self) -> None:
-        """Sprawdza, czy ACh poprawnie skaluje wyjściowe impulsy błędu."""
+        """Sprawdza, czy ACh poprawnie skaluje wyjściowe impulsy błędu.
+
+        forward() zwraca has_spiked (num_neurons) — wzorce impulsów warstwy.
+        error_spikes (num_inputs) są dostępne jako atrybut warstwy i
+        skalowane przez ACh: ACh=1 → pełne transmitowanie błędów,
+        ACh=0 → błędy stłumione.
+        """
         pre_spikes = np.ones(self.num_inputs, dtype=np.float32)
         self.layer.prediction_error.fill(1.0)  # Sztuczny błąd
 
         # Pełne zaufanie oddolne (ACh = 1.0)
         self.layer.set_ach_level(1.0)
-        out_high_ach = self.layer.forward(pre_spikes)
+        self.layer.forward(pre_spikes)
+        errors_high_ach = self.layer.error_spikes.copy()
 
         # Brak zaufania oddolnego (ACh = 0.0) -> brak impulsów błędu
         self.layer.reset_state()
         self.layer.set_ach_level(0.0)
-        out_low_ach = self.layer.forward(pre_spikes)
+        self.layer.forward(pre_spikes)
+        errors_low_ach = self.layer.error_spikes.copy()
 
-        self.assertEqual(np.sum(out_low_ach), 0, "Przy ACh=0 błędy powinny być tłumione.")
-        self.assertGreater(np.sum(out_high_ach), 0, "Przy ACh=1 błędy powinny być transmitowane.")
+        self.assertEqual(np.sum(errors_low_ach), 0, "Przy ACh=0 błędy powinny być tłumione.")
+        self.assertGreater(np.sum(errors_high_ach), 0, "Przy ACh=1 błędy powinny być transmitowane.")
 
     def test_feedback_weight_learning(self) -> None:
         """Weryfikuje Hebbowskie uczenie wag predykcji odgórnej."""

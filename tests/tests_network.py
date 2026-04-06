@@ -171,7 +171,9 @@ class TestNetworkGraphSequenceMemory(unittest.TestCase):
 
     def test_step_updates_attached_sequence_memory(self) -> None:
         net = NetworkGraph()
-        config = PredictiveCodingConfig(k_winners=4, window_ms=5)
+        # refrac_period=0 ensures the layer fires on every step with strong weights,
+        # providing consecutive non-zero spike patterns for transition_w learning.
+        config = PredictiveCodingConfig(k_winners=4, window_ms=5, refrac_period=0)
         layer = PredictiveCodingLayer(4, 4, config=config)
         # Force weights to guarantee spikes
         layer.w.fill(50.0)
@@ -184,8 +186,13 @@ class TestNetworkGraphSequenceMemory(unittest.TestCase):
         for _ in range(5):
             net.step({"L1": np.ones(4, dtype=np.float32)})
 
-        # Prev pattern should not be purely zeros if it observed spikes
-        self.assertTrue(np.any(sm.prev_pattern > 0))
+        # forward() returns has_spiked (num_neurons). With refrac_period=0 the
+        # layer fires every step, so SequenceMemory observes consecutive non-zero
+        # patterns and transition_w learns temporal associations.
+        self.assertTrue(
+            np.any(sm.transition_w > 0),
+            "SequenceMemory nie wyuczyła wag przejść po kolejnych impulsach."
+        )
 
 
 class TestNetworkGraphReset(unittest.TestCase):

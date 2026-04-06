@@ -187,8 +187,11 @@ class LIFLayer:
         dw = self.config.learning_rate * m_t * self.e * error_signal
         self.w += dw
 
-        # Ochrona przed wybuchem wag
-        np.clip(self.w, 0.0, 1.0, out=self.w)
+        # Ochrona przed wybuchem wag — zakres [-1, 2] pozwala na:
+        # - Połączenia hamujące (wagi ujemne, prawo Dale'a)
+        # - Silniejsze pobudzenie (wagi > 1.0 emergentne z STDP)
+        # - Jednocześnie zapobiega katastrofalnemu wzrostowi
+        np.clip(self.w, -1.0, 2.0, out=self.w)
 
 
     # ------------------------------------------------------------------

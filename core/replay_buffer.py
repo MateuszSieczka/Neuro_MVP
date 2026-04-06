@@ -28,7 +28,14 @@ class Experience:
 
     # DODANE: Przechowywanie lokalnych błędów warstw w momencie wystąpienia zdarzenia
     layer_errors: dict[str, np.ndarray] = field(default_factory=dict)
-    done: bool = False
+
+    # Neuromodulacyjna salience — ciągły sygnał istotności.
+    # Biologicznie: DA burst przy nagrodzie, spadek NE po osiągnięciu celu.
+    # Wartość 0.0 = rutyna, 1.0 = krytyczny moment (nagroda / zagrożenie).
+    # W ciągłym uczeniu salience wygładza granice epizodów:
+    #   effective_γ = γ × (1 − salience)
+    # więc salience=1.0 zeruje dyskont (odpowiednik twardego końca epizodu).
+    salience: float = 0.0
 
     def __post_init__(self) -> None:
         self.state = self.state.copy()
@@ -83,7 +90,7 @@ class ReplayBuffer:
         layer_outputs,
         prediction_error,
         layer_errors: dict[str, np.ndarray] | None = None,
-        done: bool = False  # <--- DODANE
+        salience: float = 0.0,
     ) -> None:
         if layer_errors is None:
             layer_errors = {}
@@ -92,7 +99,7 @@ class ReplayBuffer:
                 state=state, action=action, reward=reward, next_state=next_state,
                 layer_traces=layer_traces, layer_outputs=layer_outputs,
                 prediction_error=prediction_error, layer_errors=layer_errors,
-                done=done  # <--- DODANE
+                salience=salience,
             )
         )
     # ------------------------------------------------------------------
@@ -158,12 +165,17 @@ class ReplayBuffer:
         #  Wstępne obliczenie skumulowanych zwrotów G_t = r_t + γ*G_{t+1}
         # Iterujemy od najnowszego do najstarszego (tak jak potem robimy replay),
         # kumulując zwrot do tyłu.
+        #
+        # Salience-weighted discount: wysoka salience (DA burst) tłumi
+        # propagację przyszłego zwrotu — biologicznie odpowiada „przecięciu"
+        # śladu hipokampalnego w momencie silnego sygnału neuromodulacyjnego.
+        # salience=1.0 zeruje γ (twarda granica epizodu);
+        # salience ∈ (0,1) płynnie redukuje γ.
         cumulative_returns: list[float] = []
         G = 0.0
         for exp in reversed(experiences):
-            if exp.done:
-                G = 0.0  # Odetnij sygnał z przyszłych, niezwiązanych epizodów!
-            G = exp.reward + gamma * G
+            effective_gamma = gamma * (1.0 - exp.salience)
+            G = exp.reward + effective_gamma * G
             cumulative_returns.append(G)
         # cumulative_returns[0] = G dla najnowszego exp; odwrócimy dostęp poniżej.
 

@@ -73,6 +73,19 @@ class LIFLayer:
                 -self.config.dt / self.config.homeostatic_tau
             )
 
+            # ── Dark Matter Neurons ───────────────────────────────────
+            # A fraction of neurons start with an inflated threshold,
+            # making them silent under normal conditions.  High NE
+            # temporarily drops ALL thresholds, "awakening" these
+            # reserve neurons to encode novel stimuli via STDP.
+            self._ne_level: float = 0.0
+            n_dark = int(num_neurons * self.config.dark_matter_ratio)
+            self._is_dark_matter = np.zeros(num_neurons, dtype=bool)
+            if n_dark > 0:
+                dark_indices = np.random.choice(num_neurons, n_dark, replace=False)
+                self._is_dark_matter[dark_indices] = True
+                self.v_thresh_adaptive[dark_indices] += self.config.dark_matter_thresh_offset
+
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
@@ -107,11 +120,13 @@ class LIFLayer:
         self.v = np.where(in_refrac, self.config.v_reset, integrated_v)
 
         # 4. Spike detection — uses adaptive threshold if available
-        thresh = (
-            self.v_thresh_adaptive
-            if self._homeostatic
-            else np.float32(self.config.v_thresh)
-        )
+        #    Dark matter NE drop: high noradrenaline temporarily lowers
+        #    the effective threshold, awakening reserve neurons.
+        if self._homeostatic:
+            ne_drop = self._ne_level * self.config.ne_thresh_drop
+            thresh = self.v_thresh_adaptive - ne_drop
+        else:
+            thresh = np.float32(self.config.v_thresh)
         self.has_spiked = (self.v >= thresh) & ~in_refrac
 
         # 5. Reset spiked neurons
@@ -163,6 +178,20 @@ class LIFLayer:
         )
 
     # ------------------------------------------------------------------
+    # Neuromodulatory input
+    # ------------------------------------------------------------------
+
+    def set_ne_level(self, ne: float) -> None:
+        """
+        Set the current noradrenaline level for dark matter recruitment.
+
+        Args:
+            ne: Float in [0, 1]. High NE → lower effective threshold.
+        """
+        if self._homeostatic:
+            self._ne_level = float(np.clip(ne, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
     # Weight update
     # ------------------------------------------------------------------
 
@@ -208,5 +237,9 @@ class LIFLayer:
         self.has_spiked.fill(False)
 
         if self._homeostatic:
+            # Restore thresholds to initial values (including dark matter offset)
             self.v_thresh_adaptive.fill(self.config.v_thresh)
+            if hasattr(self, '_is_dark_matter'):
+                self.v_thresh_adaptive[self._is_dark_matter] += self.config.dark_matter_thresh_offset
             self.avg_rate.fill(0.0)
+            self._ne_level = 0.0

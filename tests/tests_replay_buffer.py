@@ -288,7 +288,6 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 }
             )
 
-        from core.config import WorldModelConfig
         wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(feedback_learning_rate=0.5))
         layers = _make_layers()
         nm = _make_nm()
@@ -340,7 +339,6 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 }
             )
 
-        from core.config import WorldModelConfig
         from core.world_model import SNNWorldModelConfig
         wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(decode_lr=0.5))
         layers = _make_layers()

@@ -1,6 +1,6 @@
 import numpy as np
 
-from .config import WorldModelConfig, SNNWorldModelConfig, PredictiveCodingConfig
+from .config import SNNWorldModelConfig, PredictiveCodingConfig
 
 
 
@@ -184,46 +184,36 @@ class SNNWorldModel:
     ) -> dict[int, dict]:
         """
         Internally simulate candidate actions without real-world interaction.
+
+        For each candidate action the encoder runs a short micro-imagination
+        loop (config.rehearsal_steps forward passes).  This lets the membrane
+        accumulate action-specific signal so that k-WTA competition can
+        differentiate subtly different inputs (e.g. one-hot action vectors
+        that differ by a single element).
+
+        The encoder state is saved before and restored after all candidates
+        have been evaluated — imagination is side-effect-free.
         """
         recent_errors = self._error_history[-20:] if self._error_history else [0.5]
         avg_baseline = float(np.mean(recent_errors)) + 1e-8
 
         enc = self._encoder
 
-        # Pełna migawka stanu enkodera przed symulacją
-        saved_state = {
-            "v": enc.v.copy(),
-            "has_spiked": enc.has_spiked.copy(),
-            "refrac_count": enc.refrac_count.copy(),
-            "x_pre": enc.x_pre.copy(),
-            "x_post": enc.x_post.copy(),
-            "e": enc.e.copy(),
-            "top_down_prediction": enc.top_down_prediction.copy(),
-            "prediction_error": enc.prediction_error.copy(),
-        }
-        if hasattr(enc, "window_spike_counts"):
-            saved_state["window_spike_counts"] = enc.window_spike_counts.copy()
-            saved_state["_current_window_size"] = enc._current_window_size
-            saved_state["_phase_reset_pending"] = enc._phase_reset_pending
-        if hasattr(enc, "avg_rate"):
-            saved_state["avg_rate"] = enc.avg_rate.copy()
-        if hasattr(enc, "v_thresh_adaptive"):
-            saved_state["v_thresh_adaptive"] = enc.v_thresh_adaptive.copy()
+        # Full snapshot of encoder state before imagination
+        saved_state = self._snapshot_encoder()
 
         results: dict[int, dict] = {}
         for action in candidate_actions:
             combined = self._build_input(current_state_spikes, action)
-            # Przywracamy stan przed każdą kandydaturą
-            enc.v[:] = saved_state["v"]
-            enc.has_spiked[:] = saved_state["has_spiked"]
-            enc.refrac_count[:] = saved_state["refrac_count"]
-            enc.x_pre[:] = saved_state["x_pre"]
-            enc.x_post[:] = saved_state["x_post"]
-            enc.e[:] = saved_state["e"]
 
-            enc.forward(combined)
+            # Restore clean state before each candidate
+            self._restore_encoder(saved_state)
 
-            # Pobieramy stan neuronów, nie błąd
+            # Micro-imagination loop: multiple forward passes let the
+            # membrane charge and k-WTA differentiate action-specific input.
+            for _ in range(self.config.rehearsal_steps):
+                enc.forward(combined)
+
             internal = enc.has_spiked.astype(np.float32)
             predicted_next = np.clip(internal @ self.w_decode, 0.0, 1.0)
 
@@ -237,23 +227,8 @@ class SNNWorldModel:
                 "familiarity": 1.0 - novelty,
             }
 
-        # Przywracamy pełny stan po zakończeniu symulacji
-        enc.v[:] = saved_state["v"]
-        enc.has_spiked[:] = saved_state["has_spiked"]
-        enc.refrac_count[:] = saved_state["refrac_count"]
-        enc.x_pre[:] = saved_state["x_pre"]
-        enc.x_post[:] = saved_state["x_post"]
-        enc.e[:] = saved_state["e"]
-        enc.top_down_prediction[:] = saved_state["top_down_prediction"]
-        enc.prediction_error[:] = saved_state["prediction_error"]
-        if "window_spike_counts" in saved_state:
-            enc.window_spike_counts[:] = saved_state["window_spike_counts"]
-            enc._current_window_size = saved_state["_current_window_size"]
-            enc._phase_reset_pending = saved_state["_phase_reset_pending"]
-        if "avg_rate" in saved_state:
-            enc.avg_rate[:] = saved_state["avg_rate"]
-        if "v_thresh_adaptive" in saved_state:
-            enc.v_thresh_adaptive[:] = saved_state["v_thresh_adaptive"]
+        # Restore full encoder state after all imagination
+        self._restore_encoder(saved_state)
 
         return results
 
@@ -306,6 +281,49 @@ class SNNWorldModel:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _snapshot_encoder(self) -> dict:
+        """Capture full encoder state for side-effect-free simulation."""
+        enc = self._encoder
+        snap = {
+            "v": enc.v.copy(),
+            "has_spiked": enc.has_spiked.copy(),
+            "refrac_count": enc.refrac_count.copy(),
+            "x_pre": enc.x_pre.copy(),
+            "x_post": enc.x_post.copy(),
+            "e": enc.e.copy(),
+            "top_down_prediction": enc.top_down_prediction.copy(),
+            "prediction_error": enc.prediction_error.copy(),
+        }
+        if hasattr(enc, "window_spike_counts"):
+            snap["window_spike_counts"] = enc.window_spike_counts.copy()
+            snap["_current_window_size"] = enc._current_window_size
+            snap["_phase_reset_pending"] = enc._phase_reset_pending
+        if hasattr(enc, "avg_rate"):
+            snap["avg_rate"] = enc.avg_rate.copy()
+        if hasattr(enc, "v_thresh_adaptive"):
+            snap["v_thresh_adaptive"] = enc.v_thresh_adaptive.copy()
+        return snap
+
+    def _restore_encoder(self, snap: dict) -> None:
+        """Restore encoder state from a snapshot."""
+        enc = self._encoder
+        enc.v[:] = snap["v"]
+        enc.has_spiked[:] = snap["has_spiked"]
+        enc.refrac_count[:] = snap["refrac_count"]
+        enc.x_pre[:] = snap["x_pre"]
+        enc.x_post[:] = snap["x_post"]
+        enc.e[:] = snap["e"]
+        enc.top_down_prediction[:] = snap["top_down_prediction"]
+        enc.prediction_error[:] = snap["prediction_error"]
+        if "window_spike_counts" in snap:
+            enc.window_spike_counts[:] = snap["window_spike_counts"]
+            enc._current_window_size = snap["_current_window_size"]
+            enc._phase_reset_pending = snap["_phase_reset_pending"]
+        if "avg_rate" in snap:
+            enc.avg_rate[:] = snap["avg_rate"]
+        if "v_thresh_adaptive" in snap:
+            enc.v_thresh_adaptive[:] = snap["v_thresh_adaptive"]
 
     def _encode_action(self, action: int) -> np.ndarray:
         """One-hot encode an integer action index."""

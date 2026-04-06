@@ -180,18 +180,8 @@ class ReplayBuffer:
         # cumulative_returns[0] = G dla najnowszego exp; odwrócimy dostęp poniżej.
 
         wm_saved_state = None
-        if hasattr(world_model, '_encoder'):
-            enc = world_model._encoder
-            wm_saved_state = {
-                "v": enc.v.copy(),
-                "has_spiked": enc.has_spiked.copy(),
-                "refrac_count": enc.refrac_count.copy(),
-                "x_pre": enc.x_pre.copy(),
-                "x_post": enc.x_post.copy(),
-                "e": enc.e.copy(),
-                "top_down_prediction": enc.top_down_prediction.copy(),
-                "prediction_error": enc.prediction_error.copy(),
-            }
+        if hasattr(world_model, '_snapshot_encoder'):
+            wm_saved_state = world_model._snapshot_encoder()
         # Hippocampal reverse replay: most recent experience first
         for i, exp in enumerate(reversed(experiences)):
             # 1. Restore eligibility traces for ALL layers in the hierarchy
@@ -240,17 +230,9 @@ class ReplayBuffer:
 
             errors.append(float(np.mean(world_error ** 2)))
 
-        # [DODANE] 3. Przywrócenie stanu sieci po przebudzeniu
+        # Przywrócenie stanu sieci po przebudzeniu
         if wm_saved_state is not None:
-            enc = world_model._encoder
-            enc.v[:] = wm_saved_state["v"]
-            enc.has_spiked[:] = wm_saved_state["has_spiked"]
-            enc.refrac_count[:] = wm_saved_state["refrac_count"]
-            enc.x_pre[:] = wm_saved_state["x_pre"]
-            enc.x_post[:] = wm_saved_state["x_post"]
-            enc.e[:] = wm_saved_state["e"]
-            enc.top_down_prediction[:] = wm_saved_state["top_down_prediction"]
-            enc.prediction_error[:] = wm_saved_state["prediction_error"]
+            world_model._restore_encoder(wm_saved_state)
         return errors
 
     # ------------------------------------------------------------------

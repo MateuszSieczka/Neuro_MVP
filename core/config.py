@@ -24,17 +24,14 @@ class HomeostaticLIFConfig(LIFConfig):
     """
     Extends LIFConfig with homeostatic plasticity — synaptic scaling.
 
-    Biological grounding:
-      Neurons maintain a target firing rate over long timescales (hours in vivo,
-      hundreds-of-ms in simulation) by slowly sliding their effective threshold.
-      Silence → threshold decreases (neuron becomes more excitable).
-      Over-activation → threshold increases (neuron self-silences).
-
-    This prevents two critical failure modes in deep hierarchies:
-      1. Dead neuron syndrome: lower layers produce no spikes → upper layers
-         never activate → no learning propagates up.
-      2. Runaway excitation: k-WTA alone can still allow >k_winners bursts if
-         lateral inhibition lags behind; homeostasis provides a second brake.
+    Dark Matter Neurons
+    -------------------
+    dark_matter_ratio controls the fraction of neurons initialized with an
+    inflated threshold (dark_matter_thresh_offset mV above v_thresh).  These
+    neurons are silent under normal conditions but can be recruited when
+    global noradrenaline spikes, which temporarily lowers ALL thresholds
+    by up to ne_thresh_drop mV.  This achieves capacity expansion for
+    continual learning without dynamic matrix allocation (neurogenesis).
 
     homeostatic_tau:  Time constant for the sliding average of firing rate (ms).
                       Intentionally long (>>tau_m) so threshold adapts slowly.
@@ -48,6 +45,11 @@ class HomeostaticLIFConfig(LIFConfig):
     thresh_adapt_lr: float = 0.01    # Threshold adaptation step
     thresh_min: float = -68.0        # Minimum allowed threshold (mV)
     thresh_max: float = -45.0        # Maximum allowed threshold (mV)
+
+    # Dark Matter Neurons
+    dark_matter_ratio: float = 0.0        # Fraction of neurons born as dark matter (0–1)
+    dark_matter_thresh_offset: float = 20.0  # Extra mV added to threshold for dark neurons
+    ne_thresh_drop: float = 15.0          # Max mV threshold drop at NE=1.0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -165,16 +167,6 @@ class SequenceMemoryConfig:
     max_weight: float = 1.0
 
 
-@dataclass(frozen=True, kw_only=True)
-class WorldModelConfig:
-    """
-    DEPRECATED: gradient-descent world model. Use SNNWorldModelConfig instead.
-
-    Kept for backward compatibility. The MSE-gradient approach creates a
-    dual learning-regime conflict with STDP (see architecture notes).
-    Replace with SNNWorldModel in new experiments.
-    """
-    learning_rate: float = 0.005
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -182,20 +174,10 @@ class SNNWorldModelConfig:
     """
     Hyperparameters for the SNN-native world model.
 
-    The SNN world model uses a PredictiveCodingLayer as its encoder
-    (maps [state_spikes ‖ action_spikes] → internal representation) and
-    a Hebbian-trained linear decoder (internal → predicted_next_state).
-    All learning is STDP + Hebbian — zero gradient descent.
-
-    hidden_size:            Number of internal representation neurons.
-                            Rule of thumb: 1.5–2× state_size.
-    decode_lr:              Learning rate for the Hebbian decoder update
-                            (outer product of internal spikes × state error).
-    feedback_strength:      Scaling of the top-down prediction signal inside
-                            the encoder PCLayer.
-    feedback_learning_rate: Hebbian rate for encoder's feedback_w.
-    k_winners:              k for k-WTA inside the encoder layer.
-    window_ms:              k-WTA integration window (ms) for encoder layer.
+    rehearsal_steps:        Number of encoder forward passes per candidate
+                            action during mental_rehearsal().  Multiple steps
+                            let the membrane accumulate action-specific signal
+                            so k-WTA can differentiate subtly different inputs.
     """
     hidden_size: int = 64
     decode_lr: float = 0.005
@@ -204,3 +186,25 @@ class SNNWorldModelConfig:
     k_winners: int = 5
     window_ms: int = 50
     i_inh: float = 50.0
+    rehearsal_steps: int = 5
+
+
+@dataclass(frozen=True, kw_only=True)
+class EpisodicMemoryConfig:
+    """
+    Hyperparameters for one-shot episodic memory (hippocampal fast binding).
+
+    Biological grounding:
+      Hippocampal CA3 performs rapid pattern completion via auto-associative
+      Hebbian learning with a very short eligibility trace (tau_e ≈ 0).
+      A single exposure at high noradrenaline is sufficient to form a
+      retrievable memory trace.
+
+    ne_threshold:       Minimum noradrenaline level to trigger storage.
+    similarity_thresh:  Cosine similarity above which a new pattern is
+                        considered a duplicate (not stored again).
+    capacity:           Maximum number of stored episodes.
+    """
+    ne_threshold: float = 0.7
+    similarity_thresh: float = 0.85
+    capacity: int = 500

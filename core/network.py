@@ -241,6 +241,8 @@ class NetworkGraph:
             for layer in self._layers.values():
                 if hasattr(layer, "set_ach_level"):
                     layer.set_ach_level(neuromodulator.bottom_up_gain)
+                if hasattr(layer, "set_ne_level"):
+                    layer.set_ne_level(neuromodulator.competition_sharpness)
                 # DODANE: Przepływ NE i 5-HT w dół, by sterować uwagą
                 if hasattr(layer, "set_neuromodulators"):
                     layer.set_neuromodulators(

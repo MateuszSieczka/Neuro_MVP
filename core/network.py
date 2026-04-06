@@ -10,6 +10,7 @@ from .oscillator import GlobalOscillator
 from .spike_encoder import PoissonEncoder
 
 if TYPE_CHECKING:
+    from .attention import SpatialAttentionController
     from .neuromodulator import NeuromodulatorSystem
     from .predictive_coding import PredictiveCodingLayer
     from .sequence_memory import SequenceMemory, HierarchicalSequenceMemory
@@ -201,6 +202,7 @@ class NetworkGraph:
         self,
         sensory_inputs: dict[str, np.ndarray],
         neuromodulator: "NeuromodulatorSystem | None" = None,
+        attention: "SpatialAttentionController | None" = None,
     ) -> dict[str, np.ndarray]:
         """
         Advance the entire network by one timestep.
@@ -208,16 +210,20 @@ class NetworkGraph:
         Pipeline:
           1. (Re-)sort layers topologically if connections changed.
           2. Distribute neuromodulator signals (ACh) to all PC/pyramidal layers.
+          2b. Apply spatial attention gains to individual columns.
           3. Feedback pass: higher layers send predictions to lower layers.
           4. Feedforward pass: each layer processes its aggregated inputs.
           5. Sequence memory observation.
-          6. Increment global timestep.
+          6. Attention update (Hebbian reinforcement of attended columns).
+          7. Increment global timestep.
 
         Args:
             sensory_inputs: Dict mapping input layer name → spike array.
                             Layers not in this dict receive aggregated
                             feedforward spikes from their registered sources.
             neuromodulator: Optional NeuromodulatorSystem for global modulation.
+            attention:      Optional SpatialAttentionController for per-column
+                            gain modulation (spatial/object-based attention).
 
         Returns:
             Dict mapping layer name → output spike array from this timestep.
@@ -249,6 +255,15 @@ class NetworkGraph:
                         ne=neuromodulator.competition_sharpness,
                         sero=neuromodulator.planning_horizon
                     )
+
+        # 2b. Spatial attention: compute per-column gains from top-down
+        if attention is not None:
+            for name in attention.column_names:
+                layer = self._layers.get(name)
+                if layer is not None and hasattr(layer, "set_attention_gain"):
+                    gain = attention.column_gains.get(name, 1.0)
+                    layer.set_attention_gain(gain)
+
         # Broadcast global phase reset to ALL applicable layers BEFORE forward pass
         for layer in self._layers.values():
             if hasattr(layer, "trigger_phase_reset") and phase_reset:
@@ -305,6 +320,25 @@ class NetworkGraph:
             if name not in self._output_history:
                 self._output_history[name] = deque(maxlen=max(1, self._max_delay + 1))
             self._output_history[name].append(spike_array.copy())
+
+        # 6. Attention update: Hebbian reinforcement of attended columns
+        if attention is not None:
+            assoc_out = outputs.get(attention.column_names[0], None)
+            # Find association layer output by scanning connections
+            for conn in self._connections:
+                if (conn.connection_type == "feedforward"
+                        and conn.source in attention.column_names):
+                    assoc_out = outputs.get(conn.target)
+                    break
+            if assoc_out is not None:
+                col_acts = {
+                    n: outputs[n] for n in attention.column_names if n in outputs
+                }
+                global_ach = 0.5
+                if neuromodulator is not None:
+                    global_ach = neuromodulator.bottom_up_gain
+                attention.compute(assoc_out, global_ach)
+                attention.update(assoc_out, col_acts)
 
 
         self.timestep += 1

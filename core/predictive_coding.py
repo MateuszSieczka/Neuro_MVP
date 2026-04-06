@@ -51,6 +51,11 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # Controls bottom-up vs top-down weighting of effective input.
         self.ach_level: float = 0.8
 
+        # Spatial attention gain (set externally by SpatialAttentionController)
+        # Multiplicatively scales feedforward drive before relaxation.
+        # >1.0 = attended (boosted), <1.0 = suppressed, 1.0 = neutral.
+        self.attention_gain: float = 1.0
+
         self.error_spikes: np.ndarray = np.zeros(num_inputs, dtype=bool)
 
     # ------------------------------------------------------------------
@@ -94,6 +99,11 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # Teraz pełnią rolę "wejścia z kory pierwszorzędowej" (bottom-up drive),
         # a pętla relaksacji uzgadnia go z predykcją top-down (feedback_w).
         ff_drive = pre_f32 @ self.w  # (num_neurons,)
+
+        # Spatial attention: multiplicatively modulate feedforward drive.
+        # Attended columns (gain > 1) have stronger bottom-up signal,
+        # giving their neurons higher priority in k-WTA competition.
+        ff_drive *= self.attention_gain
 
         # POPRAWKA Bug C: Proaktywna inhibicja k-WTA przed relaxacją
         self._apply_proactive_inhibition()
@@ -197,6 +207,16 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         """
         self.ach_level = float(np.clip(ach, 0.0, 1.0))
 
+    def set_attention_gain(self, gain: float) -> None:
+        """
+        Set spatial attention gain for this layer.
+
+        Args:
+            gain: Multiplicative gain for feedforward drive.
+                  >1.0 = attended, <1.0 = suppressed, 1.0 = neutral.
+        """
+        self.attention_gain = float(max(gain, 0.1))
+
     # Override update_weights to train the backward matrix
     def update_weights(self, m_t: float, pred_error: np.ndarray) -> None:
         """
@@ -227,3 +247,4 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         super().reset_state()
         self.top_down_prediction.fill(0.0)
         self.prediction_error.fill(0.0)
+        self.attention_gain = 1.0

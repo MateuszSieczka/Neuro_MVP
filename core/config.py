@@ -208,3 +208,51 @@ class EpisodicMemoryConfig:
     ne_threshold: float = 0.7
     similarity_thresh: float = 0.85
     capacity: int = 500
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionConfig:
+    """
+    Hyperparameters for spatial / object-based attention.
+
+    Biological grounding:
+      Attentional modulation in cortex operates through cholinergic
+      projections from basal forebrain.  Unlike global tonic ACh,
+      spatial attention is column-specific: higher areas project back
+      and selectively amplify columns whose receptive fields overlap
+      the attended location (Reynolds & Heeger, 2009).
+
+    gain_strength:   Maximum multiplicative boost for the most-attended column.
+    temperature:     Softmax temperature for attention distribution.
+    learning_rate:   Hebbian update rate for attention projection weights.
+    decay:           Temporal smoothing of attention weights.
+    """
+    gain_strength: float = 2.0
+    temperature: float = 1.0
+    learning_rate: float = 0.01
+    decay: float = 0.9
+
+
+@dataclass(frozen=True, kw_only=True)
+class ActiveInferenceConfig:
+    """
+    Hyperparameters for Active Inference / Epistemic Foraging.
+
+    Biological grounding:
+      Under Active Inference (Friston, 2010), agents minimize expected
+      free energy which combines pragmatic value (reward) and epistemic
+      value (information gain).  The anterior cingulate cortex encodes
+      expected uncertainty; locus coeruleus NE modulates the
+      explore/exploit tradeoff.
+
+    epistemic_weight:      Base weight for epistemic relative to pragmatic value.
+    ne_epistemic_boost:    NE-driven amplification of epistemic drive.
+    uncertainty_method:    'novelty' or 'variance'.
+    n_candidates:          Candidate actions to evaluate (discrete spaces).
+    pragmatic_temperature: Softmax temperature for action selection.
+    """
+    epistemic_weight: float = 0.5
+    ne_epistemic_boost: float = 1.0
+    uncertainty_method: str = "novelty"
+    n_candidates: int = 8
+    pragmatic_temperature: float = 1.0

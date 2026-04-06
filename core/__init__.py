@@ -8,6 +8,8 @@ from .config import (
     SequenceMemoryConfig,
     SNNWorldModelConfig,
     EpisodicMemoryConfig,
+    AttentionConfig,
+    ActiveInferenceConfig,
 )
 from .neuron import LIFLayer
 from .competitive_layer import CompetitiveLIFLayer
@@ -21,3 +23,5 @@ from .sequence_memory import SequenceMemory
 from .network import NetworkGraph, LayerConnection
 from .episodic_memory import EpisodicMemory, Episode
 from .columnar import build_columnar_network, split_input
+from .attention import SpatialAttentionController
+from .active_inference import ActiveInferenceModule

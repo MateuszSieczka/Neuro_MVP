@@ -51,9 +51,10 @@ class NeuromodulatorSystem:
         """
         Update all neuromodulator levels based on incoming signals.
         """
-        error_magnitude = float(np.mean(np.abs(prediction_error)))
+        error_magnitude = float(np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0))
 
-        # NAPRAWA: Zapisujemy błąd do historii, by Serotonina mogła śledzić stabilność w czasie
+        # Serotonina śledzi stabilność w czasie na podstawie ZNORMALIZOWANEGO błędu.
+        # Przycinamy do [0,1] tutaj, aby historia była porównywalna niezależnie od skali środowiska.
         self._error_history.append(error_magnitude)
 
         if novelty is None:

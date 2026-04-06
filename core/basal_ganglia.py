@@ -6,14 +6,15 @@ from typing import Tuple
 @dataclass(frozen=True, kw_only=True)
 class ContinuousBGConfig:
     gamma: float = 0.99
-    critic_lr: float = 0.005
-    actor_lr: float = 0.001
-    tau_e: float = 200.0
-    tau_hidden: float = 20.0  # Stała czasowa membrany warstwy ukrytej Krytyka (ms)
+    critic_lr: float = 5e-4   # Tempo uczenia Krytyka — wolniejsze = stabilniejszy sygnał TD
+    actor_lr: float = 1e-3    # Aktor z policy gradient trace (per-step Δw ≈ lr×td×trace ≈ 0.01)
+    tau_e: float = 20.0       # NMDA/Ca²⁺ trace ~1s at 20Hz. Compromise: credit assignment vs accumulation
+    tau_hidden: float = 2.0   # Stała czasowa membrany ukrytej — krótka dla szybkiej odpowiedzi
     dt: float = 1.0
-    exploration_noise: float = 0.2  # Odchylenie standardowe szumu
+    exploration_noise: float = 0.3  # Temperatura softmax (wyższa na starcie → eksploracja)
     hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
     tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
+    w_clip: float = 3.0      # Synaptic saturation: max |w| (receptor density / spine volume bound)
 
 
 class SNNDeepCritic:
@@ -25,69 +26,108 @@ class SNNDeepCritic:
 
     def __init__(self, state_size: int, config: ContinuousBGConfig):
         self.config = config
+        self._state_size = state_size
 
-        # Wagi Stan -> Warstwa Ukryta
-        self.w_h = np.random.uniform(-0.1, 0.1, (state_size, config.hidden_size)).astype(np.float32)
-        # Wagi Warstwa Ukryta -> Wartość V(s)
-        self.w_v = np.random.uniform(-0.1, 0.1, config.hidden_size).astype(np.float32)
+        # --- Xavier-like init: std = 1/sqrt(fan_in) ---
+        # Zapewnia, że wariancja aktywacji jest ~1 niezależnie od state_size.
+        h_std = 1.0 / np.sqrt(state_size)
+        self.w_h = np.random.uniform(-h_std, h_std, (state_size, config.hidden_size)).astype(np.float32)
+
+        v_std = 1.0 / np.sqrt(config.hidden_size)
+        self.w_v = np.random.uniform(-v_std, v_std, config.hidden_size).astype(np.float32)
 
         # Ślady dla propagacji błędu
         self.e_h = np.zeros((state_size, config.hidden_size), dtype=np.float32)
         self.e_v = np.zeros(config.hidden_size, dtype=np.float32)
         self._trace_decay = np.exp(-self.config.dt / self.config.tau_e)
-        # Poprawny biologiczny zanik membrany: exp(-dt/tau_hidden) zamiast hardcoded 0.8
         self._mem_decay: float = float(np.exp(-self.config.dt / self.config.tau_hidden))
 
-        # Potencjał dla neuronów ukrytych (uproszczony LIF dla krytyka)
+        # Potencjał membrany neuronów ukrytych
         self.v_hidden = np.zeros(config.hidden_size, dtype=np.float32)
-        self.last_hidden_spikes = np.zeros(config.hidden_size, dtype=np.float32)
-        self.hidden_firing_rate = np.zeros(config.hidden_size, dtype=np.float32)
-        self.fr_decay = 0.9  # Stała wygładzania dla Krytyka
+        # Ciągła aktywacja (rate-code)
+        self.activation = np.zeros(config.hidden_size, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Activation
+    # ------------------------------------------------------------------
+
+    def _graded_activation(self, v: np.ndarray) -> np.ndarray:
+        """Graded rate-code activation.
+
+        tanh zapewnia bounded [-1,1] output. Xavier init + krótkie
+        tau_hidden utrzymują |v| w zakresie liniowym tanh (~1–2)
+        bez potrzeby ręcznego gain.
+        """
+        return np.tanh(v)
+
+    # ------------------------------------------------------------------
+    # Forward / Peek
+    # ------------------------------------------------------------------
 
     def forward(self, state_spikes: np.ndarray) -> float:
         state_f32 = state_spikes.astype(np.float32)
 
-        # 1. Integracja warstwy ukrytej
+        # 1. Integracja membrany (leaky integrator)
         self.v_hidden = self.v_hidden * self._mem_decay + np.dot(state_f32, self.w_h)
-        spikes = (self.v_hidden > 0.5).astype(np.float32)
-        self.v_hidden[spikes > 0] = 0.0
 
-        # 2. WYGŁADZANIE (Zamiast surowych spike'ów do V(s))
-        # To sprawia, że V(s) jest różniczkowalne i stabilne
-        self.hidden_firing_rate = self.hidden_firing_rate * self.fr_decay + spikes * (1 - self.fr_decay)
+        # 2. Ciągła aktywacja z adaptacyjnym gain
+        self.activation = self._graded_activation(self.v_hidden)
 
-        # 3. Ślady oparte na wygładzonej aktywności
-        self.e_h = self.e_h * self._trace_decay + np.outer(state_f32, self.hidden_firing_rate)
-        self.e_v = self.e_v * self._trace_decay + self.hidden_firing_rate
+        # 3. Ślady kwalifikowalności — replacing traces (Ca²⁺ saturation model).
+        # W przeciwieństwie do śladów akumulujących, replacing traces biorą
+        # max(decayed_old, new), modelując nasycenie [Ca²⁺] w kolcu dendrytycznym.
+        # Zapobiega nieograniczonej akumulacji przy długich epizodach.
+        new_e_h = np.outer(state_f32, self.activation)
+        self.e_h = np.maximum(self.e_h * self._trace_decay, new_e_h)
+        new_e_v = self.activation.copy()
+        self.e_v = np.maximum(self.e_v * self._trace_decay, new_e_v)
 
-        return float(np.dot(self.w_v, self.hidden_firing_rate))
+        return float(np.dot(self.w_v, self.activation))
+
+    def peek(self, state_spikes: np.ndarray) -> float:
+        """Estimate V(s') without modifying internal state (membrane, traces)."""
+        state_f32 = state_spikes.astype(np.float32)
+        v_hid = self.v_hidden * self._mem_decay + np.dot(state_f32, self.w_h)
+        act = self._graded_activation(v_hid)
+        return float(np.dot(self.w_v, act))
 
     def update(self, td_error: float) -> None:
-        """Propagacja wsteczna błędu TD przez warstwy ukryte za pomocą śladów."""
-        # Normalizacja śladów kwalifikowalności: zapobiega katastrofalnym
-        # aktualizacjom, gdy ślady akumulują się przez długi epizod.
-        # Biologiczny odpowiednik: ograniczona pojemność znaczników synaptycznych.
-        e_v_scale = max(np.linalg.norm(self.e_v), 1.0)
-        e_h_scale = max(np.linalg.norm(self.e_h), 1.0)
+        """Biologiczna reguła uczenia: δ × ślad kwalifikowalności.
 
-        # Update warstwy wyjściowej
-        dw_v = self.config.critic_lr * td_error * (self.e_v / e_v_scale)
+        Warstwa wyjściowa (w_v): prosta reguła Hebba modulowana dopaminą:
+            Δw_v = lr × δ × e_v
 
-        # Odsprzęgnięty backprop do warstwy ukrytej (przybliżenie liniowe)
-        backward_error = td_error * self.w_v
-        dw_h = self.config.critic_lr * (self.e_h / e_h_scale) * backward_error[np.newaxis, :]
+        Warstwa ukryta (w_h): TD error jest propagowany wstecz przez w_v,
+        analogicznie do sygnału z jądra podwzgórzowego (STN) modulującego
+        plastyczność korowo-prążkowiową.  Pochodna tanh' modeluje
+        nieliniową odpowiedź dendrytyczną neuronu postsynaptycznego.
 
-        self.w_v += dw_v
-        self.w_h += dw_h
-        np.clip(self.w_v, -10.0, 10.0, out=self.w_v)
-        np.clip(self.w_h, -10.0, 10.0, out=self.w_h)
+        Stabilność zapewniają:
+        - bounded activation (tanh ∈ [-1,1]) → bounded traces
+        - weight decay (homeostaza synaptyczna / synaptic scaling)
+        - TD clipping (ograniczony wpływ ekstremalnych zdarzeń)
+        """
+        td_error = float(np.clip(td_error, -10.0, 10.0))
+
+        # Warstwa wyjściowa: prosta reguła δ×e
+        self.w_v += self.config.critic_lr * td_error * self.e_v
+
+        # Warstwa ukryta: δ propagowany wstecz przez w_v z pochodną aktywacji.
+        # tanh'(x) = 1 - tanh(x)² — modeluje nieliniową odpowiedź dendrytu.
+        activation_deriv = 1.0 - self.activation ** 2
+        feedback = self.w_v * activation_deriv   # (hidden,)
+        self.w_h += self.config.critic_lr * td_error * self.e_h * feedback[np.newaxis, :]
+
+        # Synaptic saturation: max weight bounded by receptor density / spine volume.
+        wc = self.config.w_clip
+        np.clip(self.w_v, -wc, wc, out=self.w_v)
+        np.clip(self.w_h, -wc, wc, out=self.w_h)
 
 
     def reset_state(self) -> None:
         """Reset transient state (membrane, traces). Weights are preserved."""
         self.v_hidden.fill(0.0)
-        self.last_hidden_spikes.fill(0.0)
-        self.hidden_firing_rate.fill(0.0)
+        self.activation.fill(0.0)
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
 
@@ -110,8 +150,22 @@ class SNNDeepCritic:
 
 class SNNContinuousActor:
     """
-    Ciągły Aktor. Generuje wektor akcji [motor_actions + internal_actions].
-    Uczy się poprzez korelację szumu eksploracyjnego z błędem TD.
+    Aktor oparty na polityce softmax z mechanizmem dopaminowym.
+
+    Biologicznie odpowiada ścieżce korowo-prążkowiowej:
+    - Wagi w_mu: synapsy korowo-prążkowiowe (cortex → striatum)
+    - Logity: aktywacja neuronów MSN (medium spiny neurons)
+    - Softmax: kompetycja lateralna w prążkowiu (GPe/GPi)
+    - Ślad kwalifikowalności: NMDA/Ca²⁺ ślad na aktywnej synapsie
+    - TD error → Dopamina: moduluje plastyczność STDP
+
+    Reguła uczenia (policy gradient z eligibility trace):
+      e_t = decay * e_{t-1} + ∇_θ log π(a|s)
+      Δw = lr × δ × e_t
+
+    gdzie ∇ log π(a|s) = state ⊗ (one_hot(a) - π(·|s))
+    Biologicznie: wybrany neuron MSN (D1) ma pozytywny ślad,
+    niewybrany (D2) — negatywny proporcjonalnie do π.
     """
 
     def __init__(self, state_size: int, motor_dim: int, internal_dim: int, config: ContinuousBGConfig):
@@ -119,49 +173,87 @@ class SNNContinuousActor:
         self.action_dim = motor_dim + internal_dim
         self.motor_dim = motor_dim
 
-        # Wagi mapujące stan na średnią akcji (mu)
+        # Wagi mapujące stan na logity akcji (synapsy korowo-prążkowiowe)
         self.w_mu = np.random.uniform(-0.01, 0.01, (state_size, self.action_dim)).astype(np.float32)
 
-        # Ślad STDP korelujący stan z dodanym szumem (Policy Gradient Trace)
+        # Ślad kwalifikowalności polityki (policy gradient trace)
         self.e_actor = np.zeros((state_size, self.action_dim), dtype=np.float32)
         self._trace_decay = np.exp(-self.config.dt / self.config.tau_e)
 
+        # Temperatura eksploracji — mutowalny mnożnik:
+        # maleje po sukcesach (serotonina wysoka), rośnie po porażkach.
+        self.noise_scale: float = 1.0
+
+        # Zapamiętujemy ostatnią politykę i akcję dla update
+        self._last_probs: np.ndarray | None = None
+        self._last_action: int = -1
+        self._last_state: np.ndarray | None = None
+
+    @staticmethod
+    def _softmax(logits: np.ndarray) -> np.ndarray:
+        """Numerycznie stabilna softmax."""
+        x = logits - logits.max()
+        e = np.exp(x)
+        return e / e.sum()
+
     def forward(self, state_spikes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Zwraca akcje motoryczne (dla robota) i wewnętrzne (dla pamięci)."""
+        """Oblicza politykę i próbkuje akcję."""
         state_f32 = state_spikes.astype(np.float32)
+        self._last_state = state_f32
 
-        # Generowanie deterministycznej średniej (mu)
-        mu = np.dot(state_f32, self.w_mu)
+        # Logity = stan × wagi  (aktywacja MSN)
+        logits = np.dot(state_f32, self.w_mu)
 
-        # Eksploracja (Szum Gaussa)
-        noise = np.random.normal(0, self.config.exploration_noise, self.action_dim)
-        raw_action = mu + noise
+        # Temperatura eksploracji: noise_scale > 1 → bardziej losowa;
+        # noise_scale → 0 → greedy.  Odpowiada inwersji temperatury β = 1/T.
+        temperature = max(self.config.exploration_noise * self.noise_scale, 1e-4)
+        probs = self._softmax(logits[:self.motor_dim] / temperature)
+        self._last_probs = probs
 
-        # Ograniczenie przestrzeni ciągłej (np. do tanh dla robota [-1, 1])
-        bounded_action = np.tanh(raw_action)
+        # Próbkowanie akcji (ε-softmax)
+        action = int(np.random.choice(self.motor_dim, p=probs))
+        self._last_action = action
 
-        # Ślad kwalifikowalności: koreluje aktywny stan z ZASTOSOWANYM SZUMEM.
-        # Jeśli szum na plusie dał nagrodę, wagi powinny wzrosnąć, by mu poszło w stronę szumu.
-        self.e_actor *= self._trace_decay
-        self.e_actor += np.outer(state_f32, noise)
+        # Ślad kwalifikowalności (policy gradient):
+        # ∇ log π(a|s) = state ⊗ (one_hot(a) - π(·|s))
+        # Biologicznie: D1 MSN wybranej akcji = +1,
+        # wszystkie MSN hamowane proporcjonalnie do π (kompetycja GPe).
+        grad_log_pi = np.zeros(self.action_dim, dtype=np.float32)
+        one_hot = np.zeros(self.motor_dim, dtype=np.float32)
+        one_hot[action] = 1.0
+        grad_log_pi[:self.motor_dim] = one_hot - probs
 
-        # Rozdzielenie akcji
-        motor_action = bounded_action[:self.motor_dim]
-        # Przeskalowanie akcji wewnętrznych (bramka WM) do [0, 1]
-        internal_action = (bounded_action[self.motor_dim:] + 1.0) / 2.0
+        self.e_actor = self.e_actor * self._trace_decay + np.outer(state_f32, grad_log_pi)
+
+        # Motor output jako ciągły wektor (kompatybilność z continuous API)
+        motor_action = probs * 2.0 - 1.0   # map [0,1] → [-1,1]
+
+        # Akcje wewnętrzne (bramka WM): drugi segment logitów
+        if self.action_dim > self.motor_dim:
+            internal_logits = logits[self.motor_dim:]
+            internal_action = 1.0 / (1.0 + np.exp(-internal_logits))  # sigmoid → [0,1]
+        else:
+            internal_action = np.array([], dtype=np.float32)
 
         return motor_action, internal_action
 
     def update(self, td_error: float) -> None:
-        """Ciągłe STDP: Przesuwa średnią akcji w stronę udanej eksploracji."""
-        dw = self.config.actor_lr * td_error * self.e_actor
-        self.w_mu += dw
-        np.clip(self.w_mu, -5.0, 5.0, out=self.w_mu)
+        """Policy gradient: δ × eligibility trace."""
+        td_error = float(np.clip(td_error, -10.0, 10.0))
 
+        self.w_mu += self.config.actor_lr * td_error * self.e_actor
+        np.clip(self.w_mu, -self.config.w_clip, self.config.w_clip, out=self.w_mu)
+
+    def get_action(self) -> int:
+        """Zwraca ostatnio wybraną dyskretną akcję."""
+        return self._last_action
 
     def reset_state(self) -> None:
         """Reset transient traces. Weights are preserved."""
         self.e_actor.fill(0.0)
+        self._last_probs = None
+        self._last_action = -1
+        self._last_state = None
 
     def set_plasticity_timescales(self, ne: float) -> None:
         """

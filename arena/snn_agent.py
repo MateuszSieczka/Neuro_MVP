@@ -66,6 +66,8 @@ class SNNAgent(Agent):
         self._trace = np.zeros(state_size, dtype=np.float32)
         self._last_td_error: float = 0.0
         self._step_count: int = 0
+        self._episode_reward: float = 0.0     # Running reward for current episode
+        self._avg_episode_reward: float = 0.0  # EMA of episode rewards (ventral striatum)
 
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
         if not self._use_trace:
@@ -80,21 +82,17 @@ class SNNAgent(Agent):
         aug = self._augment_state(state)
         self._update_trace(state)
 
-        # 1. Forward Aktora (generuje JEDEN czysty wektor szumu i śladu!)
+        # 1. Forward Aktora (softmax policy + próbkowanie akcji + ślad)
         motor, _internal = self.bg.actor.forward(aug)
 
         # 2. Forward Krytyka
         self.bg.last_v = self.bg.critic.forward(aug)
 
-        return int(np.argmax(motor))
+        return self.bg.actor.get_action()
 
     def _peek_value(self, state_spikes: np.ndarray) -> float:
         """Bezpieczny podgląd V(s') bez niszczenia śladów membrany Krytyka."""
-        state_f32 = state_spikes.astype(np.float32)
-        v_hid = self.bg.critic.v_hidden * self.bg.critic._mem_decay + np.dot(state_f32, self.bg.critic.w_h)
-        spikes = (v_hid > 0.5).astype(np.float32)
-        fr = self.bg.critic.hidden_firing_rate * self.bg.critic.fr_decay + spikes * (1.0 - self.bg.critic.fr_decay)
-        return float(np.dot(self.bg.critic.w_v, fr))
+        return self.bg.critic.peek(state_spikes)
 
     def observe(
         self, state: np.ndarray, action: int, reward: float,
@@ -112,11 +110,10 @@ class SNNAgent(Agent):
             td_error = reward + self.bg.config.gamma * next_v - self.bg.last_v
 
         # --- ZSYNCHRONIZOWANE NASYCENIE BŁĘDU (TD CLIPPING) ---
-        # Błąd musi być przycięty DLA OBU modułów identycznie!
-        # Clip [-10.0, 10.0] chroni przed eksplozją wag (-49 przy V=50),
-        # zachowując silny bodziec awersyjny, który jest zgodny z tempem nauki Krytyka.
+        # Clip [-10, 10] w update() Krytyka i Aktora chroni wagi.
+        # Tu przekazujemy surowy δ — moduły same przycinają.
 
-        clipped_td = float(np.clip(td_error, -100.0, 100.0))
+        clipped_td = float(np.clip(td_error, -10.0, 10.0))
         # 2. Aktualizacja obu modułów tym samym sygnałem
         self.bg.critic.update(clipped_td)
         self.bg.actor.update(clipped_td)
@@ -137,8 +134,12 @@ class SNNAgent(Agent):
                 novelty=self.world_model.curiosity_signal(),
             )
         else:
+            # Soft-normalize TD error to [0,1] for neuromodulator.
+            # sigmoid(|δ|) smoothly maps small errors→~0 and large errors→~1,
+            # unlike hard clip which saturates at |δ|>1.
+            norm_td = float(abs(td_error) / (1.0 + abs(td_error)))
             self.neuromod.update(
-                prediction_error=np.array([abs(td_error)], dtype=np.float32),
+                prediction_error=np.array([norm_td], dtype=np.float32),
                 td_error=td_error, novelty=0.0
             )
 
@@ -148,11 +149,37 @@ class SNNAgent(Agent):
         if self._use_wm:
             self.neuromod.apply_to_layer(self.world_model)
 
+        # 5. Adaptacja eksploracji — sygnał konwergencji oparty na nagrodach.
+        # Biologicznie: brzuszne prążkowie (ventral striatum) śledzi średnią nagrodę.
+        # Wysoka nagroda → aktywacja VTA → dopamina tonowa → redukcja szumu.
+        # Niska nagroda → spadek tonu → wzrost eksploracji.
+        #
+        # Używamy EMA nagrody epizodowej zamiast serotoniny (która wymaga
+        # skonwergowanego krytyka). To jest bardziej bezpośredni sygnał sukcesu.
+        self._episode_reward += reward
+        if done:
+            # EMA z α=0.1 — powolne śledzenie (ok. 10 epizodów pamięci)
+            self._avg_episode_reward = (
+                0.9 * self._avg_episode_reward + 0.1 * self._episode_reward
+            )
+            self._episode_reward = 0.0
+
+            # Sygmoidalna mapa nagrody na szum: im wyższa nagroda, tym mniej szumu.
+            # reward_signal ∈ (0,1): 0 = brak nagrody, 1 = duża nagroda.
+            # Próg ~100 kroków: at R=100 → signal=0.5; R=300→0.75; R=500→0.83
+            reward_signal = self._avg_episode_reward / (self._avg_episode_reward + 100.0)
+
+            if reward_signal > 0.5:  # Agent zaczyna się uczyć
+                self.bg.actor.noise_scale = max(0.05, self.bg.actor.noise_scale * 0.85)
+            else:
+                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale * 1.05)
+
         self._step_count += 1
 
     def reset(self) -> None:
         self.bg.reset_state()
         self._trace = np.zeros(self.state_size, dtype=np.float32)
+        self._episode_reward = 0.0
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()

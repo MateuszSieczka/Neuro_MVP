@@ -96,8 +96,11 @@ class GymEnv(Environment):
         self._obs_var += (delta * delta2 - self._obs_var) / self._obs_count
         self._obs_std = np.sqrt(np.maximum(self._obs_var, 1e-6))
 
-    def reset(self) -> np.ndarray:
-        obs, _info = self._gym_env.reset()
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
+        kwargs: dict[str, Any] = {}
+        if seed is not None:
+            kwargs["seed"] = seed
+        obs, _info = self._gym_env.reset(**kwargs)
         return self._normalize_obs(obs)
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict[str, Any]]:

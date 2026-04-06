@@ -109,14 +109,28 @@ class SNNAgent(Agent):
             next_v = self._peek_value(next_aug)
             td_error = reward + self.bg.config.gamma * next_v - self.bg.last_v
 
-        # --- ZSYNCHRONIZOWANE NASYCENIE BŁĘDU (TD CLIPPING) ---
-        # Clip [-10, 10] w update() Krytyka i Aktora chroni wagi.
-        # Tu przekazujemy surowy δ — moduły same przycinają.
-
         clipped_td = float(np.clip(td_error, -10.0, 10.0))
-        # 2. Aktualizacja obu modułów tym samym sygnałem
-        self.bg.critic.update(clipped_td)
-        self.bg.actor.update(clipped_td)
+
+        # --- Modulacja plastyczności przez dopaminę tonową ---
+        # Biologicznie: VTA utrzymuje tonowy poziom DA proporcjonalny
+        # do uśrednionej nagrody. Wysoka tonic DA → zmniejszona odpowiedź
+        # na phasic DA → mniejsza plastyczność (konsolidacja).
+        # Niska tonic DA → pełna plastyczność (eksploracja/uczenie).
+        #
+        # Implementacja: skalujemy efektywny TD error przez czynnik
+        # zależny od _avg_episode_reward. Gdy avg>200, agent już
+        # „wie" co robić — dalsze uczenie jest głównie szumem.
+        if self._avg_episode_reward > 200.0:
+            # Płynna redukcja: 200→scale=1.0, 400→0.3, 500→0.15
+            consolidation = (self._avg_episode_reward - 200.0) / 300.0
+            consolidation = min(consolidation, 1.0)
+            plasticity_scale = max(0.15, 1.0 - 0.85 * consolidation)
+        else:
+            plasticity_scale = 1.0
+
+        # 2. Aktualizacja obu modułów z modulowanym sygnałem
+        self.bg.critic.update(clipped_td * plasticity_scale)
+        self.bg.actor.update(clipped_td * plasticity_scale)
 
         self._last_td_error = td_error
 
@@ -158,21 +172,31 @@ class SNNAgent(Agent):
         # skonwergowanego krytyka). To jest bardziej bezpośredni sygnał sukcesu.
         self._episode_reward += reward
         if done:
-            # EMA z α=0.1 — powolne śledzenie (ok. 10 epizodów pamięci)
-            self._avg_episode_reward = (
-                0.9 * self._avg_episode_reward + 0.1 * self._episode_reward
-            )
+            ep_reward = self._episode_reward
             self._episode_reward = 0.0
 
-            # Sygmoidalna mapa nagrody na szum: im wyższa nagroda, tym mniej szumu.
-            # reward_signal ∈ (0,1): 0 = brak nagrody, 1 = duża nagroda.
-            # Próg ~100 kroków: at R=100 → signal=0.5; R=300→0.75; R=500→0.83
-            reward_signal = self._avg_episode_reward / (self._avg_episode_reward + 100.0)
+            # EMA z α=0.2
+            self._avg_episode_reward = (
+                0.8 * self._avg_episode_reward + 0.2 * ep_reward
+            )
 
-            if reward_signal > 0.5:  # Agent zaczyna się uczyć
+            # Adaptacja eksploracji — podwójny sygnał:
+            # 1. Bieżący epizod (szybka informacja zwrotna)
+            # 2. EMA (stabilność — czy agent konsekwentnie jest dobry?)
+            #
+            # Biologicznie: dopamina tonowa (VTA) podąża za średnią nagrodą (EMA),
+            # podczas gdy phasic DA reaguje na bieżące zdarzenie.
+            # Szum spada tylko gdy OBA sygnały są pozytywne.
+            ema_good = self._avg_episode_reward > 100.0  # EMA > 100 kroków
+            current_good = ep_reward > 200.0              # Ten epizod > 200 kroków
+
+            if ema_good and current_good:
+                # Oba sygnały pozytywne → pewna redukcja
                 self.bg.actor.noise_scale = max(0.05, self.bg.actor.noise_scale * 0.85)
-            else:
-                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale * 1.05)
+            elif not ema_good and not current_good:
+                # Oba negatywne → wzrost eksploracji
+                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale * 1.10)
+            # Mieszane sygnały → bez zmiany (czekamy na spójną informację)
 
         self._step_count += 1
 

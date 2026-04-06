@@ -7,7 +7,7 @@ from core.basal_ganglia import ContinuousBGConfig
 from core.config import SNNWorldModelConfig, NeuromodulatorConfig
 
 BOUNDS = (np.array([-2.4, -3.0, -0.21, -3.0]), np.array([2.4, 3.0, 0.21, 3.0]))
-SEEDS = [1, 17, 42, 99, 256]
+SEEDS = [1, 17, 42, 99, 145, 256, 500]
 
 def run_spark_benchmark():
     # 1. Konfiguracja Jąder Podstawnych — domyślne wartości z ContinuousBGConfig
@@ -26,7 +26,7 @@ def run_spark_benchmark():
     
     nm_cfg = NeuromodulatorConfig() # Używamy domyślnych, zbalansowanych wartości
 
-    n_ep = 200
+    n_ep = 120
     scores = []
 
     print(f"--- Benchmark zbieżności dla CartPole (Cel: <= 80-100 epizodów) ---")
@@ -34,6 +34,8 @@ def run_spark_benchmark():
     for seed in SEEDS:
         np.random.seed(seed)
         env = GymEnv("CartPole-v1", normalize=True, fixed_bounds=BOUNDS)
+        # Seed the gymnasium env for reproducibility
+        env.reset(seed=seed)
 
         agent = SNNAgent(
             state_size=env.state_size,

@@ -6,9 +6,10 @@ from typing import Tuple
 @dataclass(frozen=True, kw_only=True)
 class ContinuousBGConfig:
     gamma: float = 0.99
-    critic_lr: float = 5e-4   # Tempo uczenia Krytyka — wolniejsze = stabilniejszy sygnał TD
-    actor_lr: float = 1e-3    # Aktor z policy gradient trace (per-step Δw ≈ lr×td×trace ≈ 0.01)
-    tau_e: float = 20.0       # NMDA/Ca²⁺ trace ~1s at 20Hz. Compromise: credit assignment vs accumulation
+    critic_lr: float = 7e-3   # Tempo uczenia Krytyka — szybkie z krótkim tau_e_critic=5
+    actor_lr: float = 5e-3    # Aktor z policy gradient trace — wyższe lr z konsolidacją
+    tau_e: float = 20.0       # Bazowe tau dla aktora (NMDA/Ca²⁺, ~1s)
+    tau_e_critic: float = 5.0 # Krótsze tau dla krytyka — szybsza konwergencja V(s)
     tau_hidden: float = 2.0   # Stała czasowa membrany ukrytej — krótka dla szybkiej odpowiedzi
     dt: float = 1.0
     exploration_noise: float = 0.3  # Temperatura softmax (wyższa na starcie → eksploracja)
@@ -39,7 +40,7 @@ class SNNDeepCritic:
         # Ślady dla propagacji błędu
         self.e_h = np.zeros((state_size, config.hidden_size), dtype=np.float32)
         self.e_v = np.zeros(config.hidden_size, dtype=np.float32)
-        self._trace_decay = np.exp(-self.config.dt / self.config.tau_e)
+        self._trace_decay = np.exp(-self.config.dt / self.config.tau_e_critic)
         self._mem_decay: float = float(np.exp(-self.config.dt / self.config.tau_hidden))
 
         # Potencjał membrany neuronów ukrytych
@@ -73,14 +74,15 @@ class SNNDeepCritic:
         # 2. Ciągła aktywacja z adaptacyjnym gain
         self.activation = self._graded_activation(self.v_hidden)
 
-        # 3. Ślady kwalifikowalności — replacing traces (Ca²⁺ saturation model).
-        # W przeciwieństwie do śladów akumulujących, replacing traces biorą
-        # max(decayed_old, new), modelując nasycenie [Ca²⁺] w kolcu dendrytycznym.
-        # Zapobiega nieograniczonej akumulacji przy długich epizodach.
-        new_e_h = np.outer(state_f32, self.activation)
-        self.e_h = np.maximum(self.e_h * self._trace_decay, new_e_h)
-        new_e_v = self.activation.copy()
-        self.e_v = np.maximum(self.e_v * self._trace_decay, new_e_v)
+        # 3. Ślady kwalifikowalności (accumulating traces)
+        # Akumulacja wzmacnia sygnał korelacyjny: e_ss ≈ act/(1-decay) ≈ tau_e × act.
+        # Stabilność zapewnia w_clip (synaptic saturation).
+        self.e_h = self.e_h * self._trace_decay + np.outer(state_f32, self.activation)
+        self.e_v = self.e_v * self._trace_decay + self.activation
+        # Ca²⁺ saturation — ślady ograniczone pojemnością kolca dendrytycznego.
+        # Zapobiega akumulacji przy bardzo długich epizodach.
+        np.clip(self.e_h, -2.0, 2.0, out=self.e_h)
+        np.clip(self.e_v, -2.0, 2.0, out=self.e_v)
 
         return float(np.dot(self.w_v, self.activation))
 
@@ -144,7 +146,7 @@ class SNNDeepCritic:
         """
         ne = float(np.clip(ne, 0.0, 1.0))
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
-        eff_tau_e = self.config.tau_e / ne_factor
+        eff_tau_e = self.config.tau_e_critic / ne_factor
         self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
 
 
@@ -173,8 +175,10 @@ class SNNContinuousActor:
         self.action_dim = motor_dim + internal_dim
         self.motor_dim = motor_dim
 
-        # Wagi mapujące stan na logity akcji (synapsy korowo-prążkowiowe)
-        self.w_mu = np.random.uniform(-0.01, 0.01, (state_size, self.action_dim)).astype(np.float32)
+        # Umiarkowane losowe init — wystarczające do zróżnicowania logitów,
+        # ale nie na tyle duże by stworzyć silne początkowe bias.
+        # Biologicznie: niezorganizowane synapsy przed treningiem.
+        self.w_mu = np.random.uniform(-0.1, 0.1, (state_size, self.action_dim)).astype(np.float32)
 
         # Ślad kwalifikowalności polityki (policy gradient trace)
         self.e_actor = np.zeros((state_size, self.action_dim), dtype=np.float32)
@@ -224,6 +228,8 @@ class SNNContinuousActor:
         grad_log_pi[:self.motor_dim] = one_hot - probs
 
         self.e_actor = self.e_actor * self._trace_decay + np.outer(state_f32, grad_log_pi)
+        # Ca²⁺ saturation — trace per synapse is bounded by dendritic spine capacity
+        np.clip(self.e_actor, -1.0, 1.0, out=self.e_actor)
 
         # Motor output jako ciągły wektor (kompatybilność z continuous API)
         motor_action = probs * 2.0 - 1.0   # map [0,1] → [-1,1]

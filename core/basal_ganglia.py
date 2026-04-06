@@ -13,6 +13,7 @@ class ContinuousBGConfig:
     dt: float = 1.0
     exploration_noise: float = 0.2  # Odchylenie standardowe szumu
     hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
+    tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
 
 
 class SNNDeepCritic:
@@ -90,6 +91,22 @@ class SNNDeepCritic:
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
 
+    def set_plasticity_timescales(self, ne: float) -> None:
+        """
+        Dynamicznie dostosowuje stałe czasowe śladów kwalifikowalności
+        w odpowiedzi na poziom noradrenaliny.
+
+        Wysoka NE (wykrycie zmiany kontekstu) → kompresja tau_e →
+        stare korelacje zanikają szybciej → szybsze odłączenie od
+        poprzedniej polityki.
+
+        Niska NE (stabilne środowisko) → pełne tau_e → konsolidacja.
+        """
+        ne = float(np.clip(ne, 0.0, 1.0))
+        ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
+        eff_tau_e = self.config.tau_e / ne_factor
+        self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
+
 
 class SNNContinuousActor:
     """
@@ -146,6 +163,16 @@ class SNNContinuousActor:
         """Reset transient traces. Weights are preserved."""
         self.e_actor.fill(0.0)
 
+    def set_plasticity_timescales(self, ne: float) -> None:
+        """
+        Dostosowuje zanik śladu polityki do poziomu NE.
+        Wysoka NE → krótsze okno korelacji szum→nagroda → szybsze przełączanie polityki.
+        """
+        ne = float(np.clip(ne, 0.0, 1.0))
+        ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
+        eff_tau_e = self.config.tau_e / ne_factor
+        self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
+
 
 class BasalGangliaAGISystem:
     def __init__(self, state_size: int, motor_dim: int, internal_dim: int = 1,
@@ -180,3 +207,12 @@ class BasalGangliaAGISystem:
         self.last_v = 0.0
         self.critic.reset_state()
         self.actor.reset_state()
+
+    def set_plasticity_timescales(self, ne: float) -> None:
+        """
+        Propaguje poziom NE do Krytyka i Aktora — zamknięta pętla:
+          TD-error → NeuromodulatorSystem → NE → set_plasticity_timescales()
+        Pozwala BG samodzielnie dostosować tempo uczenia do zmienności środowiska.
+        """
+        self.critic.set_plasticity_timescales(ne)
+        self.actor.set_plasticity_timescales(ne)

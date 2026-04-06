@@ -1,13 +1,12 @@
 """
 arena.snn_agent — Adapter connecting the Neuro_MVP SNN to the arena Agent protocol.
-
-This is the ONLY file that imports from ``core``.  The arena framework itself
-is completely SNN-agnostic.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import dataclasses
+from typing import Any
 
 from arena.core import Agent
 from core.basal_ganglia import BasalGangliaAGISystem, ContinuousBGConfig
@@ -20,22 +19,6 @@ from core.config import (
 
 
 class SNNAgent(Agent):
-    """
-    Wraps BasalGangliaAGI + WorldModel + Neuromodulator into an arena Agent.
-
-    Architecture:
-      act()     — uses actor.forward() ONLY to pick an action (no weight updates).
-      observe() — runs ONE bg.step() with actual reward to compute TD error
-                  and update both critic and actor weights.
-
-    State trace (working memory):
-      When ``trace_decay > 0``, the agent augments the raw state with a
-      decaying trace of previous states.  This gives the actor+critic
-      access to temporal context without requiring recurrence in the BG.
-      Biologically: persistent prefrontal activity / sustained firing.
-      Effective input size = state_size * 2 (raw + trace).
-    """
-
     def __init__(
         self,
         state_size: int,
@@ -52,52 +35,44 @@ class SNNAgent(Agent):
         self._trace_decay = trace_decay
         self._use_trace = trace_decay > 0.0
 
-        # With trace, BG sees [state ‖ trace] = 2× state_size
         bg_input_size = state_size * 2 if self._use_trace else state_size
 
         self._bg_config = bg_config or ContinuousBGConfig(
-            gamma=0.95,
-            critic_lr=0.01,
-            actor_lr=0.005,
-            exploration_noise=0.3,
-            hidden_size=64,
+            gamma=0.95, critic_lr=0.01, actor_lr=0.005,
+            exploration_noise=0.3, hidden_size=64,
         )
+        
+        # Zapisujemy wartości bazowe dla homeostazy neuromodulacyjnej
+        self._base_actor_lr = self._bg_config.actor_lr
+        self._base_critic_lr = self._bg_config.critic_lr
+        self._base_noise = self._bg_config.exploration_noise
 
         self.bg = BasalGangliaAGISystem(
-            state_size=bg_input_size,
-            motor_dim=n_actions,
-            internal_dim=1,
-            config=self._bg_config,
+            state_size=bg_input_size, motor_dim=n_actions,
+            internal_dim=1, config=self._bg_config,
         )
+
+        # Zawsze włączamy Neuromodulator (nawet bez modelu świata)
+        self.neuromod = NeuromodulatorSystem(nm_config)
 
         if self._use_wm:
             self._wm_config = wm_config or SNNWorldModelConfig(
-                hidden_size=32,
-                k_winners=4,
-                rehearsal_steps=5,
+                hidden_size=32, k_winners=4, rehearsal_steps=5,
             )
             self.world_model = SNNWorldModel(
-                state_size=state_size,
-                action_size=n_actions,
-                config=self._wm_config,
+                state_size=state_size, action_size=n_actions, config=self._wm_config,
             )
-            self.neuromod = NeuromodulatorSystem(nm_config)
 
-        # State trace (working memory)
         self._trace = np.zeros(state_size, dtype=np.float32)
-
-        # Tracking
         self._last_td_error: float = 0.0
         self._step_count: int = 0
 
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
-        """Concatenate raw state with decaying trace if enabled."""
         if not self._use_trace:
             return state.astype(np.float32)
         return np.concatenate([state.astype(np.float32), self._trace])
 
     def _update_trace(self, state: np.ndarray) -> None:
-        """Decay trace and add current state."""
         if self._use_trace:
             self._trace = self._trace * self._trace_decay + state.astype(np.float32)
 
@@ -105,43 +80,73 @@ class SNNAgent(Agent):
         aug = self._augment_state(state)
         self._update_trace(state)
 
-        # Actor forward ONLY — no learning, no critic update.
+        # 1. Forward Aktora (generuje JEDEN czysty wektor szumu i śladu!)
         motor, _internal = self.bg.actor.forward(aug)
 
-        # Critic forward to set last_v for the upcoming TD calc.
-        v = self.bg.critic.forward(aug)
-        self.bg.last_v = v
+        # 2. Forward Krytyka
+        self.bg.last_v = self.bg.critic.forward(aug)
 
-        # Discretise: argmax over motor channels
-        action = int(np.argmax(motor))
-        return action
+        return int(np.argmax(motor))
+
+    def _peek_value(self, state_spikes: np.ndarray) -> float:
+        """Bezpieczny podgląd V(s') bez niszczenia śladów membrany Krytyka."""
+        state_f32 = state_spikes.astype(np.float32)
+        v_hid = self.bg.critic.v_hidden * self.bg.critic._mem_decay + np.dot(state_f32, self.bg.critic.w_h)
+        spikes = (v_hid > 0.5).astype(np.float32)
+        fr = self.bg.critic.hidden_firing_rate * self.bg.critic.fr_decay + spikes * (1.0 - self.bg.critic.fr_decay)
+        return float(np.dot(self.bg.critic.w_v, fr))
 
     def observe(
-        self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
+        self, state: np.ndarray, action: int, reward: float,
+        next_state: np.ndarray, done: bool, info: dict[str, Any] | None = None,
     ) -> None:
         next_aug = self._augment_state(next_state)
+        is_truncated = info.get("truncated", False) if info else False
+        is_terminal = done and not is_truncated
 
-        # BG learning step — ONE step with actual reward.
-        _, _, td_error = self.bg.step(next_aug, reward, is_terminal=done)
+        # 1. Czyste wyliczenie błędu TD
+        if is_terminal:
+            td_error = reward - self.bg.last_v
+        else:
+            next_v = self._peek_value(next_aug)
+            td_error = reward + self.bg.config.gamma * next_v - self.bg.last_v
+
+        # --- ZSYNCHRONIZOWANE NASYCENIE BŁĘDU (TD CLIPPING) ---
+        # Błąd musi być przycięty DLA OBU modułów identycznie!
+        # Clip [-10.0, 10.0] chroni przed eksplozją wag (-49 przy V=50),
+        # zachowując silny bodziec awersyjny, który jest zgodny z tempem nauki Krytyka.
+
+        clipped_td = float(np.clip(td_error, -100.0, 100.0))
+        # 2. Aktualizacja obu modułów tym samym sygnałem
+        self.bg.critic.update(clipped_td)
+        self.bg.actor.update(clipped_td)
+
         self._last_td_error = td_error
 
-        # World model + neuromodulator (optional)
+        # 3. Aktualizacja Neuromodulatora
+        # NM musi otrzymać SUROWY sygnał, by prawidłowo wyzwolić skok Noradrenaliny (NE=1.0)
+        # co skompresuje ślady (tau) po każdym upadku.
         if self._use_wm:
             state_f32 = state.astype(np.float32)
             next_f32 = next_state.astype(np.float32)
             pred_error = self.world_model.update(
-                state_f32, action, next_f32, m_t=max(abs(td_error), 0.1)
+                state_f32, action, next_f32, m_t=max(abs(clipped_td), 0.1)
             )
             self.neuromod.update(
-                prediction_error=pred_error,
-                td_error=td_error,
+                prediction_error=pred_error, td_error=td_error,
                 novelty=self.world_model.curiosity_signal(),
             )
+        else:
+            self.neuromod.update(
+                prediction_error=np.array([abs(td_error)], dtype=np.float32),
+                td_error=td_error, novelty=0.0
+            )
+
+        # 4. Neuromodulacyjna Plastyczność (Zamknięcie pętli autotuningu)
+        self.bg.set_plasticity_timescales(ne=self.neuromod.tau_compression)
+
+        if self._use_wm:
+            self.neuromod.apply_to_layer(self.world_model)
 
         self._step_count += 1
 

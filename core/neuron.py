@@ -54,6 +54,13 @@ class LIFLayer:
         self.x_post: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
 
         # ── Pre-computed decay factors ────────────────────────────────
+        # Base tau values are stored so that set_plasticity_timescales()
+        # can recompute decay factors without losing the original calibration.
+        self._base_tau_e: float = float(self.config.tau_e)
+        self._base_tau_pre: float = float(self.config.tau_pre)
+        self._base_tau_post: float = float(self.config.tau_post)
+        self._base_tau_m: float = float(self.config.tau_m)
+
         self._mem_decay: float = np.exp(-self.config.dt / self.config.tau_m)
         self._trace_decay: float = np.exp(-self.config.dt / self.config.tau_e)
         self._pre_decay: float = np.exp(-self.config.dt / self.config.tau_pre)
@@ -190,6 +197,46 @@ class LIFLayer:
         """
         if self._homeostatic:
             self._ne_level = float(np.clip(ne, 0.0, 1.0))
+
+    def set_plasticity_timescales(self, ne: float, ach: float = 0.5) -> None:
+        """
+        Zamknięta pętla: błąd TD → NE/ACh → tau → szybkość uczenia.
+
+        NE modulates eligibility trace windows (tau_e, tau_pre, tau_post):
+          - Wysoka NE (wykrycie zmiany kontekstu, burst z LC) →
+            kompresja tau_e → stare korelacje zanikają szybciej →
+            sieć „zapomina" stare skojarzenia i szybciej uczy się nowych.
+          - Niska NE (stabilne środowisko, rutyna) →
+            pełne tau_e → STDP integruje dłuższe okna temporalne →
+            konsolidacja wyuczonych wzorców.
+
+        ACh modulates membrane time constant (tau_m):
+          - Wysoka ACh (nowe środowisko, niepewność) →
+            krótsze tau_m → błona szybciej reaguje na bieżące wejście →
+            priorytet bottom-up nad zakumulowaną historią.
+          - Niska ACh (znane środowisko) →
+            dłuższe tau_m → wolna integracja → dominacja top-down predykcji.
+
+        Args:
+            ne:  Noradrenaline level [0, 1] from NeuromodulatorSystem.
+            ach: Acetylcholine level [0, 1] from NeuromodulatorSystem.
+        """
+        ne = float(np.clip(ne, 0.0, 1.0))
+        ach = float(np.clip(ach, 0.0, 1.0))
+
+        # Compression factor: 1.0 (no compression) → tau_ne_compression (max)
+        ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
+        ach_factor = 1.0 + ach * (self.config.tau_ach_compression - 1.0)
+
+        eff_tau_e = self._base_tau_e / ne_factor
+        eff_tau_pre = self._base_tau_pre / ne_factor
+        eff_tau_post = self._base_tau_post / ne_factor
+        eff_tau_m = self._base_tau_m / ach_factor
+
+        self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
+        self._pre_decay = float(np.exp(-self.config.dt / eff_tau_pre))
+        self._post_decay = float(np.exp(-self.config.dt / eff_tau_post))
+        self._mem_decay = float(np.exp(-self.config.dt / eff_tau_m))
 
     # ------------------------------------------------------------------
     # Weight update

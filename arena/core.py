@@ -76,6 +76,7 @@ class Agent(abc.ABC):
         reward: float,
         next_state: np.ndarray,
         done: bool,
+        info: dict[str, Any] | None = None,  # <-- DODANE
     ) -> None:
         """Process a transition for learning."""
 
@@ -93,7 +94,7 @@ class RandomAgent(Agent):
     def act(self, state: np.ndarray) -> int:
         return int(np.random.randint(self._n_actions))
 
-    def observe(self, state, action, reward, next_state, done) -> None:
+    def observe(self, state, action, reward, next_state, done, info=None) -> None:
         pass
 
     def reset(self) -> None:
@@ -220,7 +221,8 @@ class Trainer:
             next_state, reward, done, info = self.env.step(action)
 
             if training:
-                self.agent.observe(state, action, reward, next_state, done)
+                self.agent.observe(state, action, reward, next_state, done, info)
+
 
             log.actions.append(action)
             log.rewards.append(reward)

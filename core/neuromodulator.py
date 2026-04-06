@@ -122,6 +122,48 @@ class NeuromodulatorSystem:
         """
         return self.serotonin
 
+    @property
+    def tau_compression(self) -> float:
+        """
+        Noradrenaline-driven compression signal for eligibility trace timescales.
+
+        Pass directly to layer.set_plasticity_timescales(ne=...).
+        High NE → tau_e compressed → old correlations fade faster →
+        quicker adaptation when environment changes (phase B of a bandit task).
+        Low NE → full tau_e → consolidation of familiar patterns.
+        """
+        return self.noradrenaline
+
+    @property
+    def membrane_reactivity(self) -> float:
+        """
+        Acetylcholine-driven compression of membrane time constant.
+
+        Pass directly to layer.set_plasticity_timescales(ach=...).
+        High ACh → tau_m compressed → faster membrane integration →
+        stronger bottom-up signal influence vs. accumulated prediction.
+        Low ACh → slow tau_m → top-down predictions dominate.
+        """
+        return self.acetylcholine
+
+    def apply_to_layer(self, layer) -> None:
+        """
+        Convenience: propagate both NE and ACh to any layer that
+        supports set_plasticity_timescales().
+
+        Zamknięta pętla w jednym wywołaniu:
+          neuromodulator.update(...) → neuromodulator.apply_to_layer(layer)
+        Wystarczy umieścić to wywołanie w głównej pętli agenta po każdym kroku.
+        """
+        if hasattr(layer, 'set_plasticity_timescales'):
+            layer.set_plasticity_timescales(
+                ne=self.noradrenaline,
+                ach=self.acetylcholine,
+            )
+        # Dark matter recruitment (NE threshold drop) — preserved as before
+        if hasattr(layer, 'set_ne_level'):
+            layer.set_ne_level(self.noradrenaline)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

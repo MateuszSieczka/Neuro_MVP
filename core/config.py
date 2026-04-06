@@ -18,6 +18,18 @@ class LIFConfig:
     dt: float = 1.0
     learning_rate: float = 0.01
 
+    # ── Dynamic timescale modulation ──────────────────────────────────
+    # NE compresses eligibility trace windows (tau_e, tau_pre, tau_post).
+    # At NE=1.0 the effective tau is divided by tau_ne_compression,
+    # making old correlations fade faster → quicker context switching.
+    # At NE=0.0 no compression is applied (full tau_e retained).
+    tau_ne_compression: float = 4.0
+
+    # ACh compresses the membrane time constant.
+    # High ACh → faster integration → stronger bottom-up signal influence.
+    # At ACh=1.0 effective tau_m is divided by tau_ach_compression.
+    tau_ach_compression: float = 2.0
+
 
 @dataclass(frozen=True, kw_only=True)
 class HomeostaticLIFConfig(LIFConfig):

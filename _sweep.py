@@ -12,11 +12,13 @@ SEEDS = [1, 17, 42, 99, 256]
 def run_spark_benchmark():
     # 1. Agresywna konfiguracja Jąder Podstawnych
     bg_cfg = ContinuousBGConfig(
-        gamma=0.98,
-        critic_lr=0.015,        # Zmniejszone do stabilnego poziomu
-        actor_lr=0.005,         # Znacznie stabilniejszy aktor (nie zniszczy wag po sukcesie)
-        exploration_noise=0.15, # Wystarczający do nauki, na tyle mały by eksploatować cel
-        hidden_size=64
+        gamma=0.95,  # KLUCZ: Max V to 20. Kara za upadek to max -20, a nie -100. Chroni przed amnezją!
+        critic_lr=0.01,  # Szybka aktualizacja Krytyka
+        actor_lr=0.002,  # Przywrócone silne uczenie Aktora (przy gamma 0.95 nie zniszczy wag)
+        exploration_noise=0.1,  # Bezpieczny poziom szumu (przebija argmax, ale rzadziej zrzuca kij)
+        hidden_size=128,  # Duża pojemność dla stabilności
+        tau_e=150.0,  # Horyzont czasowy korelacji (~150 kroków)
+        tau_hidden=20.0
     )
 
     # 2. Konfiguracja Modelu Świata i Neuromodulacji
@@ -28,7 +30,7 @@ def run_spark_benchmark():
     
     nm_cfg = NeuromodulatorConfig() # Używamy domyślnych, zbalansowanych wartości
 
-    n_ep = 120 # Skracamy uczenie ze 800 do 120 epizodów!
+    n_ep = 120
     scores = []
 
     print(f"--- Benchmark zbieżności dla CartPole (Cel: <= 80-100 epizodów) ---")
@@ -36,9 +38,9 @@ def run_spark_benchmark():
     for seed in SEEDS:
         np.random.seed(seed)
         env = GymEnv("CartPole-v1", normalize=True, fixed_bounds=BOUNDS)
-        
+
         agent = SNNAgent(
-            state_size=env.state_size, 
+            state_size=env.state_size,
             n_actions=env.n_actions,
             bg_config=bg_cfg,
             use_world_model=False,  # Wyłączamy pożeracz CPU (nie jest podpięty pod aktora)

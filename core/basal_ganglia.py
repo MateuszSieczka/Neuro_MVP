@@ -15,7 +15,8 @@ class ContinuousBGConfig:
     exploration_noise: float = 0.3  # Temperatura softmax (wyższa na starcie → eksploracja)
     hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
     tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
-    w_clip: float = 3.0      # Synaptic saturation: max |w| (receptor density / spine volume bound)
+    w_clip: float = 3.0      # Synaptic saturation for actor: max |w| (receptor density / spine volume)
+    w_clip_critic: float = 2.5  # Tighter clip for critic — stabilizes backprop through w_v
 
 
 class SNNDeepCritic:
@@ -120,8 +121,8 @@ class SNNDeepCritic:
         feedback = self.w_v * activation_deriv   # (hidden,)
         self.w_h += self.config.critic_lr * td_error * self.e_h * feedback[np.newaxis, :]
 
-        # Synaptic saturation: max weight bounded by receptor density / spine volume.
-        wc = self.config.w_clip
+        # Synaptic saturation: tighter for critic to stabilize backprop through w_v.
+        wc = self.config.w_clip_critic
         np.clip(self.w_v, -wc, wc, out=self.w_v)
         np.clip(self.w_h, -wc, wc, out=self.w_h)
 

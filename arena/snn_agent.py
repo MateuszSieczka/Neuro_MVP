@@ -180,23 +180,34 @@ class SNNAgent(Agent):
                 0.8 * self._avg_episode_reward + 0.2 * ep_reward
             )
 
-            # Adaptacja eksploracji — podwójny sygnał:
+            # Adaptacja eksploracji — podwójny sygnał z surprise detection:
             # 1. Bieżący epizod (szybka informacja zwrotna)
             # 2. EMA (stabilność — czy agent konsekwentnie jest dobry?)
+            # 3. Surprise — nagły spadek poniżej oczekiwań (phasic DA dip)
             #
             # Biologicznie: dopamina tonowa (VTA) podąża za średnią nagrodą (EMA),
             # podczas gdy phasic DA reaguje na bieżące zdarzenie.
-            # Szum spada tylko gdy OBA sygnały są pozytywne.
+            # Niespodziewany upadek po dobrej serii → duży phasic DA dip →
+            # natychmiastowy wzrost eksploracji (locus coeruleus → NE burst).
             ema_good = self._avg_episode_reward > 100.0  # EMA > 100 kroków
             current_good = ep_reward > 200.0              # Ten epizod > 200 kroków
 
-            if ema_good and current_good:
+            # Surprise detection: bieżący wynik znacząco poniżej oczekiwanego
+            surprise = (self._avg_episode_reward > 300.0 and
+                        ep_reward < 0.5 * self._avg_episode_reward)
+
+            if surprise:
+                # Niespodziewany upadek — phasic DA dip → natychmiastowy
+                # wzrost szumu + przywrócenie plastyczności.
+                # Biologicznie: LC burst resetuje eksplorację.
+                self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale + 0.15)
+            elif ema_good and current_good:
                 # Oba sygnały pozytywne → pewna redukcja
                 self.bg.actor.noise_scale = max(0.05, self.bg.actor.noise_scale * 0.85)
             elif not ema_good and not current_good:
                 # Oba negatywne → wzrost eksploracji
                 self.bg.actor.noise_scale = min(1.0, self.bg.actor.noise_scale * 1.10)
-            # Mieszane sygnały → bez zmiany (czekamy na spójną informację)
+            # Mieszane sygnały (bez surprise) → bez zmiany
 
         self._step_count += 1
 

@@ -274,10 +274,17 @@ class NetworkGraph:
         for name in self._order:
             layer = self._layers[name]
 
+            # Zawsze agreguj wejścia feedforward z innych warstw wewnątrz sieci
+            ff_spikes = self._aggregate_feedforward_inputs(name, outputs)
+
+            # Jeśli warstwa otrzymuje również bezpośredni sygnał z sensorów, nałóż go
             if name in sensory_inputs:
-                input_spikes = sensory_inputs[name]
+                sensory = sensory_inputs[name].astype(np.float32)
+                # Ograniczenie do 1.0 symuluje fakt, że dany neuron wejściowy
+                # wyemitował max 1 impuls w danym dt, niezależnie od źródła
+                input_spikes = np.clip(ff_spikes + sensory, 0.0, 1.0)
             else:
-                input_spikes = self._aggregate_feedforward_inputs(name, outputs)
+                input_spikes = ff_spikes
 
             outputs[name] = layer.forward(input_spikes)
 

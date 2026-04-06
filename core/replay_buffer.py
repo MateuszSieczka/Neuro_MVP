@@ -23,16 +23,21 @@ class Experience:
     reward: float
     next_state: np.ndarray
     layer_traces: dict[str, np.ndarray]
-    layer_outputs: dict[str, np.ndarray]  # DODANE: Wyjścia z warstw do nauki sekwencyjnej
+    layer_outputs: dict[str, np.ndarray]
     prediction_error: np.ndarray
+
+    # DODANE: Przechowywanie lokalnych błędów warstw w momencie wystąpienia zdarzenia
+    layer_errors: dict[str, np.ndarray] = field(default_factory=dict)
+    done: bool = False
 
     def __post_init__(self) -> None:
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
         self.layer_traces = {name: trace.copy() for name, trace in self.layer_traces.items()}
-        # DODANE: Kopiowanie wyjść
         self.layer_outputs = {name: out.copy() for name, out in self.layer_outputs.items()}
         self.prediction_error = self.prediction_error.copy()
+        # Kopiowanie zapisanych błędów
+        self.layer_errors = {name: err.copy() for name, err in self.layer_errors.items()}
 
 
 class ReplayBuffer:
@@ -68,13 +73,26 @@ class ReplayBuffer:
     # Storage
     # ------------------------------------------------------------------
 
-    def store(self, state, action, reward, next_state, layer_traces, layer_outputs, prediction_error) -> None:
-        # Zmiana sygnatury store, aby przyjmowała layer_outputs
+    def store(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        layer_traces,
+        layer_outputs,
+        prediction_error,
+        layer_errors: dict[str, np.ndarray] | None = None,
+        done: bool = False  # <--- DODANE
+    ) -> None:
+        if layer_errors is None:
+            layer_errors = {}
         self._buffer.append(
             Experience(
                 state=state, action=action, reward=reward, next_state=next_state,
                 layer_traces=layer_traces, layer_outputs=layer_outputs,
-                prediction_error=prediction_error,
+                prediction_error=prediction_error, layer_errors=layer_errors,
+                done=done  # <--- DODANE
             )
         )
     # ------------------------------------------------------------------
@@ -137,16 +155,31 @@ class ReplayBuffer:
 
         errors: list[float] = []
 
-        # POPRAWKA Bug C: Wstępne obliczenie skumulowanych zwrotów G_t = r_t + γ*G_{t+1}
+        #  Wstępne obliczenie skumulowanych zwrotów G_t = r_t + γ*G_{t+1}
         # Iterujemy od najnowszego do najstarszego (tak jak potem robimy replay),
         # kumulując zwrot do tyłu.
         cumulative_returns: list[float] = []
         G = 0.0
         for exp in reversed(experiences):
+            if exp.done:
+                G = 0.0  # Odetnij sygnał z przyszłych, niezwiązanych epizodów!
             G = exp.reward + gamma * G
             cumulative_returns.append(G)
         # cumulative_returns[0] = G dla najnowszego exp; odwrócimy dostęp poniżej.
 
+        wm_saved_state = None
+        if hasattr(world_model, '_encoder'):
+            enc = world_model._encoder
+            wm_saved_state = {
+                "v": enc.v.copy(),
+                "has_spiked": enc.has_spiked.copy(),
+                "refrac_count": enc.refrac_count.copy(),
+                "x_pre": enc.x_pre.copy(),
+                "x_post": enc.x_post.copy(),
+                "e": enc.e.copy(),
+                "top_down_prediction": enc.top_down_prediction.copy(),
+                "prediction_error": enc.prediction_error.copy(),
+            }
         # Hippocampal reverse replay: most recent experience first
         for i, exp in enumerate(reversed(experiences)):
             # 1. Restore eligibility traces for ALL layers in the hierarchy
@@ -154,36 +187,58 @@ class ReplayBuffer:
                 if name in exp.layer_traces:
                     layer.e = exp.layer_traces[name].copy()
 
-            # 2. Update world model; get refined prediction error
+            # 2. Reset stanu transient przed każdym krokiem (izolacja przejść SNN)
+            # Zapobiega to "wyciekowi" czasu do tyłu między niezależnymi próbkami
+            if hasattr(world_model, 'reset_state'):
+                world_model.reset_state()
+            # Update world model; get refined prediction error
             world_error = world_model.update(exp.state, exp.action, exp.next_state)
 
             # 3. Three-factor STDP: dopamina × skumulowany_zwrot × ślad × błąd_predykcji
-            # POPRAWKA Bug B: Używamy lokalnego błędu predykcji każdej warstwy (num_neurons,),
+            # Używamy lokalnego błędu predykcji każdej warstwy (num_neurons,),
             # NIE globalnego world_error (state_size,). LIFLayer.update_weights robi:
             #   dw = lr * m_t * e * pred_error
             # gdzie e ma kształt (num_inputs, num_neurons). Broadcast NumPy wymaga
             # pred_error o kształcie (num_neurons,) — globalny błąd świata o innym
             # rozmiarze powoduje ValueError (crash).
+            # 3. Three-factor STDP: dopamina × skumulowany_zwrot × ślad × błąd_predykcji
             G_t = cumulative_returns[i]
             m_t = neuromodulator.learning_rate_modulation * G_t
-            for layer in layers.values():
-                local_error = getattr(layer, 'prediction_error', None)
+
+            for name, layer in layers.items():
+                # NAPRAWA BUG 1: Pobieramy zamrożony błąd z historii (exp), a nie nadpisany stan z końca epizodu
+                local_error = exp.layer_errors.get(name)
                 num_neurons = getattr(layer, 'num_neurons', None)
-                if (local_error is not None
-                        and num_neurons is not None
-                        and local_error.shape[0] == num_neurons):
-                    # Warstwa PC/Pyramidal: używa swojego własnego, lokalnego błędu
-                    layer.update_weights(m_t=m_t, pred_error=local_error)
+                num_inputs = getattr(layer, 'num_inputs', None)
+
+                if local_error is not None and num_neurons is not None:
+                    # NAPRAWA BUG 2: Warstwy PC mają błąd w wymiarze (num_inputs,), a klasyczne LIF (num_neurons,).
+                    # Dopuszczamy oba kształty - LIFLayer.update_weights ułoży wymiary przez broadcasting.
+                    if local_error.shape[0] in (num_neurons, num_inputs):
+                        layer.update_weights(m_t=m_t, pred_error=local_error)
+                    else:
+                        # Fallback jeśli kształt jest całkowicie zepsuty
+                        layer.update_weights(m_t=m_t, pred_error=np.ones(num_neurons, dtype=np.float32))
                 elif num_neurons is not None:
-                    # Prosta warstwa LIF bez prediction_error: neutralny, jednorodny sygnał
-                    # (odpowiednik "brak korekty", nie destabilizuje wag)
+                    # Prosta warstwa LIF bez wbudowanego błędu: otrzymuje mnożnik neutralny (1.0)
                     layer.update_weights(
                         m_t=m_t,
                         pred_error=np.ones(num_neurons, dtype=np.float32),
                     )
 
-            errors.append(world_model.prediction_error)
+            errors.append(float(np.mean(world_error ** 2)))
 
+        # [DODANE] 3. Przywrócenie stanu sieci po przebudzeniu
+        if wm_saved_state is not None:
+            enc = world_model._encoder
+            enc.v[:] = wm_saved_state["v"]
+            enc.has_spiked[:] = wm_saved_state["has_spiked"]
+            enc.refrac_count[:] = wm_saved_state["refrac_count"]
+            enc.x_pre[:] = wm_saved_state["x_pre"]
+            enc.x_post[:] = wm_saved_state["x_post"]
+            enc.e[:] = wm_saved_state["e"]
+            enc.top_down_prediction[:] = wm_saved_state["top_down_prediction"]
+            enc.prediction_error[:] = wm_saved_state["prediction_error"]
         return errors
 
     # ------------------------------------------------------------------

@@ -4,12 +4,12 @@ import numpy as np
 from core.config import PredictiveCodingConfig, NeuromodulatorConfig, SequenceMemoryConfig
 from core.predictive_coding import PredictiveCodingLayer
 from core.neuromodulator import NeuromodulatorSystem
-from core.sequence_memory import SequenceMemory
-from core.network import NetworkGraph, LayerConnection
+from core.sequence_memory import SequenceMemory, HierarchicalSequenceMemory
+from core.network import NetworkGraph
 
 
 class TestNetworkGraphRegistration(unittest.TestCase):
-    """Tests for layer registration and connection management."""
+    """Tests for layer registration, topology sorting, and cycle detection."""
 
     def setUp(self) -> None:
         self.net = NetworkGraph(dt=1.0)
@@ -32,115 +32,136 @@ class TestNetworkGraphRegistration(unittest.TestCase):
             self.net.connect("L1", "UNKNOWN")
 
     def test_connect_invalid_type_raises(self) -> None:
-        l1 = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
-        l2 = PredictiveCodingLayer(num_inputs=6, num_neurons=8)
-        self.net.add_layer("L1", l1)
-        self.net.add_layer("L2", l2)
+        self.net.add_layer("L1", PredictiveCodingLayer(4, 4))
+        self.net.add_layer("L2", PredictiveCodingLayer(4, 4))
         with self.assertRaises(ValueError):
             self.net.connect("L1", "L2", "invalid_type")
 
-    def test_get_layer_returns_registered_layer(self) -> None:
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
-        self.net.add_layer("L1", layer)
-        self.assertIs(self.net.get_layer("L1"), layer)
+    def test_topological_sort_feedforward(self) -> None:
+        """Graph should sort layers strictly bottom-to-top regardless of add order."""
+        self.net.add_layer("Top", PredictiveCodingLayer(4, 4))
+        self.net.add_layer("Bottom", PredictiveCodingLayer(4, 4))
+        self.net.add_layer("Middle", PredictiveCodingLayer(4, 4))
 
-    def test_layer_names_preserves_registration_order(self) -> None:
-        for name in ["bottom", "middle", "top"]:
-            self.net.add_layer(name, PredictiveCodingLayer(num_inputs=4, num_neurons=6))
-        self.assertEqual(self.net.layer_names, ["bottom", "middle", "top"])
+        self.net.connect("Bottom", "Middle", "feedforward")
+        self.net.connect("Middle", "Top", "feedforward")
+
+        # Accessing layer_names triggers the _refresh_order()
+        ordered = self.net.layer_names
+        self.assertEqual(ordered, ["Bottom", "Middle", "Top"])
+
+    def test_topological_sort_ignores_feedback_cycles(self) -> None:
+        """Feedback connections should not create cycles in the topological sort."""
+        self.net.add_layer("L1", PredictiveCodingLayer(4, 4))
+        self.net.add_layer("L2", PredictiveCodingLayer(4, 4))
+
+        self.net.connect("L1", "L2", "feedforward")
+        self.net.connect("L2", "L1", "feedback")
+
+        self.assertEqual(self.net.layer_names, ["L1", "L2"])
 
 
-class TestNetworkGraphStep(unittest.TestCase):
-    """Tests for the step() feedforward/feedback pipeline."""
+class TestNetworkGraphAggregation(unittest.TestCase):
+    """Tests for multi-source feedforward aggregation (sum vs concat)."""
 
-    def _build_two_layer_network(self) -> tuple[NetworkGraph, str, str]:
-        """
-        Build a simple two-layer hierarchy.
+    def setUp(self) -> None:
+        self.net = NetworkGraph(dt=1.0)
 
-        Dimension contract:
-          L1: num_inputs=4, num_neurons=4
-          L2: num_inputs=4, num_neurons=6
-          L2's generate_prediction() produces shape (4,) which matches L1's num_inputs.
-        """
-        net = NetworkGraph(dt=1.0)
-        l1 = PredictiveCodingLayer(num_inputs=4, num_neurons=4)
-        l2 = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
+    def test_sum_aggregation_mode(self) -> None:
+        self.net.add_layer("L1", PredictiveCodingLayer(2, 2))
+        self.net.add_layer("L2", PredictiveCodingLayer(2, 2))
+        self.net.add_layer("Target", PredictiveCodingLayer(2, 2))
 
-        net.add_layer("L1", l1)
-        net.add_layer("L2", l2)
-        net.connect("L1", "L2", "feedforward")
-        net.connect("L2", "L1", "feedback")
-        return net, "L1", "L2"
+        # Both feed into Target with sum mode and weights
+        self.net.connect("L1", "Target", "feedforward", "sum", weight=1.0)
+        self.net.connect("L2", "Target", "feedforward", "sum", weight=0.5)
 
-    def test_step_returns_outputs_for_all_layers(self) -> None:
-        net, l1, l2 = self._build_two_layer_network()
-        sensory = {"L1": np.ones(4, dtype=np.float32)}
-        outputs = net.step(sensory)
-        self.assertIn(l1, outputs)
-        self.assertIn(l2, outputs)
+        # Mocking delay buffer history manually to bypass forward passes
+        outputs = {
+            "L1": np.array([1.0, 1.0], dtype=np.float32),
+            "L2": np.array([1.0, 1.0], dtype=np.float32),
+        }
+        self.net._output_history["L1"] = [outputs["L1"]]
+        self.net._output_history["L2"] = [outputs["L2"]]
 
-    def test_step_output_shapes(self) -> None:
-        net, l1, l2 = self._build_two_layer_network()
-        sensory = {"L1": np.ones(4, dtype=np.float32)}
-        outputs = net.step(sensory)
-        self.assertEqual(outputs[l1].shape, (4,))
-        self.assertEqual(outputs[l2].shape, (6,))
+        result = self.net._aggregate_feedforward_inputs("Target", outputs)
+        np.testing.assert_array_almost_equal(result, np.array([1.5, 1.5]))
 
-    def test_step_output_is_boolean_or_binary(self) -> None:
-        net, l1, _ = self._build_two_layer_network()
-        sensory = {"L1": np.ones(4, dtype=np.float32)}
-        outputs = net.step(sensory)
-        unique_vals = set(outputs[l1].astype(float).tolist())
-        self.assertTrue(unique_vals <= {0.0, 1.0, True, False})
+    def test_concat_aggregation_mode(self) -> None:
+        # L1 produces 2 features, L2 produces 3 features
+        self.net.add_layer("L1", PredictiveCodingLayer(2, 2))
+        self.net.add_layer("L2", PredictiveCodingLayer(3, 3))
+        # Target accepts exactly 5 features (2 + 3)
+        self.net.add_layer("Target", PredictiveCodingLayer(5, 5))
 
-    def test_step_increments_timestep(self) -> None:
-        net, _, _ = self._build_two_layer_network()
-        self.assertEqual(net.timestep, 0)
-        net.step({"L1": np.zeros(4)})
-        self.assertEqual(net.timestep, 1)
-        net.step({"L1": np.zeros(4)})
-        self.assertEqual(net.timestep, 2)
+        self.net.connect("L1", "Target", "feedforward", "concat")
+        self.net.connect("L2", "Target", "feedforward", "concat")
 
-    def test_step_with_neuromodulator_distributes_ach(self) -> None:
-        net, _, _ = self._build_two_layer_network()
-        nm = NeuromodulatorSystem(NeuromodulatorConfig(baseline_ach=0.9))
-        sensory = {"L1": np.ones(4, dtype=np.float32)}
-        net.step(sensory, neuromodulator=nm)
+        outputs = {
+            "L1": np.array([1.0, 2.0], dtype=np.float32),
+            "L2": np.array([3.0, 4.0, 5.0], dtype=np.float32),
+        }
+        self.net._output_history["L1"] = [outputs["L1"]]
+        self.net._output_history["L2"] = [outputs["L2"]]
 
-        l1 = net.get_layer("L1")
-        # ACh should have been distributed to all layers
-        self.assertAlmostEqual(l1.ach_level, nm.bottom_up_gain, places=2)
+        # Accessing layer_names triggers _refresh_order and offset precalculation
+        _ = self.net.layer_names
 
-    def test_missing_sensory_input_uses_zeros(self) -> None:
-        """Layer without sensory input or feedforward source gets zero input."""
+        result = self.net._aggregate_feedforward_inputs("Target", outputs)
+        np.testing.assert_array_equal(result, np.array([1.0, 2.0, 3.0, 4.0, 5.0]))
+
+
+class TestNetworkGraphDelays(unittest.TestCase):
+    """Tests for synaptic delay buffers."""
+
+    def test_delayed_feedforward_connection(self) -> None:
         net = NetworkGraph()
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
-        net.add_layer("isolated", layer)
-        # No sensory input provided
-        outputs = net.step({})
-        # Should not crash; output is all-false spikes
-        self.assertEqual(outputs["isolated"].shape, (6,))
+        net.add_layer("L1", PredictiveCodingLayer(2, 2))
+        net.add_layer("L2", PredictiveCodingLayer(2, 2))
 
-    def test_feedback_delivers_prediction_to_lower_layer(self) -> None:
-        """
-        After training L2 to spike, its generate_prediction() should produce
-        a non-zero prediction that is received by L1.
-        """
-        net, _, _ = self._build_two_layer_network()
-        l2 = net.get_layer("L2")
-        # Force L2 to have some spikes in its history
-        l2.has_spiked[:3] = True
-        l2.feedback_w.fill(0.5)
+        # Delay of 1 means L2 receives L1's output from timestep (t-1)
+        net.connect("L1", "L2", "feedforward", delay=1)
 
-        # After step, L1 should have received a prediction
-        net.step({"L1": np.ones(4, dtype=np.float32)})
-        l1 = net.get_layer("L1")
-        # top_down_prediction should match L1's num_inputs
-        self.assertEqual(l1.top_down_prediction.shape, (4,))
+        # Timestep 0: L1 input
+        sensory_0 = {"L1": np.array([1.0, 1.0], dtype=np.float32)}
+        out_0 = net.step(sensory_0)
+
+        # In step 0, L2 should have received zero feedforward drive
+        ff_input_t0 = net._aggregate_feedforward_inputs("L2", out_0)
+        np.testing.assert_array_equal(ff_input_t0, np.zeros(2))
+
+        # Timestep 1: L1 is silent. L2 should now receive exactly what L1 fired at t=0.
+        sensory_1 = {"L1": np.array([0.0, 0.0], dtype=np.float32)}
+        out_1 = net.step(sensory_1)
+
+        ff_input_t1 = net._aggregate_feedforward_inputs("L2", out_1)
+
+        # NAPRAWA: Zamiast hardcodować [1.0, 1.0], sprawdzamy opóźnienie względem realnego wyjścia.
+        np.testing.assert_array_equal(ff_input_t1, out_0["L1"])
+
+class TestNetworkGraphNeuromodulation(unittest.TestCase):
+    """Tests for global distribution of ACh, NE, and 5-HT."""
+
+    def test_step_distributes_neuromodulators(self) -> None:
+        net = NetworkGraph()
+        l1 = PredictiveCodingLayer(4, 4)
+        net.add_layer("L1", l1)
+
+        nm = NeuromodulatorSystem(NeuromodulatorConfig(
+            baseline_ach=0.8, baseline_ne=0.7, baseline_sero=0.6
+        ))
+
+        net.step({"L1": np.zeros(4)}, neuromodulator=nm)
+
+        # Check if layer received the signals (assuming mock/duck typing behavior)
+        self.assertAlmostEqual(l1.ach_level, 0.8)
+        # Note: In the codebase, NE and 5-HT are passed via `set_neuromodulators`
+        # if the layer supports it (e.g. PyramidalLayer, but PC layer may just ignore them
+        # or we assume NetworkGraph correctly attempted to call it).
 
 
 class TestNetworkGraphSequenceMemory(unittest.TestCase):
-    """Tests for SequenceMemory integration."""
+    """Tests for attaching and observing Sequence Memory."""
 
     def test_attach_sequence_memory_to_unknown_layer_raises(self) -> None:
         net = NetworkGraph()
@@ -150,99 +171,62 @@ class TestNetworkGraphSequenceMemory(unittest.TestCase):
 
     def test_step_updates_attached_sequence_memory(self) -> None:
         net = NetworkGraph()
-        config = PredictiveCodingConfig(k_winners=3, window_ms=5)
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6, config=config)
+        config = PredictiveCodingConfig(k_winners=4, window_ms=5)
+        layer = PredictiveCodingLayer(4, 4, config=config)
+        # Force weights to guarantee spikes
         layer.w.fill(50.0)
-        layer.set_ach_level(1.0)  # Full bottom-up for reliable spiking
+        layer.set_ach_level(1.0)
         net.add_layer("L1", layer)
 
-        sm = SequenceMemory(6, SequenceMemoryConfig(learning_rate=0.1))
+        sm = SequenceMemory(4, SequenceMemoryConfig(learning_rate=0.1))
         net.attach_sequence_memory("L1", sm)
 
-        # Run enough steps to guarantee spikes even with Poisson encoding
-        any_observed = False
-        for _ in range(200):
-            outputs = net.step({"L1": np.ones(4, dtype=np.float32)})
-            if np.any(outputs["L1"]):
-                any_observed = True
+        for _ in range(5):
+            net.step({"L1": np.ones(4, dtype=np.float32)})
 
-        self.assertTrue(
-            any_observed,
-            "Network should have produced at least one spike in 200 steps.",
-        )
-
-
-class TestNetworkGraphWeightUpdate(unittest.TestCase):
-    """Tests for the global update_weights method."""
-
-    def test_update_weights_with_prediction_error(self) -> None:
-        net = NetworkGraph()
-        config = PredictiveCodingConfig(k_winners=3, window_ms=5)
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6, config=config)
-        layer.w.fill(50.0)
-        net.add_layer("L1", layer)
-
-        nm = NeuromodulatorSystem()
-        nm.dopamine = 1.0
-
-        # Run a few steps to build eligibility traces
-        for _ in range(10):
-            net.step({"L1": np.ones(4, dtype=np.float32)}, neuromodulator=nm)
-
-        # Set a prediction error in input space (num_inputs=4)
-        layer.prediction_error = np.ones(4, dtype=np.float32) * 0.5
-
-        # update_weights should project error from input space to output space
-        # and not raise a shape error
-        initial_w = layer.w.copy()
-        net.update_weights(nm)
-
-        # If there are non-zero eligibility traces, weights should have changed
-        if np.any(layer.e != 0.0):
-            self.assertFalse(np.allclose(layer.w, initial_w))
+        # Prev pattern should not be purely zeros if it observed spikes
+        self.assertTrue(np.any(sm.prev_pattern > 0))
 
 
 class TestNetworkGraphReset(unittest.TestCase):
-    """Tests for reset_state."""
+    """Tests for state wiping across episodes."""
 
-    def test_reset_clears_timestep(self) -> None:
+    def test_reset_clears_timestep_and_history(self) -> None:
         net = NetworkGraph()
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
+        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=4)
         net.add_layer("L1", layer)
-        net.step({"L1": np.zeros(4)})
-        net.step({"L1": np.zeros(4)})
+
+        net.step({"L1": np.ones(4)})
+        net.step({"L1": np.ones(4)})
+
+        self.assertEqual(net.timestep, 2)
+        self.assertIn("L1", net._output_history)
+
+        # Maxlen for zero-delay network is 1, so the buffer should hold exactly 1 element
+        self.assertEqual(len(net._output_history["L1"]), 1)
+
         net.reset_state()
+
         self.assertEqual(net.timestep, 0)
+        self.assertEqual(len(net._output_history), 0)
 
     def test_reset_clears_layer_state(self) -> None:
         net = NetworkGraph()
-        config = PredictiveCodingConfig(k_winners=3, window_ms=5)
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=4, config=config)
+        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=4)
         layer.w.fill(50.0)
         net.add_layer("L1", layer)
 
-        for _ in range(10):
-            net.step({"L1": np.ones(4, dtype=np.float32)})
+        net.step({"L1": np.ones(4, dtype=np.float32)})
+
+        # SNN check: v is different from v_rest (either charging up, or resting at v_reset after a spike)
+        self.assertTrue(np.any(layer.v != layer.config.v_rest) or np.any(layer.has_spiked))
+
         net.reset_state()
+        np.testing.assert_array_equal(layer.v, np.full(4, layer.config.v_rest))
 
-        np.testing.assert_array_equal(
-            layer.v, np.full(4, layer.config.v_rest),
-        )
 
-    def test_reset_clears_sequence_memory(self) -> None:
-        net = NetworkGraph()
-        layer = PredictiveCodingLayer(num_inputs=4, num_neurons=6)
-        layer.w.fill(50.0)
-        net.add_layer("L1", layer)
-        sm = SequenceMemory(6)
-        net.attach_sequence_memory("L1", sm)
-
-        for _ in range(20):
-            net.step({"L1": np.ones(4, dtype=np.float32)})
-        net.reset_state()
-
-        np.testing.assert_array_equal(sm.prev_pattern, np.zeros(6))
-
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

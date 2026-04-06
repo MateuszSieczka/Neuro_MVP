@@ -50,19 +50,16 @@ class NeuromodulatorSystem:
     ) -> None:
         """
         Update all neuromodulator levels based on incoming signals.
-
-        Args:
-            prediction_error: Signed error vector from a PredictiveCodingLayer
-                              (or any layer). Shape: (n,).
-            novelty:          Optional explicit novelty signal in [0, 1].
-                              When None, inferred as clipped mean |error|.
         """
         error_magnitude = float(np.mean(np.abs(prediction_error)))
+
+        # NAPRAWA: Zapisujemy błąd do historii, by Serotonina mogła śledzić stabilność w czasie
+        self._error_history.append(error_magnitude)
+
         if novelty is None:
             novelty = float(np.clip(error_magnitude, 0.0, 1.0))
 
         # ZMIANA: Dopamina jest w 100% sterowana błędem z Basal Ganglia
-        # Skalujemy td_error do przedziału dopaminergicznego [0, 1] (bazowo 0.5)
         rpe_signal = float(np.clip(td_error + 0.5, 0.0, 1.0))
 
         self.dopamine = (

@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+.vs/Neuro_MVP.slnx/FileContentIndex/30ae695f-7672-4042-af3d-2dbebd2f940f.vsidx
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/CodeChunks.db
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/CodeChunks.db-shm
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/CodeChunks.db-wal
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/SemanticSymbols.db
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/SemanticSymbols.db-shm
+.vs/Neuro_MVP/CopilotIndices/18.5.39108.44903/SemanticSymbols.db-wal
+.vs/slnx.sqlite
+.vs/ProjectSettings.json

@@ -114,56 +114,41 @@ class SNNWorldModel:
     # ------------------------------------------------------------------
 
     def predict(
-        self,
-        state_spikes: np.ndarray,
-        action: int | np.ndarray,
+            self,
+            state_spikes: np.ndarray,
+            action: int | np.ndarray,
     ) -> np.ndarray:
         """
         Predict the next state from (state_spikes, action).
-
-        Runs one forward pass of the encoder and decodes via w_decode.
-        Does NOT update any weights — call update() after the true next
-        state is observed.
-
-        Args:
-            state_spikes: Current state as a binary spike array (state_size,).
-            action:       Integer action index or one-hot float array.
-
-        Returns:
-            Predicted next state, rate-coded in [0, 1]^state_size.
         """
         combined = self._build_input(state_spikes, action)
-        internal_spikes = self._encoder.forward(combined)
-        self._last_internal_spikes = internal_spikes.astype(np.float32)
+
+        # Ignorujemy oddolny błąd zwracany przez warstwę PC
+        self._encoder.forward(combined)
+
+        # Bezpośrednio pobieramy aktywność reprezentacji ukrytej (kształt: hidden_size)
+        internal_spikes = self._encoder.has_spiked.astype(np.float32)
+        self._last_internal_spikes = internal_spikes
 
         raw = self._last_internal_spikes @ self.w_decode
         self.last_prediction = np.clip(raw, 0.0, 1.0)
         return self.last_prediction
 
     def update(
-        self,
-        state_spikes: np.ndarray,
-        action: int | np.ndarray,
-        actual_next_state: np.ndarray,
-        m_t: float = 1.0,
+            self,
+            state_spikes: np.ndarray,
+            action: int | np.ndarray,
+            actual_next_state: np.ndarray,
+            m_t: float = 1.0,
     ) -> np.ndarray:
         """
         Observe a real transition and update the decoder (Hebbian).
-
-        The encoder's STDP weights are updated via the normal
-        NetworkGraph.update_weights() path (three-factor rule), NOT here.
-        This method only updates the Hebbian decoder readout.
-
-        Args:
-            state_spikes:      State spike pattern before action.
-            action:            Action taken.
-            actual_next_state: Observed next state (spike or rate array).
-
-        Returns:
-            Signed state prediction error  (actual − predicted).
         """
         combined = self._build_input(state_spikes, action)
-        internal_spikes = self._encoder.forward(combined).astype(np.float32)
+
+        # Wykonujemy krok forward i wyciągamy prawidłowy wektor aktywacji neuronów
+        self._encoder.forward(combined)
+        internal_spikes = self._encoder.has_spiked.astype(np.float32)
         self._last_internal_spikes = internal_spikes
 
         actual = actual_next_state.astype(np.float32)
@@ -174,14 +159,13 @@ class SNNWorldModel:
         self.prediction_error_scalar = float(np.mean(self.prediction_error ** 2))
         self._error_history.append(self.prediction_error_scalar)
 
-        # Propagacja błędu przyszłości z dekodera do enkodera
-        # gradient dekodera = błąd * wagi dekodera (wstecz)
+        # Propagacja błędu przyszłości z dekodera do enkodera (przestrzeń neuronów, kształt: 64)
         decoder_gradient = self.prediction_error @ self.w_decode.T
 
-        # Łączymy lokalny błąd Predictive Coding enkodera z gradientem z dekodera
-        # Dzięki temu enkoder uczy się kompresować stan ORAZ przewidywać przyszłość
-        combined_error = self._encoder.prediction_error + decoder_gradient
-        self._encoder.update_weights(m_t=m_t, pred_error=combined_error)
+        # NAPRAWA: Przekazujemy TYLKO błąd z dekodera (rozmiar 64) do uczenia feedforward (LIFLayer.w).
+        # PredictiveCodingLayer i tak automatycznie użyje własnego self.prediction_error (rozmiar 10)
+        # pod spodem do aktualizacji wag top-down (feedback_w).
+        self._encoder.update_weights(m_t=m_t, pred_error=decoder_gradient)
 
         # Aktualizacja Hebbowska dekodera
         if np.any(internal_spikes > 0):
@@ -194,35 +178,19 @@ class SNNWorldModel:
         return self.prediction_error
 
     def mental_rehearsal(
-        self,
-        current_state_spikes: np.ndarray,
-        candidate_actions: list[int],
+            self,
+            current_state_spikes: np.ndarray,
+            candidate_actions: list[int],
     ) -> dict[int, dict]:
         """
         Internally simulate candidate actions without real-world interaction.
-
-        For each action, runs one forward pass of the encoder in read-only mode
-        (no weight updates) and decodes to get the predicted next state.
-        Novelty is measured as the magnitude of change relative to recent history.
-
-        POPRAWKA Bug 3: Zapisujemy i przywracamy PEŁNY stan enkodera, nie tylko
-        top_down_prediction. Enkoder to kompletny neuron LIF z membraną, refrakcją,
-        śladami i licznikami k-WTA — forward() modyfikuje je wszystkie.
-        Bez pełnego przywracania wyobraźnia niszczy rzeczywisty stan sieci.
-
-        Args:
-            current_state_spikes: Current state spike pattern (state_size,).
-            candidate_actions:    List of integer action indices.
-
-        Returns:
-            Dict  action → {predicted_state, novelty, familiarity}
         """
         recent_errors = self._error_history[-20:] if self._error_history else [0.5]
         avg_baseline = float(np.mean(recent_errors)) + 1e-8
 
         enc = self._encoder
 
-        # POPRAWKA Bug 3: Pełna migawka stanu enkodera przed symulacją.
+        # Pełna migawka stanu enkodera przed symulacją
         saved_state = {
             "v": enc.v.copy(),
             "has_spiked": enc.has_spiked.copy(),
@@ -233,12 +201,10 @@ class SNNWorldModel:
             "top_down_prediction": enc.top_down_prediction.copy(),
             "prediction_error": enc.prediction_error.copy(),
         }
-        # Pola specyficzne dla CompetitiveLIFLayer (k-WTA)
         if hasattr(enc, "window_spike_counts"):
             saved_state["window_spike_counts"] = enc.window_spike_counts.copy()
             saved_state["_current_window_size"] = enc._current_window_size
             saved_state["_phase_reset_pending"] = enc._phase_reset_pending
-        # Pola homeostazy
         if hasattr(enc, "avg_rate"):
             saved_state["avg_rate"] = enc.avg_rate.copy()
         if hasattr(enc, "v_thresh_adaptive"):
@@ -247,7 +213,7 @@ class SNNWorldModel:
         results: dict[int, dict] = {}
         for action in candidate_actions:
             combined = self._build_input(current_state_spikes, action)
-            # Przywracamy stan przed każdą kandydaturą, by kandydaci nie wpływali na siebie
+            # Przywracamy stan przed każdą kandydaturą
             enc.v[:] = saved_state["v"]
             enc.has_spiked[:] = saved_state["has_spiked"]
             enc.refrac_count[:] = saved_state["refrac_count"]
@@ -255,7 +221,10 @@ class SNNWorldModel:
             enc.x_post[:] = saved_state["x_post"]
             enc.e[:] = saved_state["e"]
 
-            internal = enc.forward(combined).astype(np.float32)
+            enc.forward(combined)
+
+            # Pobieramy stan neuronów, nie błąd
+            internal = enc.has_spiked.astype(np.float32)
             predicted_next = np.clip(internal @ self.w_decode, 0.0, 1.0)
 
             state_change = float(
@@ -268,7 +237,7 @@ class SNNWorldModel:
                 "familiarity": 1.0 - novelty,
             }
 
-        # POPRAWKA Bug 3: Przywracamy pełny stan po zakończeniu symulacji.
+        # Przywracamy pełny stan po zakończeniu symulacji
         enc.v[:] = saved_state["v"]
         enc.has_spiked[:] = saved_state["has_spiked"]
         enc.refrac_count[:] = saved_state["refrac_count"]

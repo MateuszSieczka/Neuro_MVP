@@ -133,9 +133,19 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         self.refrac_count[self.has_spiked] = self.config.refrac_period
         self.x_post[self.has_spiked] += 1.0
 
-        # POPRAWKA Bug 1 (cd.): Aktualizacja śladu kwalifikowalności po wykryciu spike'ów.
-        # Koreluje wejście (x_pre) z wyjściem (has_spiked) i odwrotnie.
+        # Ręczna integracja okna czasowego dla k-WTA i homeostazy
+        self.window_spike_counts += self.has_spiked.astype(np.int32)
+        self._current_window_size += 1
+
+        if getattr(self, '_phase_reset_pending', False):
+            self._apply_lateral_inhibition()
+            if getattr(self, '_homeostatic_kwta', False) and self._current_window_size > 0:
+                self._update_kwta_homeostasis(self._current_window_size)
+            self._reset_window()
+
+        # Aktualizacja śladu kwalifikowalności po wykryciu spike'ów.
         self.e *= self._trace_decay
+
         if np.any(self.has_spiked):
             self.e[:, self.has_spiked] += self.x_pre[:, np.newaxis]
         if np.any(pre_active):

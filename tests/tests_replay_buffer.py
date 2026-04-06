@@ -7,19 +7,18 @@ from core.world_model import SNNWorldModel
 from core.neuromodulator import NeuromodulatorSystem
 from core.replay_buffer import ReplayBuffer, Experience
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-STATE_SIZE = 6    # state_size == num_neurons for sleep_phase compatibility
+STATE_SIZE = 6  # state_size == num_neurons for sleep_phase compatibility
 ACTION_SIZE = 4
 NUM_INPUTS = 3
 LAYER_NAME = "default"
 
 
 def _make_exp(state_size: int = STATE_SIZE, action_size: int = ACTION_SIZE) -> dict:
-    """Create a single randomised experience dict."""
+    """Create a single randomised experience dict with all required layer dicts."""
     return dict(
         state=np.random.rand(state_size).astype(np.float32),
         action=int(np.random.randint(0, action_size)),
@@ -28,7 +27,13 @@ def _make_exp(state_size: int = STATE_SIZE, action_size: int = ACTION_SIZE) -> d
         layer_traces={
             LAYER_NAME: np.random.rand(NUM_INPUTS, state_size).astype(np.float32),
         },
+        layer_outputs={
+            LAYER_NAME: np.random.rand(state_size).astype(np.float32),
+        },
         prediction_error=np.random.rand(state_size).astype(np.float32),
+        layer_errors={
+            LAYER_NAME: np.random.rand(state_size).astype(np.float32),
+        }
     )
 
 
@@ -82,7 +87,7 @@ class TestReplayBufferStorage(unittest.TestCase):
         exp = _make_exp()
         original_state = exp["state"].copy()
         self.buf.store(**exp)
-        exp["state"][:] = 999.0   # mutate original
+        exp["state"][:] = 999.0  # mutate original
 
         stored = list(self.buf._buffer)[0]
         np.testing.assert_array_equal(
@@ -90,14 +95,24 @@ class TestReplayBufferStorage(unittest.TestCase):
             err_msg="Stored state shares memory with the original — copies must be taken.",
         )
 
-    def test_stored_layer_traces_are_independent_copy(self) -> None:
+    def test_stored_layer_dicts_are_independent_copies(self) -> None:
+        """Ensure traces, outputs, and errors are deep copied."""
         exp = _make_exp()
         original_e = exp["layer_traces"][LAYER_NAME].copy()
+        original_o = exp["layer_outputs"][LAYER_NAME].copy()
+        original_err = exp["layer_errors"][LAYER_NAME].copy()
+
         self.buf.store(**exp)
+
+        # Mutate original dicts
         exp["layer_traces"][LAYER_NAME][:] = -1.0
+        exp["layer_outputs"][LAYER_NAME][:] = -1.0
+        exp["layer_errors"][LAYER_NAME][:] = -1.0
 
         stored = list(self.buf._buffer)[0]
         np.testing.assert_array_equal(stored.layer_traces[LAYER_NAME], original_e)
+        np.testing.assert_array_equal(stored.layer_outputs[LAYER_NAME], original_o)
+        np.testing.assert_array_equal(stored.layer_errors[LAYER_NAME], original_err)
 
     def test_clear_empties_buffer(self) -> None:
         for _ in range(8):
@@ -196,7 +211,8 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         Replaying the same transition repeatedly must reduce world model MSE.
         This is a soft integration test validating the full consolidation pipeline.
         """
-        state = np.zeros(STATE_SIZE, dtype=np.float32)
+        # Mocny sygnał (10.0 zamiast zer), aby wymusić impulsy SNN i gradienty w 1 kroku
+        state = np.ones(STATE_SIZE, dtype=np.float32) * 10.0
         next_state = np.ones(STATE_SIZE, dtype=np.float32)
         action = 0
 
@@ -210,7 +226,13 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 layer_traces={
                     LAYER_NAME: np.ones((NUM_INPUTS, STATE_SIZE), dtype=np.float32),
                 },
+                layer_outputs={
+                    LAYER_NAME: np.ones(STATE_SIZE, dtype=np.float32),
+                },
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+                layer_errors={
+                    LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
+                }
             )
 
         layers = _make_layers()
@@ -218,13 +240,16 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         nm = _make_nm()
         nm.dopamine = 1.0  # Maximum learning signal
 
-        # Measure initial prediction error
+        # NAPRAWA: Reset przed pomiarem, by uniknąć okna refrakcji
+        wm.reset_state()
         initial_pred = wm.predict(state, action)
         initial_mse = float(np.mean((initial_pred - next_state) ** 2))
 
         # Consolidate
         self.buf.sleep_phase(layers, wm, nm)
 
+        # NAPRAWA: Zresetowanie stanu po śnie (i ew. przywróceniu refrakcji)
+        wm.reset_state()
         final_pred = wm.predict(state, action)
         final_mse = float(np.mean((final_pred - next_state) ** 2))
 
@@ -237,18 +262,13 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
     def test_sleep_phase_reverse_order_updates_world_model(self) -> None:
         """
         Verify that sleep_phase processes experiences in reverse chronological order.
-
-        Strategy: store two transitions with targets pulled in opposite directions
-        (zeros vs ones).  Use a high learning_rate so a single gradient step is
-        large enough to measure directionally.  With n_experiences=1 we replay
-        only the *most-recent* stored experience (late_next = ones), so the
-        prediction for (state, action) must increase after the call.
         """
-        state = np.zeros(STATE_SIZE, dtype=np.float32)
+        # Analogicznie podnosimy sygnał bazowy
+        state = np.ones(STATE_SIZE, dtype=np.float32) * 10.0
         action = 0
 
         early_next = np.zeros(STATE_SIZE, dtype=np.float32)  # stored first
-        late_next = np.ones(STATE_SIZE, dtype=np.float32)    # stored last (most recent)
+        late_next = np.ones(STATE_SIZE, dtype=np.float32)  # stored last (most recent)
 
         for next_s in (early_next, late_next):
             self.buf.store(
@@ -259,29 +279,91 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 layer_traces={
                     LAYER_NAME: np.zeros((NUM_INPUTS, STATE_SIZE), dtype=np.float32),
                 },
+                layer_outputs={
+                    LAYER_NAME: np.ones(STATE_SIZE, dtype=np.float32),
+                },
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+                layer_errors={
+                    LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
+                }
             )
 
-        # Use a large learning rate so a single step has a measurable effect
         from core.config import WorldModelConfig
         wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(feedback_learning_rate=0.5))
         layers = _make_layers()
         nm = _make_nm()
         nm.dopamine = 1.0
 
+        # NAPRAWA: Reset przed pomiarem
+        wm.reset_state()
         pred_before = float(np.mean(wm.predict(state, action)))
 
         # n_experiences=1 → only the LAST stored experience is replayed (late_next = ones)
         self.buf.sleep_phase(layers, wm, nm, n_experiences=1)
 
+        # NAPRAWA: Reset przed pomiarem
+        wm.reset_state()
         pred_after = float(np.mean(wm.predict(state, action)))
 
-        # Prediction should have moved TOWARD ones (increased from near-zero baseline)
         self.assertGreater(
             pred_after,
             pred_before,
             "Reverse replay with n_experiences=1 must update world model from the "
             "most-recent experience (late_next=ones), moving prediction upward.",
+        )
+
+    def test_sleep_phase_reverse_order_updates_world_model(self) -> None:
+        """
+        Verify that sleep_phase processes experiences in reverse chronological order.
+        """
+        state = np.ones(STATE_SIZE, dtype=np.float32) * 10.0
+        action = 0
+
+        early_next = np.zeros(STATE_SIZE, dtype=np.float32)  # stored first
+        late_next = np.ones(STATE_SIZE, dtype=np.float32)  # stored last (most recent)
+
+        for next_s in (early_next, late_next):
+            self.buf.store(
+                state=state,
+                action=action,
+                reward=1.0,
+                next_state=next_s,
+                layer_traces={
+                    LAYER_NAME: np.zeros((NUM_INPUTS, STATE_SIZE), dtype=np.float32),
+                },
+                layer_outputs={
+                    LAYER_NAME: np.ones(STATE_SIZE, dtype=np.float32),
+                },
+                prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+                layer_errors={
+                    LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
+                }
+            )
+
+        from core.config import WorldModelConfig
+        from core.world_model import SNNWorldModelConfig
+        wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(decode_lr=0.5))
+        layers = _make_layers()
+        nm = _make_nm()
+        nm.dopamine = 1.0
+
+        wm.reset_state()
+
+        # Zapisujemy stan wag dekodera przed replayem
+        w_before = wm.w_decode.copy()
+
+        # n_experiences=1 → only the LAST stored experience is replayed (late_next = ones)
+        self.buf.sleep_phase(layers, wm, nm, n_experiences=1)
+
+        # Skoro uczymy się przejścia w jedynki (late_next), błąd predykcji będzie mocno dodatni.
+        # Reguła Hebbowska (STDP dekodera) powinna w rezultacie podbić wagi w_decode.
+        w_after = wm.w_decode.copy()
+
+        self.assertGreater(
+            float(np.mean(w_after)),
+            float(np.mean(w_before)),
+            "Reverse replay must process the most-recent experience (ones), "
+            "causing decoder weights to increase via Hebbian learning.",
         )
 
     def test_sleep_phase_restores_traces_to_matching_layers(self) -> None:
@@ -293,7 +375,9 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
             reward=1.0,
             next_state=np.ones(STATE_SIZE, dtype=np.float32),
             layer_traces={LAYER_NAME: known_traces},
+            layer_outputs={LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32)},
             prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+            layer_errors={LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32)}
         )
 
         layers = _make_layers()
@@ -302,14 +386,10 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
         nm.dopamine = 1.0
 
         self.buf.sleep_phase(layers, wm, nm)
-
-        # After replay, the layer's eligibility traces should have been
-        # restored from the stored snapshot (before the weight update modified them)
-        # We can't check the exact value post-update, but the mechanism should not crash
         self.assertEqual(layers[LAYER_NAME].e.shape, (NUM_INPUTS, STATE_SIZE))
 
     def test_sleep_phase_with_multiple_layers(self) -> None:
-        """sleep_phase must handle multiple named layers."""
+        """sleep_phase must handle multiple named layers and match their errors."""
         layer_a = _make_layer(num_inputs=3, num_neurons=STATE_SIZE)
         layer_b = _make_layer(num_inputs=4, num_neurons=STATE_SIZE)
         layers = {"layer_a": layer_a, "layer_b": layer_b}
@@ -323,14 +403,21 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 "layer_a": np.ones((3, STATE_SIZE), dtype=np.float32),
                 "layer_b": np.ones((4, STATE_SIZE), dtype=np.float32),
             },
+            layer_outputs={
+                "layer_a": np.ones(STATE_SIZE, dtype=np.float32),
+                "layer_b": np.ones(STATE_SIZE, dtype=np.float32),
+            },
             prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
+            layer_errors={
+                "layer_a": np.zeros(STATE_SIZE, dtype=np.float32),
+                "layer_b": np.zeros(STATE_SIZE, dtype=np.float32),
+            }
         )
 
         wm = _make_world_model()
         nm = _make_nm()
         nm.dopamine = 1.0
 
-        # Should not crash and should return one error
         errors = self.buf.sleep_phase(layers, wm, nm)
         self.assertEqual(len(errors), 1)
 

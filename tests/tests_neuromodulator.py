@@ -1,7 +1,6 @@
 import unittest
 import numpy as np
 
-
 from core.config import NeuromodulatorConfig
 from core.neuromodulator import NeuromodulatorSystem
 
@@ -52,23 +51,24 @@ class TestNeuromodulatorSystem(unittest.TestCase):
     # B. Directional responses
     # ──────────────────────────────────────────────────────────────────
 
-    def test_high_reward_above_history_raises_dopamine(self) -> None:
+    def test_positive_td_error_raises_dopamine(self) -> None:
         """
-        Receiving reward=1.0 consistently (well above the neutral 0.0 history)
-        should push dopamine above its initial baseline.
+        Positive Temporal Difference error from Basal Ganglia should push
+        dopamine above its initial baseline (RPE signal).
         """
         zero_error = np.zeros(5)
-        # Seed history with zeros so a reward of 1.0 is genuinely unexpected
+        # Neutral td_error=0.0 means RPE=0.5 (neutral baseline)
         for _ in range(5):
-            self.nm.update(zero_error, reward=0.0)
+            self.nm.update(zero_error, td_error=0.0)
         da_before = self.nm.dopamine
 
+        # Positive td_error > 0
         for _ in range(20):
-            self.nm.update(zero_error, reward=1.0)
+            self.nm.update(zero_error, td_error=0.5)
 
         self.assertGreater(
             self.nm.dopamine, da_before,
-            "Unexpected positive reward must increase dopamine.",
+            "Positive TD error must increase dopamine.",
         )
 
     def test_explicit_high_novelty_raises_acetylcholine(self) -> None:
@@ -77,7 +77,7 @@ class TestNeuromodulatorSystem(unittest.TestCase):
         ach_before = self.nm.acetylcholine
 
         for _ in range(20):
-            self.nm.update(zero_error, reward=0.0, novelty=1.0)
+            self.nm.update(zero_error, td_error=0.0, novelty=1.0)
 
         self.assertGreater(
             self.nm.acetylcholine, ach_before,
@@ -90,7 +90,7 @@ class TestNeuromodulatorSystem(unittest.TestCase):
         ne_before = self.nm.noradrenaline
 
         for _ in range(20):
-            self.nm.update(large_error, reward=0.0)
+            self.nm.update(large_error, td_error=0.0)
 
         self.assertGreater(
             self.nm.noradrenaline, ne_before,
@@ -106,7 +106,7 @@ class TestNeuromodulatorSystem(unittest.TestCase):
         zero_error = np.zeros(5)
 
         for _ in range(50):
-            self.nm.update(zero_error, reward=0.0, novelty=0.0)
+            self.nm.update(zero_error, td_error=0.0, novelty=0.0)
 
         self.assertGreater(
             self.nm.serotonin, sero_before,
@@ -121,7 +121,7 @@ class TestNeuromodulatorSystem(unittest.TestCase):
         """No level must escape [0, 1] under extreme or adversarial input."""
         extreme_error = np.ones(5) * 1000.0
         for _ in range(100):
-            self.nm.update(extreme_error, reward=1000.0, novelty=1000.0)
+            self.nm.update(extreme_error, td_error=1000.0, novelty=1000.0)
 
         for name, val in [
             ("dopamine", self.nm.dopamine),
@@ -133,10 +133,10 @@ class TestNeuromodulatorSystem(unittest.TestCase):
             self.assertLessEqual(val, 1.0, f"{name} exceeded 1.")
 
     def test_no_level_goes_negative_under_zero_input(self) -> None:
-        """All levels must remain ≥ 0 even with novelty=0 and reward=0."""
+        """All levels must remain ≥ 0 even with novelty=0 and td_error=-1.0."""
         zero_error = np.zeros(5)
         for _ in range(200):
-            self.nm.update(zero_error, reward=0.0, novelty=0.0)
+            self.nm.update(zero_error, td_error=-1.0, novelty=0.0)
 
         self.assertGreaterEqual(self.nm.dopamine, 0.0)
         self.assertGreaterEqual(self.nm.acetylcholine, 0.0)
@@ -147,23 +147,20 @@ class TestNeuromodulatorSystem(unittest.TestCase):
     # D. Decay without stimulation
     # ──────────────────────────────────────────────────────────────────
 
-    def test_dopamine_decays_when_no_reward(self) -> None:
+    def test_dopamine_decays_with_zero_td_error(self) -> None:
         """
-        Manually set dopamine to maximum, then drive with zero reward.
-        It must decay from 1.0.
+        Manually set dopamine to maximum, then drive with neutral (0.0) td_error.
+        It must decay from 1.0 towards 0.5.
         """
         self.nm.dopamine = 1.0
         zero_error = np.zeros(5)
-        # Seed history so avg_reward ≈ 0 (no surprise from reward=0)
-        for _ in range(10):
-            self.nm._reward_history.append(0.0)
 
         for _ in range(50):
-            self.nm.update(zero_error, reward=0.0, novelty=0.0)
+            self.nm.update(zero_error, td_error=0.0, novelty=0.0)
 
         self.assertLess(
             self.nm.dopamine, 1.0,
-            "Dopamine must decay from its peak when reward stays at 0.",
+            "Dopamine must decay from peak when td_error stays neutral.",
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -186,14 +183,13 @@ class TestNeuromodulatorSystem(unittest.TestCase):
         self.assertAlmostEqual(self.nm.serotonin, self.config.baseline_sero)
 
     def test_reset_clears_histories(self) -> None:
-        """reset() must empty both _error_history and _reward_history."""
+        """reset() must empty _error_history."""
         zero_error = np.zeros(5)
         for _ in range(10):
-            self.nm.update(zero_error, reward=1.0)
+            self.nm.update(zero_error, td_error=0.5)
         self.nm.reset()
 
         self.assertEqual(len(self.nm._error_history), 0)
-        self.assertEqual(len(self.nm._reward_history), 0)
 
     # ──────────────────────────────────────────────────────────────────
     # F. Properties

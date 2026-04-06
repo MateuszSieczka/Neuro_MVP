@@ -1,9 +1,10 @@
 {
   "ExpandedNodes": [
     "",
+    "\\arena",
     "\\core",
     "\\tests"
   ],
-  "SelectedNode": "\\tests\\tests_agi_capabilities.py",
+  "SelectedNode": "\\tests\\tests_arena_learning.py",
   "PreviewInSolutionExplorer": false
 }

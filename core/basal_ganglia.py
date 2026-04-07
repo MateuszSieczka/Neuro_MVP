@@ -16,7 +16,8 @@ class ContinuousBGConfig:
     hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
     tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
     w_clip: float = 3.0      # Synaptic saturation for actor: max |w| (receptor density / spine volume)
-    w_clip_critic: float = 2.5  # Tighter clip for critic — stabilizes backprop through w_v
+    w_clip_critic: float = 5.0  # Ventral striatal critic: wider dynamic range needed to
+                                 # represent cumulative V(s) across long episodes (Schultz 1998)
     td_rms_decay: float = 0.999  # Slow decay for running RMS of TD error (adaptive DA gain)
 
 
@@ -39,9 +40,17 @@ class SNNDeepCritic:
         v_std = 1.0 / np.sqrt(config.hidden_size)
         self.w_v = np.random.uniform(-v_std, v_std, config.hidden_size).astype(np.float32)
 
+        # Biases — biological: resting potential / spontaneous activity.
+        # Hidden bias b_h shifts each neuron's activation independently
+        # of the current state, enabling non-zero V(s) at the origin.
+        # Output bias b_v represents the baseline expected value.
+        self.b_h = np.zeros(config.hidden_size, dtype=np.float32)
+        self.b_v: float = 0.0
+
         # Ślady dla propagacji błędu
         self.e_h = np.zeros((state_size, config.hidden_size), dtype=np.float32)
         self.e_v = np.zeros(config.hidden_size, dtype=np.float32)
+        self.e_bv: float = 0.0  # trace for output bias (constant input = 1)
         self._trace_decay = np.exp(-self.config.dt / self.config.tau_e_critic)
         self._mem_decay: float = float(np.exp(-self.config.dt / self.config.tau_hidden))
 
@@ -70,8 +79,14 @@ class SNNDeepCritic:
     def forward(self, state_spikes: np.ndarray) -> float:
         state_f32 = state_spikes.astype(np.float32)
 
-        # 1. Integracja membrany (leaky integrator)
-        self.v_hidden = self.v_hidden * self._mem_decay + np.dot(state_f32, self.w_h)
+        # 1. Direct feedforward activation (rate-coded value representation).
+        #    Ventral striatal neurons encode expected value as firing RATE,
+        #    not as membrane state.  V(s) must be a function of the current
+        #    state only — it should NOT depend on previous states via
+        #    leaky membrane integration.  Temporal credit assignment is
+        #    handled by the eligibility traces (e_h, e_v), not membrane
+        #    persistence.  (Samejima, Ueda, Doya & Kimura 2005)
+        self.v_hidden = np.dot(state_f32, self.w_h) + self.b_h
 
         # 2. Ciągła aktywacja z adaptacyjnym gain
         self.activation = self._graded_activation(self.v_hidden)
@@ -81,19 +96,22 @@ class SNNDeepCritic:
         # Stabilność zapewnia w_clip (synaptic saturation).
         self.e_h = self.e_h * self._trace_decay + np.outer(state_f32, self.activation)
         self.e_v = self.e_v * self._trace_decay + self.activation
+        # Output bias trace: constant input of 1.0
+        self.e_bv = self.e_bv * self._trace_decay + 1.0
         # Ca²⁺ saturation — ślady ograniczone pojemnością kolca dendrytycznego.
         # Zapobiega akumulacji przy bardzo długich epizodach.
         np.clip(self.e_h, -2.0, 2.0, out=self.e_h)
         np.clip(self.e_v, -2.0, 2.0, out=self.e_v)
+        self.e_bv = float(np.clip(self.e_bv, -2.0, 2.0))
 
-        return float(np.dot(self.w_v, self.activation))
+        return float(np.dot(self.w_v, self.activation) + self.b_v)
 
     def peek(self, state_spikes: np.ndarray) -> float:
         """Estimate V(s') without modifying internal state (membrane, traces)."""
         state_f32 = state_spikes.astype(np.float32)
-        v_hid = self.v_hidden * self._mem_decay + np.dot(state_f32, self.w_h)
+        v_hid = np.dot(state_f32, self.w_h) + self.b_h
         act = self._graded_activation(v_hid)
-        return float(np.dot(self.w_v, act))
+        return float(np.dot(self.w_v, act) + self.b_v)
 
     def update(self, td_error: float) -> None:
         """Biologiczna reguła uczenia: δ × ślad kwalifikowalności.
@@ -106,34 +124,70 @@ class SNNDeepCritic:
         plastyczność korowo-prążkowiową.  Pochodna tanh' modeluje
         nieliniową odpowiedź dendrytyczną neuronu postsynaptycznego.
 
+        Dendritic saturation (Williams & Stuart 2003):
+        The backpropagating signal through the apical dendrite has bounded
+        amplitude due to nonlinear dendritic processing.  We normalize the
+        feedback vector to prevent downstream weight growth (w_v at clip)
+        from destabilizing the hidden layer's learned features.
+
         Per-synapse bounds are enforced by:
         - trace clips (±2.0): Ca²⁺ saturation in dendritic spines
-        - weight clips (±2.5): receptor density / spine volume limits
+        - weight clips: receptor density / spine volume limits
+        - feedback normalization: dendritic amplitude saturation
         - TD clipping: bounded influence of extreme events
         """
         td_error = float(np.clip(td_error, -10.0, 10.0))
 
         # Warstwa wyjściowa: prosta reguła δ×e
         self.w_v += self.config.critic_lr * td_error * self.e_v
+        # Output bias: ∂V/∂b_v = 1 → trace e_bv accumulates constant input
+        self.b_v += self.config.critic_lr * td_error * self.e_bv
 
         # Warstwa ukryta: δ propagowany wstecz przez w_v z pochodną aktywacji.
         # tanh'(x) = 1 - tanh(x)² — modeluje nieliniową odpowiedź dendrytu.
         activation_deriv = 1.0 - self.activation ** 2
         feedback = self.w_v * activation_deriv   # (hidden,)
+
+        # Dendritic saturation: bound the feedback magnitude so that
+        # growth of w_v (needed to represent large V(s)) does not
+        # amplify the w_h gradient into instability.
+        fb_norm = float(np.linalg.norm(feedback))
+        if fb_norm > 1.0:
+            feedback = feedback / fb_norm
+
         self.w_h += self.config.critic_lr * td_error * self.e_h * feedback[np.newaxis, :]
 
-        # Synaptic saturation: tighter for critic to stabilize backprop through w_v.
+        # Hidden bias: same gradient as w_h with input=1, so trace = e_v
+        # (which already accumulates activation). Biologically: resting
+        # potential adaptation driven by neuromodulatory TD signal.
+        self.b_h += self.config.critic_lr * td_error * self.e_v * feedback
+        np.clip(self.b_h, -5.0, 5.0, out=self.b_h)
+
+        # Synaptic saturation (output layer)
         wc = self.config.w_clip_critic
         np.clip(self.w_v, -wc, wc, out=self.w_v)
-        np.clip(self.w_h, -wc, wc, out=self.w_h)
+
+        # Homeostatic dendritic scaling (Turrigiano 2008):
+        # Maintain per-neuron total afferent input at a level that keeps
+        # tanh in its responsive (pre-saturation) range.  Target norm =
+        # sqrt(fan_in) gives Var(activation) ≈ 1 for normalized inputs.
+        # This prevents both runaway excitation (saturation → loss of
+        # discrimination) and silence, preserving the relative structure
+        # of learned weights while bounding absolute magnitude.
+        h_target = float(np.sqrt(self._state_size))
+        for j in range(self.config.hidden_size):
+            col_norm = float(np.linalg.norm(self.w_h[:, j]))
+            if col_norm > h_target:
+                self.w_h[:, j] *= h_target / col_norm
 
 
     def reset_state(self) -> None:
-        """Reset transient state (membrane, traces). Weights are preserved."""
+        """Reset transient state (membrane, traces). Weights/biases preserved."""
         self.v_hidden.fill(0.0)
         self.activation.fill(0.0)
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
+        self.e_bv = 0.0
 
     def set_plasticity_timescales(self, ne: float) -> None:
         """
@@ -181,7 +235,6 @@ class SNNContinuousActor:
 
     # Target L2 norm per MSN column — set from init scale.
     # Biological: the target firing rate that homeostatic scaling maintains.
-    _HOMEOSTATIC_TARGET: float = 1.0
 
     def __init__(self, state_size: int, motor_dim: int, internal_dim: int, config: ContinuousBGConfig):
         self.config = config
@@ -213,7 +266,7 @@ class SNNContinuousActor:
         e = np.exp(x)
         return e / e.sum()
 
-    def forward(self, state_spikes: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def forward(self, state_spikes: np.ndarray, forced_action: int | None = None) -> Tuple[np.ndarray, np.ndarray]:
         """Oblicza politykę i próbkuje akcję."""
         state_f32 = state_spikes.astype(np.float32)
         self._last_state = state_f32
@@ -228,7 +281,11 @@ class SNNContinuousActor:
         self._last_probs = probs
 
         # Próbkowanie akcji (ε-softmax)
-        action = int(np.random.choice(self.motor_dim, p=probs))
+        if forced_action is not None:
+            action = forced_action
+        else:
+            action = int(np.random.choice(self.motor_dim, p=probs))
+
         self._last_action = action
 
         # Ślad kwalifikowalności (policy gradient):
@@ -277,9 +334,10 @@ class SNNContinuousActor:
         # This is a slow process (hours in biology) — we apply it every step
         # but the effect is gentle (only kicks in when norm exceeds target).
         for j in range(self.action_dim):
-            col_norm = np.linalg.norm(self.w_mu[:, j])
-            if col_norm > self._HOMEOSTATIC_TARGET:
-                self.w_mu[:, j] *= self._HOMEOSTATIC_TARGET / col_norm
+            col_norm = float(np.linalg.norm(self.w_mu[:, j]))
+            # Używamy naturalnego limitu w_clip zamiast twardego 1.0
+            if col_norm > self.config.w_clip:
+                self.w_mu[:, j] *= self.config.w_clip / col_norm
 
         np.clip(self.w_mu, -self.config.w_clip, self.config.w_clip, out=self.w_mu)
 

@@ -16,7 +16,8 @@ from core.config import (
     NeuromodulatorConfig,
     SNNWorldModelConfig,
 )
-
+from core.replay_buffer import ReplayBuffer
+from core.active_inference import ActiveInferenceModule
 
 class SNNAgent(Agent):
     def __init__(
@@ -57,6 +58,8 @@ class SNNAgent(Agent):
             self.world_model = SNNWorldModel(
                 state_size=state_size, action_size=n_actions, config=self._wm_config,
             )
+            self.active_inference = ActiveInferenceModule(self.world_model)
+            self.replay_buffer = ReplayBuffer(capacity=1000)
 
         self._trace = np.zeros(state_size, dtype=np.float32)
         self._last_td_error: float = 0.0
@@ -77,14 +80,29 @@ class SNNAgent(Agent):
         aug = self._augment_state(state)
         self._update_trace(state)
 
-        # 1. Forward Aktora (softmax policy + próbkowanie akcji + ślad)
-        motor, _internal = self.bg.actor.forward(aug)
+        if self._use_wm:
+            # Active Inference: Oblicz pragmatyczne preferencje Aktora (logity MSN)
+            logits = np.dot(aug, self.bg.actor.w_mu)
+            pragmatic_values = {a: float(logits[a]) for a in range(self.n_actions)}
 
-        # 2. Forward Krytyka
+            candidate_actions = list(range(self.n_actions))
+            selected_action = self.active_inference.select_action(
+                state_spikes=state.astype(np.float32),
+                # <--- POPRAWKA: Przekazujemy czysty 'state', a nie rozszerzony 'aug'!
+                candidate_actions=candidate_actions,
+                pragmatic_values=pragmatic_values,
+                ne_level=self.neuromod.noradrenaline
+            )
+            # Zmuszamy Aktora do wykonania tej akcji, by policy gradient i ślad E zapisały się poprawnie
+            self.bg.actor.forward(aug, forced_action=selected_action)
+        else:
+            # Fallback dla środowisk gęstych bez modelu świata (standardowa eksploracja z szumem)
+            self.bg.actor.forward(aug)
+
+        # Forward Krytyka (V(s))
         self.bg.last_v = self.bg.critic.forward(aug)
 
         return self.bg.actor.get_action()
-
     def _peek_value(self, state_spikes: np.ndarray) -> float:
         """Bezpieczny podgląd V(s') bez niszczenia śladów membrany Krytyka."""
         return self.bg.critic.peek(state_spikes)
@@ -121,9 +139,14 @@ class SNNAgent(Agent):
         #    (a) consistently rewarded (high tonic DA from VTA), AND
         #    (b) making stable predictions (high serotonin from raphe).
         #    Gate = sqrt(tonic_DA × 5-HT), requiring both signals.
-        #    Gentle scaling: gate=0 → 1.0, gate=0.7 → 0.59, gate=1.0 → 0.5
+        #    Linear scaling with low floor models the transition from
+        #    early-phase LTP (labile, high plasticity) to late-phase L-LTP
+        #    (protein-synthesis-dependent, protected). The floor at 0.05
+        #    corresponds to the minimal synaptic modification that occurs
+        #    even during deep consolidation (Frey & Morris 1997).
+        #    gate=0 → 1.0, gate=0.5 → 0.50, gate=0.9 → 0.10, gate=0.95 → 0.05
         gate = self.neuromod.consolidation_gate
-        plasticity_scale = 1.0 / (1.0 + gate)
+        plasticity_scale = max(0.05, 1.0 - gate)
 
         self.bg.critic.update(norm_td * plasticity_scale)
         self.bg.actor.update(norm_td * plasticity_scale)
@@ -166,22 +189,63 @@ class SNNAgent(Agent):
         if self._use_wm:
             self.neuromod.apply_to_layer(self.world_model)
 
-        # 6. Exploration control: serotonin primary + tonic DA floor
+        # 6. Exploration control: serotonin + tonic DA performance floor
         #    Primary signal: serotonin — prediction accuracy.
         #    (1-sero)² drives noise. Works well for dense reward.
         #
-        #    Floor from tonic DA stagnation: when tonic_da ≈ 0.5 for many
-        #    episodes (agent stuck at neutral — neither improving nor
-        #    declining), maintain minimum noise to escape local optima.
-        #    This addresses the sparse-reward trap (MountainCar):
-        #    critic converges to V=-20, TD→0, sero→1, noise→0, stuck.
+        #    Performance floor from tonic DA (Niv et al. 2007):
+        #    Low tonic DA means the agent is NOT being consistently rewarded.
+        #    In that regime, exploration must remain high regardless of how
+        #    "stable" predictions are (serotonin). An agent that consistently
+        #    picks the wrong action has low TD error → high serotonin, but
+        #    low tonic DA reveals it hasn't found reward yet.
         #
-        #    Stagnation = 1 - |2×tda - 1|: max (1.0) at tda=0.5,
-        #    zero at tda=0 or tda=1.  Scaled by 0.05 for a gentle floor.
+        #    da_floor = 0.5 × (1 − tonic_da):
+        #      tda=0.0 (no reward experience) → floor=0.5 (strong exploration)
+        #      tda=0.5 (neutral/stagnating)   → floor=0.25 (moderate exploration)
+        #      tda=1.0 (consistently rewarded) → floor=0.0 (serotonin takes over)
+        #
+        #    This addresses the sparse-reward trap (MountainCar / corridor):
+        #    critic converges to V≈const, TD→0, sero→1, but tonic_da stays
+        #    low → da_floor keeps noise alive → agent eventually discovers reward.
+        MIN_EXPLORATION = 0.01
         sero_noise = (1.0 - self.neuromod.serotonin) ** 2
-        stagnation = 1.0 - abs(2.0 * self.neuromod.tonic_da - 1.0)
-        noise_floor = 0.15 * stagnation
-        self.bg.actor.noise_scale = max(noise_floor, sero_noise)
+        tda = self.neuromod.tonic_da
+        da_floor = 0.5 * (1.0 - tda)
+        self.bg.actor.noise_scale = max(MIN_EXPLORATION, sero_noise, da_floor)
+
+        # 7. Zapis do Replay Buffer (tylko z World Modelem)
+        if self._use_wm:
+            # SNNWorldModel posiada wewnątrz warstwę PredictiveCodingLayer jako _encoder
+            layer_traces = {'encoder': self.world_model._encoder.e}
+            layer_outputs = {'encoder': self.world_model._encoder.has_spiked.astype(np.float32)}
+            layer_errors = {'encoder': self.world_model._encoder.prediction_error}
+
+            self.replay_buffer.store(
+                state=state.astype(np.float32),
+                action=action,
+                reward=reward,
+                next_state=next_state.astype(np.float32),
+                layer_traces=layer_traces,
+                layer_outputs=layer_outputs,
+                prediction_error=pred_error,
+                layer_errors=layer_errors,
+                salience=self.neuromod.noradrenaline,  # Salience = NE (arousal/zaskoczenie)
+                recorded_da=self.neuromod.learning_rate_modulation  # Zamrożony sygnał DA!
+            )
+
+        # 8. Faza snu (Offline Consolidation) na koniec epizodu
+        if done and self._use_wm and len(self.replay_buffer) > 0:
+            layers_dict = {'encoder': self.world_model._encoder}
+            # Odtwarzamy wstecznie epizod, używając zamrożonego recorded_da
+            self.replay_buffer.sleep_phase(
+                layers=layers_dict,
+                world_model=self.world_model,
+                neuromodulator=self.neuromod
+            )
+            # Po śnie czyścimy bufor, aby nie mieszać epizodów
+            # (hipokamp przekazał wiedzę do kory)
+            self.replay_buffer.clear()
 
         self._step_count += 1
 

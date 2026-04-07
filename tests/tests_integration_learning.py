@@ -72,7 +72,7 @@ class TestSystemLearning(unittest.TestCase):
 
                 is_terminal = (i == 39)
                 reward = 1.0 if is_terminal else 0.0
-                
+
                 # Zamiast zewnętrznej flagi końca epizodu, symulujemy potężny skok 
                 # "zaskoczenia/wagi sytuacji" dokładnie w momencie otrzymania nagrody.
                 current_salience = 1.0 if is_terminal else 0.0
@@ -90,6 +90,9 @@ class TestSystemLearning(unittest.TestCase):
                 )
                 self.net.update_weights(self.nm)
                 self.nm.update(self.layer.prediction_error, td_error=td_err)
+
+                if is_terminal:
+                    break
 
         # 3. Konsolidacja (wzmacnia wagi warstw SNN)
         self.buffer.sleep_phase({"L1": self.layer}, self.wm, self.nm)

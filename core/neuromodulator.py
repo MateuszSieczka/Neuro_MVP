@@ -122,41 +122,50 @@ class NeuromodulatorSystem:
         self._clamp_all()
 
     def update_tonic_da(self, episode_return: float, episode_steps: int) -> None:
-        """Update tonic DA at episode boundaries from return z-score.
+        """Update tonic DA at episode boundaries based on dynamic range adaptation.
 
-        Biological basis (Niv, Daw, Joel & Dayan 2007):
-        VTA tonic firing rate tracks how well the agent is performing
-        relative to its own recent history. This is scale-invariant.
+        Biologiczna podstawa (Niv, Daw, Joel & Dayan 2007; Tobler et al. 2005):
+        Toniczna aktywność neuronów VTA koduje długoterminowe tempo nagrody
+        (average reward rate) i determinuje próg konsolidacji wyuczonych zachowań.
+        Neurony adaptują swój zakres odpowiedzi do historycznych minimów i maksimów
+        (dynamic range adaptation).
 
-        - Return >> recent mean → z>0 → sigmoid>0.5 → tonic_da rises
-        - Return << recent mean → z<0 → sigmoid<0.5 → tonic_da falls
-        - Return ≈ mean → z≈0 → sigmoid≈0.5 → tonic_da drifts to 0.5
-
-        When variance is very low (constant returns), the z-score is
-        unreliable. We handle this by clamping std to a minimum of 1.0,
-        which means small deviations from the mean produce small z-scores,
-        keeping tonic_da near 0.5 (neutral). This correctly represents
-        "no information about improvement" regardless of absolute level.
+        Zamiast z-score (który zawodzi przy zerowej wariancji w wyuczonym zadaniu),
+        mapujemy obecny wynik na ułamek historycznego okna [min, max].
+        Dzięki temu stałe osiąganie historycznego maksimum (np. powtarzalne 500 pkt)
+        generuje sygnał 1.0, utrzymując stan wysokiej konsolidacji i blokując
+        katastroficzne zapominanie.
         """
         self._reward_history.append(episode_return)
 
         if len(self._reward_history) < 2:
             return
 
-        mean_r = float(np.mean(self._reward_history))
-        std_r = float(np.std(self._reward_history))
-        # Clamp std to minimum 1.0 — not 1e-6.
-        # When variance is near zero, small fluctuations shouldn't produce
-        # extreme z-scores. A std floor of 1.0 means the agent needs to
-        # improve by at least ~1 unit of return to register as positive.
-        std_r = max(std_r, 1.0)
+        min_r = float(min(self._reward_history))
+        max_r = float(max(self._reward_history))
 
-        z = (episode_return - mean_r) / std_r
-        signal = float(1.0 / (1.0 + np.exp(-z)))
+        # Zabezpieczenie przed błędem dzielenia na samym początku (zerowa wariancja startowa)
+        if max_r - min_r < 1e-6:
+            signal = 0.5
+        else:
+            # Liniowe mapowanie obecnego wyniku do przedziału [0.0, 1.0]
+            signal = (episode_return - min_r) / (max_r - min_r)
+
+        # Asymmetric VTA adaptation (Koob & Le Moal 2001; Volkow et al. 2017):
+        # Rising: standard adaptation — quickly recognize improvement.
+        # Falling: D2 auto-receptor desensitization and VTA afferent
+        #   plasticity create hysteresis — consolidated tonic DA resists
+        #   decline.  Time constant ~3× longer for decrease than increase.
+        #   This prevents a single bad episode from cascading into
+        #   catastrophic forgetting by reopening plasticity prematurely.
+        if float(signal) >= self.tonic_da:
+            decay = self.config.tonic_da_decay                               # rise: tc ≈ 10 ep
+        else:
+            decay = 1.0 - (1.0 - self.config.tonic_da_decay) / 3.0          # fall: tc ≈ 30 ep
 
         self.tonic_da = (
-            self.tonic_da * self.config.tonic_da_decay
-            + signal * (1.0 - self.config.tonic_da_decay)
+            self.tonic_da * decay
+            + float(signal) * (1.0 - decay)
         )
         self.tonic_da = float(np.clip(self.tonic_da, 0.0, 1.0))
 

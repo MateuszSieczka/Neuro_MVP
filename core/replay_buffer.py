@@ -36,6 +36,7 @@ class Experience:
     #   effective_γ = γ × (1 − salience)
     # więc salience=1.0 zeruje dyskont (odpowiednik twardego końca epizodu).
     salience: float = 0.0
+    recorded_da: float = 0.0
 
     def __post_init__(self) -> None:
         self.state = self.state.copy()
@@ -91,6 +92,7 @@ class ReplayBuffer:
         prediction_error,
         layer_errors: dict[str, np.ndarray] | None = None,
         salience: float = 0.0,
+        recorded_da: float = 0.0,
     ) -> None:
         if layer_errors is None:
             layer_errors = {}
@@ -99,7 +101,7 @@ class ReplayBuffer:
                 state=state, action=action, reward=reward, next_state=next_state,
                 layer_traces=layer_traces, layer_outputs=layer_outputs,
                 prediction_error=prediction_error, layer_errors=layer_errors,
-                salience=salience,
+                salience=salience, recorded_da=recorded_da
             )
         )
     # ------------------------------------------------------------------
@@ -182,58 +184,31 @@ class ReplayBuffer:
         wm_saved_state = None
         if hasattr(world_model, '_snapshot_encoder'):
             wm_saved_state = world_model._snapshot_encoder()
-        # Hippocampal reverse replay: most recent experience first
-        for i, exp in enumerate(reversed(experiences)):
-            # 1. Restore eligibility traces for ALL layers in the hierarchy
-            for name, layer in layers.items():
-                if name in exp.layer_traces:
-                    layer.e = exp.layer_traces[name].copy()
+            # Hippocampal reverse replay: most recent experience first
+            for i, exp in enumerate(reversed(experiences)):
+                # 1. Restore eligibility traces for ALL layers in the hierarchy
+                for name, layer in layers.items():
+                    if name in exp.layer_traces:
+                        layer.e = exp.layer_traces[name].copy()
 
-            # 2. Reset stanu transient przed każdym krokiem (izolacja przejść SNN)
-            # Zapobiega to "wyciekowi" czasu do tyłu między niezależnymi próbkami
-            if hasattr(world_model, 'reset_state'):
-                world_model.reset_state()
-            # Update world model; get refined prediction error
-            world_error = world_model.update(exp.state, exp.action, exp.next_state)
+                # 2. Reset stanu transient przed każdym krokiem (izolacja przejść SNN)
+                # Zapobiega to "wyciekowi" czasu do tyłu między niezależnymi próbkami
+                if hasattr(world_model, 'reset_state'):
+                    world_model.reset_state()
 
-            # 3. Three-factor STDP: dopamina × skumulowany_zwrot × ślad × błąd_predykcji
-            # Używamy lokalnego błędu predykcji każdej warstwy (num_neurons,),
-            # NIE globalnego world_error (state_size,). LIFLayer.update_weights robi:
-            #   dw = lr * m_t * e * pred_error
-            # gdzie e ma kształt (num_inputs, num_neurons). Broadcast NumPy wymaga
-            # pred_error o kształcie (num_neurons,) — globalny błąd świata o innym
-            # rozmiarze powoduje ValueError (crash).
-            # 3. Three-factor STDP: dopamina × skumulowany_zwrot × ślad × błąd_predykcji
-            G_t = cumulative_returns[i]
-            m_t = neuromodulator.learning_rate_modulation * G_t
+                # 3. Aktualizacja: dopamina × skumulowany_zwrot
+                G_t = cumulative_returns[i]
+                m_t = exp.recorded_da * G_t
 
-            for name, layer in layers.items():
-                # NAPRAWA BUG 1: Pobieramy zamrożony błąd z historii (exp), a nie nadpisany stan z końca epizodu
-                local_error = exp.layer_errors.get(name)
-                num_neurons = getattr(layer, 'num_neurons', None)
-                num_inputs = getattr(layer, 'num_inputs', None)
+                # Przekazujemy m_t wprost do modelu. World Model zadba o resztę samodzielnie!
+                world_error = world_model.update(exp.state, exp.action, exp.next_state, m_t=m_t)
 
-                if local_error is not None and num_neurons is not None:
-                    # NAPRAWA BUG 2: Warstwy PC mają błąd w wymiarze (num_inputs,), a klasyczne LIF (num_neurons,).
-                    # Dopuszczamy oba kształty - LIFLayer.update_weights ułoży wymiary przez broadcasting.
-                    if local_error.shape[0] in (num_neurons, num_inputs):
-                        layer.update_weights(m_t=m_t, pred_error=local_error)
-                    else:
-                        # Fallback jeśli kształt jest całkowicie zepsuty
-                        layer.update_weights(m_t=m_t, pred_error=np.ones(num_neurons, dtype=np.float32))
-                elif num_neurons is not None:
-                    # Prosta warstwa LIF bez wbudowanego błędu: otrzymuje mnożnik neutralny (1.0)
-                    layer.update_weights(
-                        m_t=m_t,
-                        pred_error=np.ones(num_neurons, dtype=np.float32),
-                    )
+                errors.append(float(np.mean(world_error ** 2)))
 
-            errors.append(float(np.mean(world_error ** 2)))
-
-        # Przywrócenie stanu sieci po przebudzeniu
-        if wm_saved_state is not None:
-            world_model._restore_encoder(wm_saved_state)
-        return errors
+            # Przywrócenie stanu sieci po przebudzeniu
+            if wm_saved_state is not None:
+                world_model._restore_encoder(wm_saved_state)
+            return errors
 
     # ------------------------------------------------------------------
     # Online sampling

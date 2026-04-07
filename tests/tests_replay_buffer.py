@@ -232,7 +232,8 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
                 layer_errors={
                     LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
-                }
+                },
+                recorded_da=1.0,
             )
 
         layers = _make_layers()
@@ -259,7 +260,7 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
             f"Initial={initial_mse:.4f}, Final={final_mse:.4f}.",
         )
 
-    def test_sleep_phase_reverse_order_updates_world_model(self) -> None:
+    def test_sleep_phase_reverse_order_updates_prediction(self) -> None:
         """
         Verify that sleep_phase processes experiences in reverse chronological order.
         """
@@ -285,10 +286,11 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
                 layer_errors={
                     LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
-                }
+                },
+                recorded_da=1.0,
             )
 
-        wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(feedback_learning_rate=0.5))
+        wm = SNNWorldModel(STATE_SIZE, ACTION_SIZE, SNNWorldModelConfig(decode_lr=0.5))
         layers = _make_layers()
         nm = _make_nm()
         nm.dopamine = 1.0
@@ -336,7 +338,8 @@ class TestReplayBufferSleepPhase(unittest.TestCase):
                 prediction_error=np.zeros(STATE_SIZE, dtype=np.float32),
                 layer_errors={
                     LAYER_NAME: np.zeros(STATE_SIZE, dtype=np.float32),
-                }
+                },
+                recorded_da=1.0,
             )
 
         from core.world_model import SNNWorldModelConfig

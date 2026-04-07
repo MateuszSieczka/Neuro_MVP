@@ -144,9 +144,17 @@ class NeuromodulatorSystem:
         min_r = float(min(self._reward_history))
         max_r = float(max(self._reward_history))
 
-        # Zabezpieczenie przed błędem dzielenia na samym początku (zerowa wariancja startowa)
+        # Zabezpieczenie przed brakiem zróżnicowania nagrody.
+        # Biologiczna interpretacja (Tobler et al. 2005): when all experienced
+        # rewards are identical, the VTA has no basis to distinguish good
+        # from bad policy — its phasic response is zero and tonic firing
+        # reflects absence of reward prediction signal.  signal=0.0 keeps
+        # tonic DA at its baseline (0.0), maintaining full exploration.
+        # The 0.5 fallback was causing premature exploration reduction in
+        # sparse-reward environments where all episodes return the same
+        # score until the first success.
         if max_r - min_r < 1e-6:
-            signal = 0.5
+            signal = 0.0
         else:
             # Liniowe mapowanie obecnego wyniku do przedziału [0.0, 1.0]
             signal = (episode_return - min_r) / (max_r - min_r)

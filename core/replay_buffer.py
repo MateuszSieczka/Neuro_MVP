@@ -243,10 +243,19 @@ class ReplayBuffer:
                 #    that did not. This is exactly what the hippocampus
                 #    provides during sleep (Diekelmann & Born 2010).
                 #
-                #    Signal scaling: we use the normalized advantage
-                #    A_t = G_t - V(s_t) to avoid shifting the critic's
-                #    baseline. The advantage is normalized by BG's running
-                #    RMS to match the online learning scale.
+                #    Signal: advantage A_t = G_t - V(s_t).
+                #    Positive advantage → this trajectory was better than
+                #    the current value estimate → reinforce.
+                #    Negative advantage → trajectory worse than expected →
+                #    attenuate (only weakly, to avoid unlearning useful weights).
+                #
+                #    Biological basis for asymmetry (Diekelmann & Born 2010):
+                #    SWR replay preferentially replays sequences associated
+                #    with reward (place cells for rewarded locations are
+                #    replayed more). Negative experiences are replayed less
+                #    and with lower gain. This is modeled by the asymmetric
+                #    scaling: positive advantage gets full weight, negative
+                #    gets 20% (modeling the reduced replay probability).
                 if bg is not None and exp.bg_traces:
                     # Restore BG eligibility traces from snapshot
                     if 'critic_e_h' in exp.bg_traces:
@@ -256,20 +265,21 @@ class ReplayBuffer:
                     if 'actor_e' in exp.bg_traces:
                         bg.actor.e_actor = exp.bg_traces['actor_e'].copy()
 
-                    # Advantage: G_t - V(s_t) using current critic weights
-                    # This gives the critic a Monte Carlo target signal
-                    # while preserving relative scale via normalize_td.
                     v_s = bg.critic.peek(exp.aug_state if exp.aug_state is not None else exp.state)
                     advantage = G_t - v_s
 
-                    # Sleep plasticity is attenuated relative to online
-                    # learning (Diekelmann & Born 2010): typical ratio
-                    # is ~0.3-0.5 of waking plasticity. This prevents
-                    # catastrophic overwriting of online-learned features
-                    # while still enabling long-range credit assignment.
-                    SLEEP_PLASTICITY_RATIO = 0.3
+                    # Asymmetric sleep plasticity:
+                    # Positive advantage: 0.3× waking rate (full consolidation)
+                    # Negative advantage: 0.06× waking rate (minimal unlearning)
+                    # This reflects the biological observation that SWR replay
+                    # preferentially strengthens rewarded sequences (Ambrose
+                    # et al. 2016; Singer & Frank 2009).
+                    SLEEP_POS_RATIO = 0.3
+                    SLEEP_NEG_RATIO = 0.06
+                    ratio = SLEEP_POS_RATIO if advantage >= 0 else SLEEP_NEG_RATIO
+
                     sleep_signal = bg.normalize_td(float(np.clip(advantage, -10.0, 10.0)))
-                    sleep_signal *= SLEEP_PLASTICITY_RATIO
+                    sleep_signal *= ratio
 
                     bg.critic.update(sleep_signal)
                     bg.actor.update(sleep_signal)

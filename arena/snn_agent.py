@@ -40,15 +40,17 @@ class SNNAgent(Agent):
         self._trace_decay = trace_decay
         self._use_trace = trace_decay > 0.0
 
-        # Working Memory replaces naive trace augmentation when world model
-        # is active. The WM provides attractor-sustained temporal context
-        # (prefrontal cortex) instead of a simple exponential moving average.
-        # BG input size is state_size + WM neurons when WM is used,
-        # or state_size * 2 when using the simple trace fallback.
-        self._use_working_memory = self._use_wm and self._use_trace
+        # Working Memory: activated when both world model and trace are used.
+        # For environments with very small state spaces (dim ≤ 4), the WM's
+        # LIF attractor dynamics may produce too sparse a signal. In that
+        # case the simple trace fallback provides more gradual temporal
+        # context. For higher-dimensional spaces, WM's attractor provides
+        # pattern completion and sustained representation that outperforms
+        # a simple exponential average.
+        self._use_working_memory = (
+            self._use_wm and self._use_trace and state_size > 4
+        )
         if self._use_working_memory:
-            # WM neuron count = state_size: one attractor neuron per feature
-            # dimension, so the BG receives a state-aligned persistent signal.
             self._wm_num_neurons = state_size
             self.working_memory = WorkingMemoryModule(
                 num_external_inputs=state_size,

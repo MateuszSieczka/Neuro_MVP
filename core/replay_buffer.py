@@ -140,6 +140,7 @@ class ReplayBuffer:
         sequence_memories: dict[str, SequenceMemory] | None = None,
         gamma: float = 0.99,
         bg: "BasalGangliaAGISystem | None" = None,
+        sleep_gain: float = 1.0,
     ) -> list[float]:
         """
         Consolidate recent experience through reverse-order replay.
@@ -303,7 +304,7 @@ class ReplayBuffer:
                     SLEEP_POS_RATIO = 0.5
                     SLEEP_NEG_RATIO = 0.1
                     ratio = SLEEP_POS_RATIO if norm_adv >= 0 else SLEEP_NEG_RATIO
-                    sleep_signal = norm_adv * ratio
+                    sleep_signal = norm_adv * ratio * sleep_gain
 
                     bg.critic.update(sleep_signal)
                     bg.actor.update(sleep_signal)

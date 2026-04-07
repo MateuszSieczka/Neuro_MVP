@@ -10,7 +10,7 @@ env = GymEnv(task.env_id, normalize=True, fixed_bounds=task.obs_bounds, reward_s
 env.reset(seed=23)
 agent = make_agent(task, env)
 
-for ep in range(300):
+for ep in range(500):
     state = env.reset()
     agent.reset()
     ep_reward = 0.0

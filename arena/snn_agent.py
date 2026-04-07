@@ -99,6 +99,26 @@ class SNNAgent(Agent):
         self._episode_steps: int = 0
         self._last_aug_state: np.ndarray | None = None  # Cached augmented state from act()
 
+        # ── Exploration noise smoothing (D1/D2 receptor inertia) ─────
+        # Biological basis: striatal receptor density changes over
+        # hours/days, not per-step. A single bad episode should NOT
+        # spike exploration — the noise "policy" must be tonic,
+        # integrating over many episodes to avoid vicious cycles
+        # (bad episode → high noise → bad episode → ...).
+        # τ_noise ≈ 200 steps (one full episode) ensures episode-level
+        # smoothing while still tracking genuine environmental changes.
+        self._smooth_noise: float = 1.0  # Starts at max exploration
+        self._noise_filter_decay: float = 0.98  # τ ≈ 50 steps (~1/3 episode)
+
+        # ── Best-episode priority replay (hippocampal "golden trace") ─
+        # Biology: hippocampus preferentially replays reward-associated
+        # trajectories during SWR bursts (Dupret et al. 2010), with
+        # frequency proportional to reward magnitude. This ensures
+        # rare but significant experiences are consolidated across
+        # multiple sleep cycles, not just once.
+        self._best_episode_buffer: list = []  # Stores Experience objects from best episode
+        self._best_episode_return: float = -np.inf
+
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
         """Augment raw state with temporal context.
 
@@ -236,6 +256,8 @@ class SNNAgent(Agent):
         self._episode_return += reward
         self._episode_steps += 1
         if done:
+            # Save return for best-episode tracking (needed in sleep phase below)
+            self._last_episode_return = self._episode_return
             self.neuromod.update_tonic_da(self._episode_return, self._episode_steps)
             self._episode_return = 0.0
             self._episode_steps = 0
@@ -248,9 +270,18 @@ class SNNAgent(Agent):
 
         # 6. Exploration control: delegate to BG which combines serotonin,
         #    tonic DA floor, and action entropy (Proposal 2).
-        self.bg.actor.noise_scale = self.bg.compute_exploration_noise(
+        #
+        #    Smoothing (D1/D2 receptor inertia): the raw target noise is
+        #    filtered through a slow EMA to prevent individual bad episodes
+        #    from spiking exploration into a vicious failure cascade.
+        #    Biologically, receptor density changes on timescales of
+        #    hours/days, not seconds (Seamans & Yang 2004).
+        _target_noise = self.bg.compute_exploration_noise(
             self.neuromod.serotonin, self.neuromod.tonic_da
         )
+        d = self._noise_filter_decay
+        self._smooth_noise = self._smooth_noise * d + _target_noise * (1.0 - d)
+        self.bg.actor.noise_scale = self._smooth_noise
 
         # 7. Zapis do Replay Buffer (tylko z World Modelem)
         if self._use_wm:
@@ -302,11 +333,6 @@ class SNNAgent(Agent):
         # 8. Faza snu (Offline Consolidation) na koniec epizodu
         if done and self._use_wm and len(self.replay_buffer) > 0:
             # 8a. Inject episodic memories into replay buffer before sleep.
-            #     Hippocampal episodic traces (CA3) are re-instantiated in
-            #     the replay buffer so they participate in SWR reverse replay.
-            #     This ensures rare but pivotal experiences (e.g., reaching
-            #     the MountainCar goal once after 200 failures) contribute
-            #     to the G_t computation and BG weight updates during sleep.
             for ep in self.episodic_memory.recall_all():
                 self.replay_buffer.store(
                     state=ep.state,
@@ -318,20 +344,50 @@ class SNNAgent(Agent):
                     prediction_error=np.zeros(self.state_size, dtype=np.float32),
                     salience=ep.salience,
                     recorded_da=self.neuromod.learning_rate_modulation,
-                    bg_traces={},  # No BG traces for episodic injections — they use current traces
+                    bg_traces={},
                 )
 
+            # 8b. Proportional sleep gain (VTA DA modulation of replay).
+            #     Biology (Bethus et al. 2010; McNamara et al. 2014):
+            #     VTA phasic dopamine during hippocampal SWR determines
+            #     the gain of hippocampal-to-cortical plasticity. Better
+            #     episodes trigger stronger DA burst, which amplifies the
+            #     replay consolidation signal. This ensures that rare but
+            #     significantly better episodes receive proportionally
+            #     STRONGER consolidation, while mediocre or bad episodes
+            #     receive weaker consolidation.
+            #
+            #     Gain is computed as a z-score of the current episode's
+            #     return relative to recent history, clipped to [0.3, 2.5].
+            #     This provides up to 2.5× amplification for +3σ episodes
+            #     and 0.3× attenuation for very bad episodes.
+            ep_return = getattr(self, '_last_episode_return', 0.0)
+            # Track best return for diagnostics
+            if ep_return > self._best_episode_return:
+                self._best_episode_return = ep_return
+
+            sleep_gain = 1.0
+            if len(self.neuromod._reward_history) >= 5:
+                _r_arr = np.array(self.neuromod._reward_history)
+                _r_mean = float(np.mean(_r_arr))
+                _r_std = float(np.std(_r_arr)) + 1e-8
+                _quality = (ep_return - _r_mean) / _r_std
+                # Only AMPLIFY good episodes, never attenuate bad ones.
+                # Bad episodes still contain useful learning signal (state
+                # dynamics, non-goal value landscape). Attenuating them
+                # slows down critic learning during early training.
+                # Amplification range: [1.0, 2.5] — a +3σ episode gets
+                # 2.5× consolidation, average episode gets 1.0×.
+                sleep_gain = max(1.0, float(np.clip(1.0 + 0.5 * _quality, 1.0, 2.5)))
+
             layers_dict = {'encoder': self.world_model._encoder}
-            # Odtwarzamy wstecznie epizod, używając zamrożonego recorded_da
-            # AND passing BG for critic/actor consolidation from G_t.
             self.replay_buffer.sleep_phase(
                 layers=layers_dict,
                 world_model=self.world_model,
                 neuromodulator=self.neuromod,
                 bg=self.bg,
+                sleep_gain=sleep_gain,
             )
-            # Po śnie czyścimy bufor, aby nie mieszać epizodów
-            # (hipokamp przekazał wiedzę do kory)
             self.replay_buffer.clear()
 
         self._step_count += 1

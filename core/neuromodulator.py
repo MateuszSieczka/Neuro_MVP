@@ -52,6 +52,20 @@ class NeuromodulatorSystem:
         self._error_history: deque[float] = deque(maxlen=100)
         self._reward_history: deque[float] = deque(maxlen=100)
 
+        # ── Stagnation detection (ACC/mPFC learning monitor) ──────────
+        # Biological basis (Kolling et al. 2016; Shenhav et al. 2013):
+        # Anterior cingulate cortex (ACC) tracks the rate of reward
+        # improvement. When learning stagnates (no improvement despite
+        # continued effort), ACC signals orbitofrontal cortex to increase
+        # exploration and maintain synaptic plasticity.
+        #
+        # Implementation: track rolling variance of tonic DA changes.
+        # When tDA barely moves for many episodes → stagnation_factor→1.
+        # This attenuates the consolidation gate, preventing premature
+        # plasticity reduction that traps the agent at a suboptimal plateau.
+        self._tda_history: deque[float] = deque(maxlen=30)
+        self._stagnation_factor: float = 0.0  # 0=improving, 1=fully stagnated
+
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
@@ -177,6 +191,23 @@ class NeuromodulatorSystem:
         )
         self.tonic_da = float(np.clip(self.tonic_da, 0.0, 1.0))
 
+        # ── Stagnation tracking (ACC learning-rate monitor) ───────────
+        # Record tonic DA history and compute improvement rate.
+        # If tDA has been flat (low variance) for many episodes,
+        # the stagnation factor rises, attenuating the consolidation gate.
+        self._tda_history.append(self.tonic_da)
+        if len(self._tda_history) >= 10:
+            tda_arr = np.array(self._tda_history)
+            # Rate of change: std of recent tDA values
+            tda_variability = float(np.std(tda_arr))
+            # Map variability to stagnation: low variability → high stagnation
+            # Threshold: tda_std < 0.02 means no meaningful improvement.
+            # Smoothed with EMA to avoid jitter.
+            raw_stagnation = float(np.clip(1.0 - tda_variability / 0.05, 0.0, 1.0))
+            self._stagnation_factor = (
+                0.9 * self._stagnation_factor + 0.1 * raw_stagnation
+            )
+
     # ------------------------------------------------------------------
     # Properties — typed read-outs for other modules
     # ------------------------------------------------------------------
@@ -188,23 +219,34 @@ class NeuromodulatorSystem:
 
     @property
     def consolidation_gate(self) -> float:
-        """Gate for plasticity reduction based on tonic DA and serotonin.
+        """Gate for plasticity reduction based on tonic DA, serotonin, and learning progress.
 
-        Biological basis (Niv et al. 2007; Doya 2002):
+        Biological basis (Niv et al. 2007; Doya 2002; Kolling et al. 2016):
         Consolidation requires BOTH:
         - Tonic DA high → agent is consistently rewarded (VTA background)
         - Serotonin high → predictions are temporally stable (dorsal raphe)
 
-        The geometric mean requires both signals to contribute:
-        if either is low, the gate stays open (full plasticity).
+        ACC modulation (Kolling et al. 2016; Shenhav et al. 2013):
+        When learning has stagnated AND tonic DA is in the ambiguous
+        middle range (0.3–0.7), ACC signals that the current policy may
+        be suboptimal and attenuates the consolidation gate. This prevents
+        the agent from getting trapped at a local optimum.
 
-        Critical: tonic DA at 0.5 is neutral (no evidence of improvement
-        or decline). Only values above ~0.5 indicate genuine success.
-        The geometric mean naturally handles this: sqrt(0.5 × 0.9) = 0.67,
-        which gives moderate consolidation. Only when both are truly high
-        (tda=0.8, sero=0.9 → gate=0.85) does strong consolidation occur.
+        Crucially, if tDA > 0.7 (strong evidence of success), stagnation
+        attenuation is NOT applied — the agent genuinely needs consolidation
+        to protect its successful policy. The attenuator is targeted
+        specifically at the "mediocre plateau" regime.
         """
-        return float(np.sqrt(self.tonic_da * self.serotonin))
+        raw_gate = float(np.sqrt(self.tonic_da * self.serotonin))
+        # ACC attenuation only in the "stuck in middle" regime.
+        # High tDA (>0.7) = genuine success → full consolidation.
+        # Low tDA (<0.3) = early learning → gate is already low.
+        # Middle tDA (0.3–0.7) with stagnation → attenuate gate.
+        if 0.3 < self.tonic_da < 0.7:
+            acc_attenuation = 1.0 - 0.5 * self._stagnation_factor
+        else:
+            acc_attenuation = 1.0
+        return raw_gate * acc_attenuation
 
     @property
     def bottom_up_gain(self) -> float:

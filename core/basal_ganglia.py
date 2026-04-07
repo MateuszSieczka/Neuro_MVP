@@ -169,12 +169,15 @@ class SNNDeepCritic:
 
         # Homeostatic dendritic scaling (Turrigiano 2008):
         # Maintain per-neuron total afferent input at a level that keeps
-        # tanh in its responsive (pre-saturation) range.  Target norm =
-        # sqrt(fan_in) gives Var(activation) ≈ 1 for normalized inputs.
-        # This prevents both runaway excitation (saturation → loss of
-        # discrimination) and silence, preserving the relative structure
-        # of learned weights while bounding absolute magnitude.
-        h_target = float(np.sqrt(self._state_size))
+        # tanh in its responsive (pre-saturation) range.
+        # Correct target: h_target = 1.0 gives Var(pre_activation) = 1
+        # because Var(x·w) = state_size × Var(x_i) × E[w²]
+        #                   = state_size × 1 × (h_target²/state_size)
+        #                   = h_target².
+        # With h_target=1: pre-activations ≈ N(0,1), tanh'(1) ≈ 0.42.
+        # The previous sqrt(fan_in) was a scaling error that saturated
+        # tanh for all state dims (tanh'(2)=0.07, tanh'(4)≈0).
+        h_target = 1.0
         for j in range(self.config.hidden_size):
             col_norm = float(np.linalg.norm(self.w_h[:, j]))
             if col_norm > h_target:
@@ -345,6 +348,24 @@ class SNNContinuousActor:
         """Zwraca ostatnio wybraną dyskretną akcję."""
         return self._last_action
 
+    @property
+    def action_entropy(self) -> float:
+        """Normalized entropy of last action distribution [0, 1].
+
+        Biological basis: competition uncertainty in striatum.
+        When multiple MSNs are equally active (high entropy), thalamic
+        output is less decisive → more variable behavior.
+        When one MSN dominates (low entropy) → deterministic action.
+        """
+        if self._last_probs is None:
+            return 1.0
+        p = self._last_probs
+        entropy = -float(np.sum(p * np.log(p + 1e-10)))
+        max_entropy = float(np.log(self.motor_dim))
+        if max_entropy < 1e-8:
+            return 0.0
+        return float(np.clip(entropy / max_entropy, 0.0, 1.0))
+
     def reset_state(self) -> None:
         """Reset transient traces. Weights are preserved."""
         self.e_actor.fill(0.0)
@@ -440,3 +461,22 @@ class BasalGangliaAGISystem:
         """
         self.critic.set_plasticity_timescales(ne)
         self.actor.set_plasticity_timescales(ne)
+
+    def compute_exploration_noise(self, serotonin: float, tonic_da: float) -> float:
+        """Compute exploration noise from neuromodulatory signals.
+
+        Three-signal exploration control:
+          1. Serotonin: (1-sero)² — global prediction uncertainty (dorsal raphe)
+          2. Tonic DA floor: keep exploring when unrewarded (VTA)
+          3. Action entropy: exposed as diagnostic but not yet used for
+             exploration gating (risk of premature collapse before reward)
+
+        Biological basis (Niv et al. 2007): low tonic DA in VTA signals
+        that the agent has not found consistent reward. Exploration must
+        remain high regardless of cortical prediction stability (serotonin)
+        or striatal competition patterns (action entropy).
+        """
+        MIN_EXPLORATION = 0.01
+        sero_noise = (1.0 - serotonin) ** 2
+        da_floor = 0.5 * ((1.0 - tonic_da) ** 2)
+        return max(MIN_EXPLORATION, sero_noise, da_floor)

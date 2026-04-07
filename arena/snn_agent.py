@@ -246,30 +246,11 @@ class SNNAgent(Agent):
         if self._use_wm:
             self.neuromod.apply_to_layer(self.world_model)
 
-        # 6. Exploration control: serotonin + tonic DA performance floor
-        #    Primary signal: serotonin — prediction accuracy.
-        #    (1-sero)² drives noise. Works well for dense reward.
-        #
-        #    Performance floor from tonic DA (Niv et al. 2007):
-        #    Low tonic DA means the agent is NOT being consistently rewarded.
-        #    In that regime, exploration must remain high regardless of how
-        #    "stable" predictions are (serotonin). An agent that consistently
-        #    picks the wrong action has low TD error → high serotonin, but
-        #    low tonic DA reveals it hasn't found reward yet.
-        #
-        #    da_floor = 0.5 × (1 − tonic_da):
-        #      tda=0.0 (no reward experience) → floor=0.5 (strong exploration)
-        #      tda=0.5 (neutral/stagnating)   → floor=0.25 (moderate exploration)
-        #      tda=1.0 (consistently rewarded) → floor=0.0 (serotonin takes over)
-        #
-        #    This addresses the sparse-reward trap (MountainCar / corridor):
-        #    critic converges to V≈const, TD→0, sero→1, but tonic_da stays
-        #    low → da_floor keeps noise alive → agent eventually discovers reward.
-        MIN_EXPLORATION = 0.01
-        sero_noise = (1.0 - self.neuromod.serotonin) ** 2
-        tda = self.neuromod.tonic_da
-        da_floor = 0.5 * (1.0 - tda)
-        self.bg.actor.noise_scale = max(MIN_EXPLORATION, sero_noise, da_floor)
+        # 6. Exploration control: delegate to BG which combines serotonin,
+        #    tonic DA floor, and action entropy (Proposal 2).
+        self.bg.actor.noise_scale = self.bg.compute_exploration_noise(
+            self.neuromod.serotonin, self.neuromod.tonic_da
+        )
 
         # 7. Zapis do Replay Buffer (tylko z World Modelem)
         if self._use_wm:

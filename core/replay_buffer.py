@@ -208,6 +208,32 @@ class ReplayBuffer:
         wm_saved_state = None
         if hasattr(world_model, '_snapshot_encoder'):
             wm_saved_state = world_model._snapshot_encoder()
+
+            # ── BG sleep: batch-normalize advantages (fixes Proposals 1+3) ──
+            # Pre-compute and standardize advantages within the episode.
+            # Two bugs fixed:
+            #   1. ±10 clip made success/failure advantages identical → no gradient
+            #   2. normalize_td() polluted running RMS → unstable online learning
+            # Biological basis: hippocampal SWR replay assigns credit relative
+            # to the episode's own distribution (Ambrose et al. 2016).
+            _sleep_adv_normalized = None
+            if bg is not None:
+                _saved_td_rms = bg._td_rms
+                _all_advantages = []
+                for _i, _exp in enumerate(reversed(experiences)):
+                    _G = cumulative_returns[_i]
+                    _vs = bg.critic.peek(
+                        _exp.aug_state if _exp.aug_state is not None else _exp.state
+                    )
+                    _all_advantages.append(_G - _vs)
+                _adv_arr = np.array(_all_advantages, dtype=np.float32)
+                _adv_mean = float(np.mean(_adv_arr))
+                _adv_std = float(np.std(_adv_arr)) + 1e-8
+                _max_abs = float(np.max(np.abs(_adv_arr))) + 1e-8
+                # Normalize by max absolute value: bounds signal to [-1, 1]
+                # per step, preventing any single advantage from dominating.
+                _sleep_adv_normalized = _adv_arr / _max_abs
+
             # Hippocampal reverse replay: most recent experience first
             for i, exp in enumerate(reversed(experiences)):
                 # 1. Restore eligibility traces for ALL layers in the hierarchy
@@ -256,7 +282,7 @@ class ReplayBuffer:
                 #    and with lower gain. This is modeled by the asymmetric
                 #    scaling: positive advantage gets full weight, negative
                 #    gets 20% (modeling the reduced replay probability).
-                if bg is not None and exp.bg_traces:
+                if bg is not None and exp.bg_traces and _sleep_adv_normalized is not None:
                     # Restore BG eligibility traces from snapshot
                     if 'critic_e_h' in exp.bg_traces:
                         bg.critic.e_h = exp.bg_traces['critic_e_h'].copy()
@@ -265,24 +291,26 @@ class ReplayBuffer:
                     if 'actor_e' in exp.bg_traces:
                         bg.actor.e_actor = exp.bg_traces['actor_e'].copy()
 
-                    v_s = bg.critic.peek(exp.aug_state if exp.aug_state is not None else exp.state)
-                    advantage = G_t - v_s
+                    # Batch-normalized advantage (within-episode standardization).
+                    # Bypasses normalize_td to avoid polluting online RMS.
+                    norm_adv = float(_sleep_adv_normalized[i])
 
-                    # Asymmetric sleep plasticity:
-                    # Positive advantage: 0.3× waking rate (full consolidation)
-                    # Negative advantage: 0.06× waking rate (minimal unlearning)
-                    # This reflects the biological observation that SWR replay
-                    # preferentially strengthens rewarded sequences (Ambrose
-                    # et al. 2016; Singer & Frank 2009).
-                    SLEEP_POS_RATIO = 0.3
-                    SLEEP_NEG_RATIO = 0.06
-                    ratio = SLEEP_POS_RATIO if advantage >= 0 else SLEEP_NEG_RATIO
-
-                    sleep_signal = bg.normalize_td(float(np.clip(advantage, -10.0, 10.0)))
-                    sleep_signal *= ratio
+                    # Asymmetric sleep plasticity (Ambrose et al. 2016):
+                    # Positive advantages (states better than V predicts)
+                    # get stronger consolidation. Over many episodes, this
+                    # makes success-adjacent states accumulate relatively
+                    # higher V while all V drifts toward correct scale.
+                    SLEEP_POS_RATIO = 0.5
+                    SLEEP_NEG_RATIO = 0.1
+                    ratio = SLEEP_POS_RATIO if norm_adv >= 0 else SLEEP_NEG_RATIO
+                    sleep_signal = norm_adv * ratio
 
                     bg.critic.update(sleep_signal)
                     bg.actor.update(sleep_signal)
+
+            # Restore BG running-RMS after sleep (prevent online pollution)
+            if bg is not None and _sleep_adv_normalized is not None:
+                bg._td_rms = _saved_td_rms
 
             # Przywrócenie stanu sieci po przebudzeniu
             if wm_saved_state is not None:

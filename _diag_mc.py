@@ -5,9 +5,9 @@ from arena.agent_factory import make_agent
 from arena import task_config
 
 task = task_config.get("MountainCar-v0")
-np.random.seed(1)
+np.random.seed(23)
 env = GymEnv(task.env_id, normalize=True, fixed_bounds=task.obs_bounds, reward_scale=task.reward_scale)
-env.reset(seed=1)
+env.reset(seed=23)
 agent = make_agent(task, env)
 
 for ep in range(300):

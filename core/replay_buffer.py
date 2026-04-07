@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .neuron import LIFLayer
     from .world_model import WorldModel
     from .neuromodulator import NeuromodulatorSystem
+    from .basal_ganglia import BasalGangliaAGISystem
 
 
 @dataclass
@@ -38,6 +39,19 @@ class Experience:
     salience: float = 0.0
     recorded_da: float = 0.0
 
+    # BG traces for sleep-phase consolidation (hippocampal → striatal transfer).
+    # Stores the eligibility traces of the critic and actor at the time of
+    # the experience, enabling offline credit assignment via G_t.
+    # Biological basis: hippocampal SWR replay reactivates cortico-striatal
+    # eligibility traces that were active during the original experience
+    # (Lansink et al., 2009; Pennartz et al., 2004).
+    bg_traces: dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Augmented state for BG critic (state + trace or state + WM signal).
+    # When BG input size > raw state size, critic.peek() needs the full
+    # augmented vector. None means raw state == BG input (no augmentation).
+    aug_state: np.ndarray | None = None
+
     def __post_init__(self) -> None:
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
@@ -46,6 +60,9 @@ class Experience:
         self.prediction_error = self.prediction_error.copy()
         # Kopiowanie zapisanych błędów
         self.layer_errors = {name: err.copy() for name, err in self.layer_errors.items()}
+        self.bg_traces = {name: trace.copy() for name, trace in self.bg_traces.items()}
+        if self.aug_state is not None:
+            self.aug_state = self.aug_state.copy()
 
 
 class ReplayBuffer:
@@ -93,15 +110,21 @@ class ReplayBuffer:
         layer_errors: dict[str, np.ndarray] | None = None,
         salience: float = 0.0,
         recorded_da: float = 0.0,
+        bg_traces: dict[str, np.ndarray] | None = None,
+        aug_state: np.ndarray | None = None,
     ) -> None:
         if layer_errors is None:
             layer_errors = {}
+        if bg_traces is None:
+            bg_traces = {}
         self._buffer.append(
             Experience(
                 state=state, action=action, reward=reward, next_state=next_state,
                 layer_traces=layer_traces, layer_outputs=layer_outputs,
                 prediction_error=prediction_error, layer_errors=layer_errors,
-                salience=salience, recorded_da=recorded_da
+                salience=salience, recorded_da=recorded_da,
+                bg_traces=bg_traces,
+                aug_state=aug_state,
             )
         )
     # ------------------------------------------------------------------
@@ -116,6 +139,7 @@ class ReplayBuffer:
         n_experiences: int | None = None,
         sequence_memories: dict[str, SequenceMemory] | None = None,
         gamma: float = 0.99,
+        bg: "BasalGangliaAGISystem | None" = None,
     ) -> list[float]:
         """
         Consolidate recent experience through reverse-order replay.
@@ -198,12 +222,57 @@ class ReplayBuffer:
 
                 # 3. Aktualizacja: dopamina × skumulowany_zwrot
                 G_t = cumulative_returns[i]
-                m_t = exp.recorded_da * G_t
+                m_t = exp.recorded_da * max(abs(G_t), 0.1)
 
                 # Przekazujemy m_t wprost do modelu. World Model zadba o resztę samodzielnie!
                 world_error = world_model.update(exp.state, exp.action, exp.next_state, m_t=m_t)
 
                 errors.append(float(np.mean(world_error ** 2)))
+
+                # 4. BG consolidation (Lansink et al. 2009):
+                #    During hippocampal SWR replay, cortico-striatal synapses
+                #    that were eligible during the original experience are
+                #    reactivated. The Monte Carlo return G_t provides the
+                #    teaching signal that was unavailable online (because
+                #    the reward only arrived at the end of the episode).
+                #
+                #    The key insight: online TD learning in MountainCar gives
+                #    δ ≈ 0 everywhere (reward is -1 everywhere, V converges
+                #    to ≈-200). But G_t computed backward from the goal
+                #    differentiates states that led to success from those
+                #    that did not. This is exactly what the hippocampus
+                #    provides during sleep (Diekelmann & Born 2010).
+                #
+                #    Signal scaling: we use the normalized advantage
+                #    A_t = G_t - V(s_t) to avoid shifting the critic's
+                #    baseline. The advantage is normalized by BG's running
+                #    RMS to match the online learning scale.
+                if bg is not None and exp.bg_traces:
+                    # Restore BG eligibility traces from snapshot
+                    if 'critic_e_h' in exp.bg_traces:
+                        bg.critic.e_h = exp.bg_traces['critic_e_h'].copy()
+                    if 'critic_e_v' in exp.bg_traces:
+                        bg.critic.e_v = exp.bg_traces['critic_e_v'].copy()
+                    if 'actor_e' in exp.bg_traces:
+                        bg.actor.e_actor = exp.bg_traces['actor_e'].copy()
+
+                    # Advantage: G_t - V(s_t) using current critic weights
+                    # This gives the critic a Monte Carlo target signal
+                    # while preserving relative scale via normalize_td.
+                    v_s = bg.critic.peek(exp.aug_state if exp.aug_state is not None else exp.state)
+                    advantage = G_t - v_s
+
+                    # Sleep plasticity is attenuated relative to online
+                    # learning (Diekelmann & Born 2010): typical ratio
+                    # is ~0.3-0.5 of waking plasticity. This prevents
+                    # catastrophic overwriting of online-learned features
+                    # while still enabling long-range credit assignment.
+                    SLEEP_PLASTICITY_RATIO = 0.3
+                    sleep_signal = bg.normalize_td(float(np.clip(advantage, -10.0, 10.0)))
+                    sleep_signal *= SLEEP_PLASTICITY_RATIO
+
+                    bg.critic.update(sleep_signal)
+                    bg.actor.update(sleep_signal)
 
             # Przywrócenie stanu sieci po przebudzeniu
             if wm_saved_state is not None:

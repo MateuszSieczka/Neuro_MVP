@@ -15,9 +15,13 @@ from core.world_model import SNNWorldModel
 from core.config import (
     NeuromodulatorConfig,
     SNNWorldModelConfig,
+    WorkingMemoryConfig,
+    EpisodicMemoryConfig,
 )
 from core.replay_buffer import ReplayBuffer
 from core.active_inference import ActiveInferenceModule
+from core.episodic_memory import EpisodicMemory
+from core.working_memory import WorkingMemoryModule
 
 class SNNAgent(Agent):
     def __init__(
@@ -36,7 +40,25 @@ class SNNAgent(Agent):
         self._trace_decay = trace_decay
         self._use_trace = trace_decay > 0.0
 
-        bg_input_size = state_size * 2 if self._use_trace else state_size
+        # Working Memory replaces naive trace augmentation when world model
+        # is active. The WM provides attractor-sustained temporal context
+        # (prefrontal cortex) instead of a simple exponential moving average.
+        # BG input size is state_size + WM neurons when WM is used,
+        # or state_size * 2 when using the simple trace fallback.
+        self._use_working_memory = self._use_wm and self._use_trace
+        if self._use_working_memory:
+            # WM neuron count = state_size: one attractor neuron per feature
+            # dimension, so the BG receives a state-aligned persistent signal.
+            self._wm_num_neurons = state_size
+            self.working_memory = WorkingMemoryModule(
+                num_external_inputs=state_size,
+                num_neurons=self._wm_num_neurons,
+            )
+            bg_input_size = state_size + self._wm_num_neurons
+        elif self._use_trace:
+            bg_input_size = state_size * 2
+        else:
+            bg_input_size = state_size
 
         self._bg_config = bg_config or ContinuousBGConfig(
             gamma=0.95, critic_lr=0.01, actor_lr=0.005,
@@ -61,24 +83,57 @@ class SNNAgent(Agent):
             self.active_inference = ActiveInferenceModule(self.world_model)
             self.replay_buffer = ReplayBuffer(capacity=1000)
 
+            # Episodic Memory (hippocampal CA3 one-shot binding):
+            # Stores rare, high-NE transitions for injection into replay
+            # buffer during sleep. Critical for sparse-reward environments
+            # where a single success must be remembered despite hundreds
+            # of failures (O'Neill et al. 2010; Cheng & Frank 2008).
+            self.episodic_memory = EpisodicMemory(state_dim=state_size)
+
         self._trace = np.zeros(state_size, dtype=np.float32)
         self._last_td_error: float = 0.0
         self._step_count: int = 0
         self._episode_return: float = 0.0   # Accumulated return for tonic DA
         self._episode_steps: int = 0
+        self._last_aug_state: np.ndarray | None = None  # Cached augmented state from act()
 
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
-        if not self._use_trace:
-            return state.astype(np.float32)
-        return np.concatenate([state.astype(np.float32), self._trace])
+        """Augment raw state with temporal context.
+
+        When WorkingMemory is active (WM mode):
+          State is concatenated with WM's persistent content signal.
+          The WM module sustains activity through recurrent attractor
+          dynamics (tau_m=300ms), providing a biologically grounded
+          temporal context that outlasts the original stimulus.
+          ACh gates WM update: high ACh (novel situation) → accept new
+          input; low ACh (familiar) → sustain existing content.
+
+        Fallback (trace mode):
+          Simple exponential moving average of past states.
+        """
+        state_f32 = state.astype(np.float32)
+        if self._use_working_memory:
+            # Gate WM by ACh level from neuromodulator
+            self.working_memory.gate(self.neuromod.acetylcholine)
+            # Forward pass: integrate input if gate open, sustain if closed
+            self.working_memory.forward(state_f32)
+            # Content is the low-pass filtered activation (rate-coded)
+            wm_signal = self.working_memory.content.copy()
+            return np.concatenate([state_f32, wm_signal])
+        elif self._use_trace:
+            return np.concatenate([state_f32, self._trace])
+        else:
+            return state_f32
 
     def _update_trace(self, state: np.ndarray) -> None:
-        if self._use_trace:
+        """Update simple EMA trace (only used in non-WM trace mode)."""
+        if self._use_trace and not self._use_working_memory:
             self._trace = self._trace * self._trace_decay + state.astype(np.float32)
 
     def act(self, state: np.ndarray) -> int:
         aug = self._augment_state(state)
         self._update_trace(state)
+        self._last_aug_state = aug.copy()  # Cache for replay buffer in observe()
 
         if self._use_wm:
             # Active Inference: Oblicz pragmatyczne preferencje Aktora (logity MSN)
@@ -221,6 +276,17 @@ class SNNAgent(Agent):
             layer_outputs = {'encoder': self.world_model._encoder.has_spiked.astype(np.float32)}
             layer_errors = {'encoder': self.world_model._encoder.prediction_error}
 
+            # BG eligibility trace snapshot (Lansink et al. 2009):
+            # Hippocampal place cells co-fire with ventral striatal neurons
+            # during behavior. During subsequent sleep SWR, these co-activation
+            # patterns are replayed, reactivating the striatal eligibility
+            # traces that were present during the original experience.
+            bg_traces = {
+                'critic_e_h': self.bg.critic.e_h.copy(),
+                'critic_e_v': self.bg.critic.e_v.copy(),
+                'actor_e': self.bg.actor.e_actor.copy(),
+            }
+
             self.replay_buffer.store(
                 state=state.astype(np.float32),
                 action=action,
@@ -231,17 +297,55 @@ class SNNAgent(Agent):
                 prediction_error=pred_error,
                 layer_errors=layer_errors,
                 salience=self.neuromod.noradrenaline,  # Salience = NE (arousal/zaskoczenie)
-                recorded_da=self.neuromod.learning_rate_modulation  # Zamrożony sygnał DA!
+                recorded_da=self.neuromod.learning_rate_modulation,  # Zamrożony sygnał DA!
+                bg_traces=bg_traces,
+                aug_state=self._last_aug_state,
+            )
+
+            # 7b. Episodic Memory: NE-gated one-shot storage (hippocampal CA3).
+            #     When NE is high (surprise/arousal), store this transition
+            #     in the episodic memory for later injection during sleep.
+            #     Critical for sparse-reward environments where successful
+            #     episodes are rare and would be diluted in the main buffer
+            #     (O'Neill et al. 2010; Cheng & Frank 2008).
+            self.episodic_memory.try_store(
+                state=state.astype(np.float32),
+                action=action,
+                reward=reward,
+                next_state=next_state.astype(np.float32),
+                ne_level=self.neuromod.noradrenaline,
             )
 
         # 8. Faza snu (Offline Consolidation) na koniec epizodu
         if done and self._use_wm and len(self.replay_buffer) > 0:
+            # 8a. Inject episodic memories into replay buffer before sleep.
+            #     Hippocampal episodic traces (CA3) are re-instantiated in
+            #     the replay buffer so they participate in SWR reverse replay.
+            #     This ensures rare but pivotal experiences (e.g., reaching
+            #     the MountainCar goal once after 200 failures) contribute
+            #     to the G_t computation and BG weight updates during sleep.
+            for ep in self.episodic_memory.recall_all():
+                self.replay_buffer.store(
+                    state=ep.state,
+                    action=ep.action,
+                    reward=ep.reward,
+                    next_state=ep.next_state,
+                    layer_traces={},
+                    layer_outputs={},
+                    prediction_error=np.zeros(self.state_size, dtype=np.float32),
+                    salience=ep.salience,
+                    recorded_da=self.neuromod.learning_rate_modulation,
+                    bg_traces={},  # No BG traces for episodic injections — they use current traces
+                )
+
             layers_dict = {'encoder': self.world_model._encoder}
             # Odtwarzamy wstecznie epizod, używając zamrożonego recorded_da
+            # AND passing BG for critic/actor consolidation from G_t.
             self.replay_buffer.sleep_phase(
                 layers=layers_dict,
                 world_model=self.world_model,
-                neuromodulator=self.neuromod
+                neuromodulator=self.neuromod,
+                bg=self.bg,
             )
             # Po śnie czyścimy bufor, aby nie mieszać epizodów
             # (hipokamp przekazał wiedzę do kory)
@@ -255,3 +359,5 @@ class SNNAgent(Agent):
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()
+        if self._use_working_memory:
+            self.working_memory.reset_state()

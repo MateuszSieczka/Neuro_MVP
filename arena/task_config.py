@@ -112,7 +112,7 @@ REGISTRY: dict[str, TaskConfig] = {
     # ------------------------------------------------------------------
     "CartPole-v1": TaskConfig(
         env_id="CartPole-v1",
-        n_episodes=300,
+        n_episodes=120,
         max_steps=500,
         solved_threshold=450.0,
         eval_window=20,
@@ -148,7 +148,7 @@ REGISTRY: dict[str, TaskConfig] = {
     # ------------------------------------------------------------------
     "MountainCar-v0": TaskConfig(
         env_id="MountainCar-v0",
-        n_episodes=500,
+        n_episodes=300,
         max_steps=200,
         solved_threshold=-110.0,
         eval_window=20,
@@ -158,7 +158,7 @@ REGISTRY: dict[str, TaskConfig] = {
         ),
         bg_config=ContinuousBGConfig(
             gamma=0.99,
-            exploration_noise=0.35,
+            exploration_noise=1.0,
             hidden_size=128,
         ),
         wm_config=SNNWorldModelConfig(

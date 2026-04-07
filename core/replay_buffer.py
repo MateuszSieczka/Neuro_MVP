@@ -201,7 +201,17 @@ class ReplayBuffer:
         cumulative_returns: list[float] = []
         G = 0.0
         for exp in reversed(experiences):
-            effective_gamma = gamma * (1.0 - exp.salience)
+            # Only genuinely salient events (NE > 0.5) create temporal
+            # boundaries in hippocampal replay. Routine NE (arousal during
+            # normal exploration) should NOT attenuate the discount factor
+            # — otherwise G is systematically compressed (e.g., -6 instead
+            # of -87 in MountainCar), causing the critic to target the
+            # wrong value. Biological basis: low NE reflects tonic LC
+            # firing (routine arousal), while high NE bursts mark genuine
+            # surprise events that segment the temporal stream (Bouret &
+            # Sara 2005).
+            sal_effective = max(0.0, exp.salience - 0.5) * 2.0
+            effective_gamma = gamma * (1.0 - sal_effective)
             G = exp.reward + effective_gamma * G
             cumulative_returns.append(G)
         # cumulative_returns[0] = G dla najnowszego exp; odwrócimy dostęp poniżej.
@@ -289,6 +299,8 @@ class ReplayBuffer:
                         bg.critic.e_h = exp.bg_traces['critic_e_h'].copy()
                     if 'critic_e_v' in exp.bg_traces:
                         bg.critic.e_v = exp.bg_traces['critic_e_v'].copy()
+                    if 'critic_e_bv' in exp.bg_traces:
+                        bg.critic.e_bv = float(exp.bg_traces['critic_e_bv'].flat[0])
                     if 'actor_e' in exp.bg_traces:
                         bg.actor.e_actor = exp.bg_traces['actor_e'].copy()
 

@@ -96,8 +96,12 @@ class SNNDeepCritic:
         # Stabilność zapewnia w_clip (synaptic saturation).
         self.e_h = self.e_h * self._trace_decay + np.outer(state_f32, self.activation)
         self.e_v = self.e_v * self._trace_decay + self.activation
-        # Output bias trace: constant input of 1.0
-        self.e_bv = self.e_bv * self._trace_decay + 1.0
+        # Output bias trace: gated by network activity (mean |activation|).
+        # Biological basis: the bias represents tonic firing rate adaptation,
+        # which should only update when the network is genuinely processing
+        # input — not accumulate a constant +1 gradient that saturates the
+        # trace and amplifies drift during offline replay.
+        self.e_bv = self.e_bv * self._trace_decay + float(np.mean(np.abs(self.activation)))
         # Ca²⁺ saturation — ślady ograniczone pojemnością kolca dendrytycznego.
         # Zapobiega akumulacji przy bardzo długich epizodach.
         np.clip(self.e_h, -2.0, 2.0, out=self.e_h)

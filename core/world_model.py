@@ -110,6 +110,36 @@ class SNNWorldModel:
         self._error_history: list[float] = []
 
     # ------------------------------------------------------------------
+    # Encoder readout
+    # ------------------------------------------------------------------
+
+    def _encoder_rate(self) -> np.ndarray:
+        """Graded rate-coded activity from encoder membrane potential.
+
+        Biological basis: cortical population coding uses graded firing
+        rates (Shadlen & Newsome 1998), not just binary spikes. The rate
+        r = (v - v_rest) / (v_thresh - v_rest) maps subthreshold membrane
+        potential to a normalised firing probability, providing a continuous
+        signal for downstream readout even when the population is too small
+        or the input too weak for reliable spiking.
+        """
+        return np.clip(
+            (self._encoder.v - self._encoder.config.v_rest)
+            / (self._encoder.config.v_thresh - self._encoder.config.v_rest),
+            0.0, 1.0,
+        )
+
+    def _maybe_phase_reset(self) -> None:
+        """Auto-trigger k-WTA phase reset when the encoder’s window is full.
+
+        Unlike NetworkGraph (which has a global oscillator), the world model
+        runs its encoder independently. Without explicit phase resets, k-WTA
+        competition and homeostatic threshold adaptation never activate.
+        """
+        if self._encoder._current_window_size >= self.config.window_ms:
+            self._encoder.trigger_phase_reset()
+
+    # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
@@ -123,14 +153,15 @@ class SNNWorldModel:
         """
         combined = self._build_input(state_spikes, action)
 
-        # Ignorujemy oddolny błąd zwracany przez warstwę PC
+        self._maybe_phase_reset()
         self._encoder.forward(combined)
 
-        # Bezpośrednio pobieramy aktywność reprezentacji ukrytej (kształt: hidden_size)
-        internal_spikes = self._encoder.has_spiked.astype(np.float32)
-        self._last_internal_spikes = internal_spikes
+        # Graded rate-coded activity: provides continuous signal for decoder
+        # even when binary spike count is zero or bursty.
+        internal_activity = self._encoder_rate()
+        self._last_internal_spikes = internal_activity
 
-        raw = self._last_internal_spikes @ self.w_decode
+        raw = internal_activity @ self.w_decode
         self.last_prediction = np.clip(raw, 0.0, 1.0)
         return self.last_prediction
 
@@ -146,13 +177,14 @@ class SNNWorldModel:
         """
         combined = self._build_input(state_spikes, action)
 
-        # Wykonujemy krok forward i wyciągamy prawidłowy wektor aktywacji neuronów
+        # Forward pass with auto-triggered phase resets for k-WTA
+        self._maybe_phase_reset()
         self._encoder.forward(combined)
-        internal_spikes = self._encoder.has_spiked.astype(np.float32)
-        self._last_internal_spikes = internal_spikes
+        internal_activity = self._encoder_rate()
+        self._last_internal_spikes = internal_activity
 
         actual = actual_next_state.astype(np.float32)
-        predicted = np.clip(internal_spikes @ self.w_decode, 0.0, 1.0)
+        predicted = np.clip(internal_activity @ self.w_decode, 0.0, 1.0)
 
         # Błąd dekodera
         self.prediction_error = actual - predicted
@@ -168,9 +200,9 @@ class SNNWorldModel:
         self._encoder.update_weights(m_t=m_t, pred_error=decoder_gradient)
 
         # Aktualizacja Hebbowska dekodera
-        if np.any(internal_spikes > 0):
+        if np.max(internal_activity) > 0.01:
             dw = self.config.decode_lr * np.outer(
-                internal_spikes, self.prediction_error
+                internal_activity, self.prediction_error
             )
             self.w_decode += dw * m_t
             np.clip(self.w_decode, -1.0, 1.0, out=self.w_decode)
@@ -214,8 +246,13 @@ class SNNWorldModel:
             for _ in range(self.config.rehearsal_steps):
                 enc.forward(combined)
 
-            internal = enc.has_spiked.astype(np.float32)
-            predicted_next = np.clip(internal @ self.w_decode, 0.0, 1.0)
+            # Graded rates for decoder readout (consistent with predict/update)
+            internal_rate = np.clip(
+                (enc.v - enc.config.v_rest)
+                / (enc.config.v_thresh - enc.config.v_rest),
+                0.0, 1.0,
+            )
+            predicted_next = np.clip(internal_rate @ self.w_decode, 0.0, 1.0)
 
             # Epistemic novelty: the PC encoder's internal prediction error
             # reflects how uncertain the model is about this (state, action)

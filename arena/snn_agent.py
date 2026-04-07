@@ -255,7 +255,12 @@ class SNNAgent(Agent):
         if done:
             # Save return for best-episode tracking (needed in sleep phase below)
             self._last_episode_return = self._episode_return
-            self.neuromod.update_tonic_da(self._episode_return, self._episode_steps)
+            # Compute episode-average prediction error for intrinsic progress
+            ep_pe = 0.0
+            if hasattr(self, 'world_model') and hasattr(self.world_model, '_error_history') and self.world_model._error_history:
+                ep_pe = float(np.mean(self.world_model._error_history))
+            self.neuromod.update_tonic_da(self._episode_return, self._episode_steps,
+                                          prediction_error_avg=ep_pe)
             self._episode_return = 0.0
             self._episode_steps = 0
 
@@ -295,6 +300,7 @@ class SNNAgent(Agent):
             bg_traces = {
                 'critic_e_h': self.bg.critic.e_h.copy(),
                 'critic_e_v': self.bg.critic.e_v.copy(),
+                'critic_e_bv': np.array([self.bg.critic.e_bv], dtype=np.float32),
                 'actor_e': self.bg.actor.e_actor.copy(),
             }
 
@@ -328,6 +334,7 @@ class SNNAgent(Agent):
                 bg_traces={
                     'critic_e_h': self.bg.critic.e_h.copy(),
                     'critic_e_v': self.bg.critic.e_v.copy(),
+                    'critic_e_bv': np.array([self.bg.critic.e_bv], dtype=np.float32),
                     'actor_e': self.bg.actor.e_actor.copy(),
                 },
                 aug_state=self._last_aug_state,

@@ -72,6 +72,13 @@ class NeuromodulatorSystem:
         self._tda_history: deque[float] = deque(maxlen=30)
         self._stagnation_factor: float = 0.0  # 0=improving, 1=fully stagnated
 
+        # ── Intrinsic progress tracking (Lisman & Grace 2005) ─────────
+        # VTA receives inputs from hippocampus/PFC about learning progress.
+        # When extrinsic reward is uninformative, world model prediction
+        # error improvement drives tonic DA, enabling gradual exploration
+        # reduction as the agent masters environmental dynamics.
+        self._episode_pred_errors: deque[float] = deque(maxlen=30)
+
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
@@ -155,7 +162,8 @@ class NeuromodulatorSystem:
 
         self._clamp_all()
 
-    def update_tonic_da(self, episode_return: float, episode_steps: int) -> None:
+    def update_tonic_da(self, episode_return: float, episode_steps: int,
+                         prediction_error_avg: float = 0.0) -> None:
         """Update tonic DA at episode boundaries based on dynamic range adaptation.
 
         Biologiczna podstawa (Niv, Daw, Joel & Dayan 2007; Tobler et al. 2005):
@@ -188,10 +196,27 @@ class NeuromodulatorSystem:
         # sparse-reward environments where all episodes return the same
         # score until the first success.
         if max_r - min_r < 1e-6:
-            signal = 0.0
+            reward_signal = 0.0
         else:
             # Liniowe mapowanie obecnego wyniku do przedziału [0.0, 1.0]
-            signal = (episode_return - min_r) / (max_r - min_r)
+            reward_signal = (episode_return - min_r) / (max_r - min_r)
+
+        # ── Intrinsic progress signal (Lisman & Grace 2005) ───────────
+        # Track per-episode average prediction error and compare recent
+        # episodes to older ones.  Decreasing error = learning progress.
+        self._episode_pred_errors.append(prediction_error_avg)
+        intrinsic_signal = 0.0
+        if len(self._episode_pred_errors) >= 10:
+            err_arr = np.array(self._episode_pred_errors)
+            midpoint = len(err_arr) // 2
+            avg_older = float(np.mean(err_arr[:midpoint]))
+            avg_recent = float(np.mean(err_arr[midpoint:]))
+            if avg_older > 1e-8:
+                intrinsic_signal = float(
+                    np.clip((avg_older - avg_recent) / avg_older, 0.0, 1.0)
+                )
+
+        signal = max(reward_signal, intrinsic_signal)
 
         # Asymmetric VTA adaptation (Koob & Le Moal 2001; Volkow et al. 2017):
         # Rising: standard adaptation — quickly recognize improvement.

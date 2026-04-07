@@ -52,6 +52,12 @@ class NeuromodulatorSystem:
         self._error_history: deque[float] = deque(maxlen=100)
         self._reward_history: deque[float] = deque(maxlen=100)
 
+        # TD error magnitude history — behavioral stability signal for serotonin.
+        # Biological basis (Doya 2002): dorsal raphe nucleus receives projections
+        # from VTA and habenula, integrating reward prediction accuracy into the
+        # serotonergic stability signal. High |TD| = critic surprised = unstable.
+        self._td_history: deque[float] = deque(maxlen=100)
+
         # ── Stagnation detection (ACC/mPFC learning monitor) ──────────
         # Biological basis (Kolling et al. 2016; Shenhav et al. 2013):
         # Anterior cingulate cortex (ACC) tracks the rate of reward
@@ -121,13 +127,27 @@ class NeuromodulatorSystem:
             + float(np.clip(error_magnitude, 0.0, 1.0)) * (1.0 - self.config.ne_decay)
         )
 
-        # ── Serotonin: prediction accuracy (dorsal raphe) ─────────────
-        # Tracks the mean absolute prediction error over a 100-step window.
-        # High serotonin = accurate predictions = stable environment model.
-        # This is ONE component of consolidation — the other is tonic DA
-        # (are rewards actually good?). Both are needed.
+        # ── Serotonin: combined prediction stability (dorsal raphe) ─────
+        # Biological basis (Doya 2002; Nakamura et al. 2008):
+        # Dorsal raphe nucleus integrates BOTH sensory prediction accuracy
+        # (via cortical afferents) AND reward prediction accuracy (via VTA/
+        # habenula). Serotonin should only be high when the agent genuinely
+        # understands its environment AND its behavioral outcomes are predictable.
+        #
+        # World model stability alone caused premature consolidation:
+        # agent could perfectly predict valley physics while having no idea
+        # how to reach the goal. Combined signal prevents this.
         avg_error = float(np.mean(self._error_history)) if self._error_history else 0.5
-        stability = float(np.clip(1.0 - avg_error, 0.0, 1.0))
+        world_stability = float(np.clip(1.0 - avg_error, 0.0, 1.0))
+
+        # Behavioral stability: how predictable are reward outcomes?
+        # 1/(1+|δ|) is self-normalizing: works regardless of reward scale.
+        self._td_history.append(float(np.clip(abs(td_error), 0.0, 10.0)))
+        avg_td_mag = float(np.mean(self._td_history)) if self._td_history else 5.0
+        behavioral_stability = float(1.0 / (1.0 + avg_td_mag))
+
+        # Geometric mean: BOTH must be stable for consolidation.
+        stability = float(np.sqrt(world_stability * behavioral_stability))
         self.serotonin = (
             self.serotonin * self.config.sero_decay
             + stability * (1.0 - self.config.sero_decay)
@@ -335,6 +355,7 @@ class NeuromodulatorSystem:
         self.serotonin = self.config.baseline_sero
         self._error_history.clear()
         self._reward_history.clear()
+        self._td_history.clear()
 
     def __repr__(self) -> str:  # pragma: no cover
         return (

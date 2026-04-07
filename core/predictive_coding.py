@@ -108,6 +108,13 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # POPRAWKA Bug C: Proaktywna inhibicja k-WTA przed relaxacją
         self._apply_proactive_inhibition()
 
+        # Membrane leak between timesteps (LIF consistency).
+        # Without this, voltages accumulated from the previous timestep's
+        # relaxation persist indefinitely, violating LIF physics.
+        # Biological basis: inter-spike membrane potential decays toward
+        # v_rest with time constant tau_m between input events.
+        self.v *= self._mem_decay
+
         # ZMODYFIKOWANE: Pętla relaksacji
         for i in range(self.pc_config.relaxation_steps):
             # 1. Przybliżenie obecnej aktywności na podstawie potencjału v
@@ -136,7 +143,11 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         self.refrac_count[in_refrac] -= 1
 
         # Wykorzystujemy zrelaksowany potencjał v do oceny spike'ów
-        thresh = self.v_thresh_adaptive if getattr(self, '_homeostatic', False) else self.config.v_thresh
+        if hasattr(self, 'v_thresh_adaptive'):
+            ne_drop = getattr(self, '_ne_level', 0.0) * self.config.ne_thresh_drop
+            thresh = self.v_thresh_adaptive - ne_drop
+        else:
+            thresh = self.config.v_thresh
         self.has_spiked = (self.v >= thresh) & ~in_refrac
 
         self.v[self.has_spiked] = self.config.v_reset

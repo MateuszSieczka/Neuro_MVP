@@ -41,17 +41,14 @@ class SNNAgent(Agent):
         self._use_trace = trace_decay > 0.0
 
         # Working Memory: activated when both world model and trace are used.
-        # For environments with very small state spaces (dim ≤ 4), the WM's
-        # LIF attractor dynamics may produce too sparse a signal. In that
-        # case the simple trace fallback provides more gradual temporal
-        # context. For higher-dimensional spaces, WM's attractor provides
-        # pattern completion and sustained representation that outperforms
-        # a simple exponential average.
-        self._use_working_memory = (
-            self._use_wm and self._use_trace and state_size > 4
-        )
+        # Biological grounding: prefrontal working memory operates regardless
+        # of input dimensionality. Even low-dimensional inputs are expanded
+        # into a higher-dimensional persistent attractor representation
+        # (Goldman-Rakic 1995). The minimum population size (8 neurons)
+        # ensures enough capacity for stable attractor dynamics.
+        self._use_working_memory = self._use_wm and self._use_trace
         if self._use_working_memory:
-            self._wm_num_neurons = state_size
+            self._wm_num_neurons = max(8, state_size)
             self.working_memory = WorkingMemoryModule(
                 num_external_inputs=state_size,
                 num_neurons=self._wm_num_neurons,
@@ -328,6 +325,15 @@ class SNNAgent(Agent):
                 reward=reward,
                 next_state=next_state.astype(np.float32),
                 ne_level=self.neuromod.noradrenaline,
+                bg_traces={
+                    'critic_e_h': self.bg.critic.e_h.copy(),
+                    'critic_e_v': self.bg.critic.e_v.copy(),
+                    'actor_e': self.bg.actor.e_actor.copy(),
+                },
+                aug_state=self._last_aug_state,
+                layer_traces={'encoder': self.world_model._encoder.e.copy()},
+                layer_outputs={'encoder': self.world_model._encoder.has_spiked.astype(np.float32)},
+                prediction_error=pred_error.copy(),
             )
 
         # 8. Faza snu (Offline Consolidation) na koniec epizodu
@@ -339,12 +345,17 @@ class SNNAgent(Agent):
                     action=ep.action,
                     reward=ep.reward,
                     next_state=ep.next_state,
-                    layer_traces={},
-                    layer_outputs={},
-                    prediction_error=np.zeros(self.state_size, dtype=np.float32),
+                    layer_traces=ep.layer_traces,
+                    layer_outputs=ep.layer_outputs,
+                    prediction_error=(
+                        ep.prediction_error
+                        if ep.prediction_error is not None
+                        else np.zeros(self.state_size, dtype=np.float32)
+                    ),
                     salience=ep.salience,
                     recorded_da=self.neuromod.learning_rate_modulation,
-                    bg_traces={},
+                    bg_traces=ep.bg_traces,
+                    aug_state=ep.aug_state,
                 )
 
             # 8b. Proportional sleep gain (VTA DA modulation of replay).
@@ -388,7 +399,13 @@ class SNNAgent(Agent):
                 bg=self.bg,
                 sleep_gain=sleep_gain,
             )
-            self.replay_buffer.clear()
+            # Biological basis (McClelland et al. 1995, Complementary Learning
+            # Systems): hippocampus maintains recent experience traces across
+            # multiple sleep cycles, not just one. The buffer's FIFO capacity
+            # limit naturally drops old experiences, modelling the days-to-weeks
+            # decay of hippocampal traces as they transfer to neocortex.
+            # Removing clear() allows successful trajectories to be replayed
+            # across multiple sleep phases, matching SWR multi-night replay.
 
         self._step_count += 1
 

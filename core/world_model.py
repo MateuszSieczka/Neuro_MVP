@@ -217,10 +217,17 @@ class SNNWorldModel:
             internal = enc.has_spiked.astype(np.float32)
             predicted_next = np.clip(internal @ self.w_decode, 0.0, 1.0)
 
-            state_change = float(
-                np.mean(np.abs(predicted_next - current_state_spikes[:self.state_size]))
-            )
-            novelty = float(np.clip(state_change / avg_baseline, 0.0, 1.0))
+            # Epistemic novelty: the PC encoder's internal prediction error
+            # reflects how uncertain the model is about this (state, action)
+            # transition.  High encoder PE = top-down vs bottom-up mismatch =
+            # model cannot confidently represent this input.
+            # This replaces the previous metric (state displacement) which
+            # confused "large physical movement" with "model uncertainty".
+            # Biological basis (Friston 2010): epistemic value = expected
+            # information gain from resolving model uncertainty, not from
+            # observing large state changes.
+            encoder_pe = float(np.mean(np.abs(enc.prediction_error)))
+            novelty = float(np.clip(encoder_pe / (avg_baseline + 1e-8), 0.0, 1.0))
             results[action] = {
                 "predicted_state": predicted_next,
                 "novelty": novelty,

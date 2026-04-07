@@ -25,7 +25,7 @@ Design:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -41,9 +41,24 @@ class Episode:
     next_state: np.ndarray
     salience: float = 1.0
 
+    # BG eligibility traces at time of encoding (Lansink et al. 2009).
+    # Enables proper credit assignment when replayed during sleep.
+    bg_traces: dict[str, np.ndarray] = field(default_factory=dict)
+    aug_state: np.ndarray | None = None
+    layer_traces: dict[str, np.ndarray] = field(default_factory=dict)
+    layer_outputs: dict[str, np.ndarray] = field(default_factory=dict)
+    prediction_error: np.ndarray | None = None
+
     def __post_init__(self) -> None:
         self.state = np.asarray(self.state, dtype=np.float32).copy()
         self.next_state = np.asarray(self.next_state, dtype=np.float32).copy()
+        self.bg_traces = {k: v.copy() for k, v in self.bg_traces.items()}
+        if self.aug_state is not None:
+            self.aug_state = self.aug_state.copy()
+        self.layer_traces = {k: v.copy() for k, v in self.layer_traces.items()}
+        self.layer_outputs = {k: v.copy() for k, v in self.layer_outputs.items()}
+        if self.prediction_error is not None:
+            self.prediction_error = self.prediction_error.copy()
 
 
 class EpisodicMemory:
@@ -87,6 +102,11 @@ class EpisodicMemory:
         reward: float,
         next_state: np.ndarray,
         ne_level: float,
+        bg_traces: dict[str, np.ndarray] | None = None,
+        aug_state: np.ndarray | None = None,
+        layer_traces: dict[str, np.ndarray] | None = None,
+        layer_outputs: dict[str, np.ndarray] | None = None,
+        prediction_error: np.ndarray | None = None,
     ) -> bool:
         """
         Attempt to store an episode.  Returns True if stored.
@@ -109,6 +129,11 @@ class EpisodicMemory:
             reward=reward,
             next_state=next_state,
             salience=float(np.clip(ne_level, 0.0, 1.0)),
+            bg_traces=bg_traces or {},
+            aug_state=aug_state,
+            layer_traces=layer_traces or {},
+            layer_outputs=layer_outputs or {},
+            prediction_error=prediction_error,
         )
 
         if len(self._episodes) < self.config.capacity:

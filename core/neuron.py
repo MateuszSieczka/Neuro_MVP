@@ -129,8 +129,11 @@ class LIFLayer:
         # 4. Spike detection — uses adaptive threshold if available
         #    Dark matter NE drop: high noradrenaline temporarily lowers
         #    the effective threshold, awakening reserve neurons.
-        if self._homeostatic:
-            ne_drop = self._ne_level * self.config.ne_thresh_drop
+        #    Note: v_thresh_adaptive exists for both HomeostaticLIFConfig
+        #    and CompetitiveLIFLayer (where _homeostatic is False but
+        #    _homeostatic_kwta manages k-WTA adaptation separately).
+        if hasattr(self, 'v_thresh_adaptive'):
+            ne_drop = getattr(self, '_ne_level', 0.0) * self.config.ne_thresh_drop
             thresh = self.v_thresh_adaptive - ne_drop
         else:
             thresh = np.float32(self.config.v_thresh)
@@ -195,7 +198,7 @@ class LIFLayer:
         Args:
             ne: Float in [0, 1]. High NE → lower effective threshold.
         """
-        if self._homeostatic:
+        if hasattr(self, '_ne_level'):
             self._ne_level = float(np.clip(ne, 0.0, 1.0))
 
     def set_plasticity_timescales(self, ne: float, ach: float = 0.5) -> None:

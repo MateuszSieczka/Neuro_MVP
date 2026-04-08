@@ -128,7 +128,22 @@ class SNNWorldModel:
         self.prediction_error: np.ndarray = np.zeros(state_size, dtype=np.float32)
         self.prediction_error_scalar: float = 0.0
         self._error_history: list[float] = []
+        # Running baseline for absolute epistemic novelty (EMA).
+        # Tracks average prediction uncertainty so mental_rehearsal can
+        # determine if a candidate action is MORE uncertain than usual
+        # (absolute novelty) rather than just ranking candidates (relative).
+        self._epistemic_baseline: float = 0.5
+        self._epistemic_baseline_decay: float = 0.95
 
+        # Running baseline for curiosity_signal() sensory adaptation.
+        # Biological basis (Ulanovsky et al. 2003; Katz et al. 2006):
+        # Cortical neurons adapt their response gain to the statistics
+        # of recent input. After sustained exposure to a stimulus,
+        # responses diminish (adaptation). But when a NOVEL stimulus
+        # appears, the response relative to adapted baseline is LARGE.
+        # This ensures novelty detection works even after overall PE drops.
+        self._curiosity_baseline: float = 0.3
+        self._curiosity_baseline_decay: float = 0.97  # τ ≈ 33 steps
     # ------------------------------------------------------------------
     # Encoder readout
     # ------------------------------------------------------------------
@@ -305,25 +320,35 @@ class SNNWorldModel:
 
             raw_results.append((action, raw_epistemic, predicted_next, step_predictions[-1]))
 
-        # ── Pass 2: relative novelty normalization ────────────────────
+        # ── Pass 2: absolute novelty normalization ────────────────────
+        # Biological basis (Bromberg-Martin & Hikosaka 2009): VTA novelty
+        # responses reflect ABSOLUTE information gain, not relative ranking.
+        # An action is epistemically valuable when it produces MORE
+        # prediction uncertainty than the agent's running baseline, not
+        # merely more than the other candidates.
+        #
+        # Previous relative normalization guaranteed one action always had
+        # novelty=1.0 even in fully familiar territory, injecting noise
+        # into action selection. Absolute novelty correctly reports "all
+        # familiar" (low values) vs "all novel" (high values).
         raw_values = np.array([r[1] for r in raw_results], dtype=np.float32)
-        pe_min = float(np.min(raw_values))
-        pe_range = float(np.max(raw_values) - pe_min)
+
+        # Update running epistemic baseline (EMA across rehearsal calls)
+        batch_mean = float(np.mean(raw_values))
+        d = self._epistemic_baseline_decay
+        self._epistemic_baseline = d * self._epistemic_baseline + (1 - d) * batch_mean
+        baseline = max(self._epistemic_baseline, 1e-6)
 
         results: dict[int, dict] = {}
         for action, raw_ep, predicted_next, _ in raw_results:
-            if pe_range > 1e-8:
-                # Relative novelty: rank within this batch of candidates.
-                # 0 = least novel candidate, 1 = most novel candidate.
-                novelty = float((raw_ep - pe_min) / pe_range)
-            else:
-                # All candidates equally (un)certain → neutral
-                novelty = 0.5
+            # Absolute novelty: ratio to running baseline, clipped to [0, 2]
+            # 0 = fully familiar, 1 = baseline surprise, 2 = extremely novel
+            novelty = float(np.clip(raw_ep / baseline, 0.0, 2.0))
 
             results[action] = {
                 "predicted_state": predicted_next,
                 "novelty": novelty,
-                "familiarity": 1.0 - novelty,
+                "familiarity": max(0.0, 1.0 - novelty),
             }
 
         # Restore full encoder state after all imagination
@@ -336,28 +361,41 @@ class SNNWorldModel:
         prediction_error: np.ndarray | None = None,
     ) -> float:
         """
-        Scalar intrinsic motivation from prediction error.
+        Scalar intrinsic motivation from decoder prediction error.
 
-        Combines encoder-level error (prediction_error attribute of the
-        PCLayer, in input space) and decoder-level state error to give a
-        richer novelty signal than either alone.
+        Uses ADAPTIVE BASELINE (sensory adaptation): the raw PE is compared
+        to a running average.  This prevents curiosity collapse — even when
+        absolute PE drops as the WM learns, a visit to a novel state produces
+        PE above the adapted baseline, generating strong curiosity.
 
         Returns:
-            Float in [0, 1] — suitable for NeuromodulatorSystem.update(novelty=...).
+            Float in [0, 2] — 1.0 = baseline surprise, >1 = novel, <1 = familiar.
         """
         if prediction_error is None:
             prediction_error = self.prediction_error
-        encoder_error = float(
-            np.clip(np.mean(np.abs(self._encoder.prediction_error)), 0.0, 1.0)
-        )
+
+        # Primary signal: decoder state prediction error
         decoder_error = float(
             np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0)
         )
-        # Arithmetic mean: either level being surprised contributes.
-        # Geometric mean suppressed curiosity when one level was near-zero
-        # (e.g. decoder well-fit but encoder still adapting), stalling
-        # exploration in the critical early phase.
-        return float(0.5 * encoder_error + 0.5 * decoder_error)
+
+        # Secondary: encoder prediction error (internal PC mismatch)
+        encoder_error = float(
+            np.clip(np.mean(np.abs(self._encoder.prediction_error)), 0.0, 1.0)
+        )
+
+        raw_curiosity = 0.7 * decoder_error + 0.3 * encoder_error
+
+        # Sensory adaptation: EMA baseline tracks average PE.
+        # When PE is at baseline → curiosity ≈ 1.0 (neutral).
+        # When PE spikes (novel state) → curiosity > 1.0 (explore!).
+        # When PE drops below baseline → curiosity < 1.0 (familiar).
+        d = self._curiosity_baseline_decay
+        self._curiosity_baseline = d * self._curiosity_baseline + (1 - d) * raw_curiosity
+        baseline = max(self._curiosity_baseline, 1e-6)
+
+        relative_curiosity = raw_curiosity / baseline
+        return float(np.clip(relative_curiosity, 0.0, 2.0))
 
     def set_ach_level(self, ach: float) -> None:
         """
@@ -370,6 +408,10 @@ class SNNWorldModel:
         """Clear running error history. Call between episodes."""
         self._error_history.clear()
         self.prediction_error_scalar = 0.0
+        self._epistemic_baseline = 0.5
+        # NOTE: do NOT reset _curiosity_baseline here — it must persist
+        # across episodes for sensory adaptation to work correctly.
+        # Resetting it would cause curiosity spikes at episode boundaries.
 
     def reset_state(self) -> None:
         """Reset transient state of encoder. Weights are preserved."""
@@ -378,6 +420,7 @@ class SNNWorldModel:
         self.last_prediction.fill(0.0)
         self.prediction_error.fill(0.0)
         self.prediction_error_scalar = 0.0
+        self._epistemic_baseline = 0.5
 
     # ------------------------------------------------------------------
     # Internal helpers

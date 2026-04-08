@@ -52,6 +52,11 @@ class Experience:
     # augmented vector. None means raw state == BG input (no augmentation).
     aug_state: np.ndarray | None = None
 
+    # Intrinsic curiosity signal at the time of this experience.
+    # Used during sleep replay to augment advantages when extrinsic
+    # reward is uninformative (Kakade & Dayan 2002).
+    curiosity: float = 0.0
+
     def __post_init__(self) -> None:
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
@@ -112,6 +117,7 @@ class ReplayBuffer:
         recorded_da: float = 0.0,
         bg_traces: dict[str, np.ndarray] | None = None,
         aug_state: np.ndarray | None = None,
+        curiosity: float = 0.0,
     ) -> None:
         if layer_errors is None:
             layer_errors = {}
@@ -125,6 +131,7 @@ class ReplayBuffer:
                 salience=salience, recorded_da=recorded_da,
                 bg_traces=bg_traces,
                 aug_state=aug_state,
+                curiosity=curiosity,
             )
         )
     # ------------------------------------------------------------------
@@ -231,28 +238,32 @@ class ReplayBuffer:
             if bg is not None:
                 _saved_td_rms = bg._td_rms
                 _all_advantages = []
+                _intrinsic_weight = 0.5  # Same as agent's intrinsic_reward_weight
                 for _i, _exp in enumerate(reversed(experiences)):
                     _G = cumulative_returns[_i]
+                    # Curiosity-augmented advantage: differentiate states
+                    # that were novel vs familiar even when extrinsic returns
+                    # are identical. This breaks the dead-variance trap where
+                    # all G_t are the same and BG sleep is skipped.
+                    _G_aug = _G + _intrinsic_weight * _exp.curiosity
                     _vs = bg.critic.peek(
                         _exp.aug_state if _exp.aug_state is not None else _exp.state
                     )
-                    _all_advantages.append(_G - _vs)
+                    _all_advantages.append(_G_aug - _vs)
                 _adv_arr = np.array(_all_advantages, dtype=np.float32)
                 _adv_mean = float(np.mean(_adv_arr))
                 _adv_std = float(np.std(_adv_arr)) + 1e-8
                 _max_abs = float(np.max(np.abs(_adv_arr))) + 1e-8
 
-                # Variance guard (Ambrose et al. 2016): when all advantages
-                # are near-zero noise (agent stuck, V ≈ G everywhere), SWR
-                # replay has no meaningful signal to consolidate. Normalizing
-                # this noise to [-1, 1] would teach the actor random
-                # preferences. Skip BG sleep entirely in this case.
-                if _adv_std < 0.5:
-                    _sleep_adv_normalized = None
-                else:
-                    # Normalize by max absolute value: bounds signal to [-1, 1]
-                    # per step, preventing any single advantage from dominating.
-                    _sleep_adv_normalized = _adv_arr / _max_abs
+                # Soft variance guard: instead of hard skip at _adv_std < 0.5,
+                # attenuate the signal proportionally. Even low-variance
+                # advantages contain directional information that helps
+                # the critic learn spatial value gradients.
+                # Biological basis: SWR replay occurs even during poor
+                # performance — it just has lower gain (Diekelmann & Born 2010).
+                _variance_scale = float(np.clip(_adv_std / 0.5, 0.1, 1.0))
+                # Normalize by max absolute value: bounds signal to [-1, 1]
+                _sleep_adv_normalized = (_adv_arr / _max_abs) * _variance_scale
 
             # Hippocampal reverse replay: most recent experience first
             for i, exp in enumerate(reversed(experiences)):

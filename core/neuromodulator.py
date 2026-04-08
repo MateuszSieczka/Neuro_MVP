@@ -141,17 +141,24 @@ class NeuromodulatorSystem:
         # habenula). Serotonin should only be high when the agent genuinely
         # understands its environment AND its behavioral outcomes are predictable.
         #
-        # World model stability alone caused premature consolidation:
-        # agent could perfectly predict valley physics while having no idea
-        # how to reach the goal. Combined signal prevents this.
+        # CRITICAL FIX: behavioral_stability = 1/(1+|td|) was ~1.0 whenever V(s)
+        # is flat (even at V=-200, td≈0), falsely signaling "stable behavior".
+        # Now gated by tonic_da: low tonic_da (no extrinsic reward found) →
+        # behavioral_stability contribution near-zero regardless of TD accuracy.
+        # Biologically: dorsal raphe receives reward magnitude signals from VTA
+        # (Nakamura et al. 2008). Serotonin = "things going WELL AND PREDICTABLY".
         avg_error = float(np.mean(self._error_history)) if self._error_history else 0.5
         world_stability = float(np.clip(1.0 - avg_error, 0.0, 1.0))
 
         # Behavioral stability: how predictable are reward outcomes?
-        # 1/(1+|δ|) is self-normalizing: works regardless of reward scale.
+        # Gated by reward quality: sigmoid(tonic_da * 4 - 2) ranges from
+        # ~0.12 (tDA=0) to ~0.88 (tDA=1). Without extrinsic reward,
+        # "low TD error" is meaningless for stability.
         self._td_history.append(float(np.clip(abs(td_error), 0.0, 10.0)))
         avg_td_mag = float(np.mean(self._td_history)) if self._td_history else 5.0
-        behavioral_stability = float(1.0 / (1.0 + avg_td_mag))
+        td_stability = float(1.0 / (1.0 + avg_td_mag))
+        reward_quality = float(1.0 / (1.0 + np.exp(-(self.tonic_da * 4.0 - 2.0))))
+        behavioral_stability = td_stability * reward_quality
 
         # Geometric mean: BOTH must be stable for consolidation.
         stability = float(np.sqrt(world_stability * behavioral_stability))
@@ -190,11 +197,9 @@ class NeuromodulatorSystem:
         # Biologiczna interpretacja (Tobler et al. 2005): when all experienced
         # rewards are identical, the VTA has no basis to distinguish good
         # from bad policy — its phasic response is zero and tonic firing
-        # reflects absence of reward prediction signal.  signal=0.0 keeps
-        # tonic DA at its baseline (0.0), maintaining full exploration.
-        # The 0.5 fallback was causing premature exploration reduction in
-        # sparse-reward environments where all episodes return the same
-        # score until the first success.
+        # reflects absence of reward prediction signal.
+        # HOWEVER: intrinsic progress (world model improvement) can still
+        # provide a tonic DA signal even without extrinsic reward variation.
         if max_r - min_r < 1e-6:
             reward_signal = 0.0
         else:

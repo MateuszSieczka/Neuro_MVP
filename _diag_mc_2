@@ -1,0 +1,53 @@
+"""Advanced diagnostic for MountainCar: internal Active Inference tug-of-war."""
+import numpy as np
+from arena.gym_env import GymEnv
+from arena.agent_factory import make_agent
+from arena import task_config
+
+task = task_config.get("MountainCar-v0")
+np.random.seed(23)
+env = GymEnv(task.env_id, normalize=True, fixed_bounds=task.obs_bounds, reward_scale=task.reward_scale)
+env.reset(seed=23)
+agent = make_agent(task, env)
+
+print(f"{'Ep':>3} | {'R':>6} | {'Step':>4} | {'Action':>6} | {'Pragmatic (Logits)':>25} | {'Epistemic (Curiosity)':>25} | {'Total (Winning)':>25}")
+print("-" * 115)
+
+for ep in range(500):
+    state = env.reset()
+    agent.reset()
+    ep_reward = 0.0
+    
+    for step in range(task.max_steps):
+        action = agent.act(state)
+        next_state, reward, done, info = env.step(action)
+        agent.observe(state, action, reward, next_state, done, info)
+        
+        ep_reward += reward
+        state = next_state
+        
+        # Wyświetlamy dogłębną diagnozę co 25 kroków, by nie zalać konsoli
+        if ep < 5 and step % 25 == 0 and agent._use_wm:
+            ai = agent.active_inference
+            prag = ai.last_pragmatic_values
+            epis = ai.last_epistemic_values
+            tot = ai.last_total_values
+            
+            # Formatujemy słowniki do czytelnych stringów
+            p_str = f"[{prag.get(0,0):.2f}, {prag.get(1,0):.2f}, {prag.get(2,0):.2f}]"
+            e_str = f"[{epis.get(0,0):.2f}, {epis.get(1,0):.2f}, {epis.get(2,0):.2f}]"
+            t_str = f"[{tot.get(0,0):.2f}, {tot.get(1,0):.2f}, {tot.get(2,0):.2f}]"
+            
+            # Akcja 0: Lewo, 1: Nic, 2: Prawo
+            act_names = ["Left", "None", "Right"]
+            
+            print(f"{ep:3d} | {ep_reward:6.1f} | {step:4d} | {act_names[action]:>6} | {p_str:>25} | {e_str:>25} | {t_str:>25}")
+
+        if done:
+            break
+            
+    # Podsumowanie epizodu (co 5 epizodów)
+    if ep % 5 == 0 or ep_reward > -190:
+        print(f"\n--- Koniec Epizodu {ep}: V_end={agent.bg.last_v:.2f}, R={ep_reward:.1f}, Noise={agent.bg.actor.noise_scale:.2f} ---\n")
+
+env.close()

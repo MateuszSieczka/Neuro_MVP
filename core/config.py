@@ -242,7 +242,7 @@ class EpisodicMemoryConfig:
                         considered a duplicate (not stored again).
     capacity:           Maximum number of stored episodes.
     """
-    ne_threshold: float = 0.7
+    ne_threshold: float = 0.3
     similarity_thresh: float = 0.85
     capacity: int = 500
 
@@ -292,4 +292,4 @@ class ActiveInferenceConfig:
     ne_epistemic_boost: float = 1.0
     uncertainty_method: str = "novelty"
     n_candidates: int = 8
-    pragmatic_temperature: float = 1.0
+    pragmatic_temperature: float = 0.3

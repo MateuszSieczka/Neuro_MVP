@@ -96,6 +96,18 @@ class SNNAgent(Agent):
         self._episode_steps: int = 0
         self._last_aug_state: np.ndarray | None = None  # Cached augmented state from act()
 
+        # ── Intrinsic curiosity reward (Hippocampal-VTA loop) ────────
+        # Biological basis (Kakade & Dayan 2002; Lisman & Grace 2005):
+        # VTA dopamine neurons respond to NOVELTY as well as reward.
+        # The hippocampal-VTA loop sends novelty signals that directly
+        # modulate dopaminergic RPE. This intrinsic reward prevents the
+        # dead-gradient trap where V(s) converges to a flat constant
+        # and TD error → 0 in sparse-reward environments.
+        # Weight is modulated by (1 - tonic_da): when extrinsic reward
+        # is found, intrinsic drive fades — pure Active Inference.
+        self._intrinsic_reward_weight: float = 0.5
+        self._last_curiosity: float = 0.0  # Curiosity at current step
+
         # ── Exploration noise smoothing (D1/D2 receptor inertia) ─────
         # Biological basis: striatal receptor density changes over
         # hours/days, not per-step. A single bad episode should NOT
@@ -166,14 +178,26 @@ class SNNAgent(Agent):
         self._update_trace(state)
         self._last_aug_state = aug.copy()  # Cache for replay buffer in observe()
 
-        # ── Motor program persistence check ──────────────────────────
-        # If a motor program is still running, repeat the committed action.
-        # The actor and critic still forward-pass to maintain membrane state
-        # and eligibility traces, but the action is predetermined.
+        # Always compute V(s) for proper TD error in observe()
+        self.bg.last_v = self.bg.critic.forward(aug)
+
+        # ── Motor program commitment (BG action persistence) ─────────
+        # Biological basis (Redgrave et al. 2010; Bogacz et al. 2010):
+        # Basal ganglia motor programs span multiple timesteps — once
+        # selected, a program executes for its characteristic duration
+        # before re-evaluation. This mirrors the ~200ms minimum
+        # inter-decision interval in primate motor cortex.
+        #
+        # Commitment duration depends on decision confidence (entropy
+        # of the actor's action distribution). Low entropy = confident
+        # → longer program (up to 5 steps). High entropy = uncertain
+        # → shorter program (2 steps). This models the evidence-
+        # accumulation-to-threshold framework: confident decisions
+        # commit more strongly.
         if self._action_commitment_remaining > 0:
             self._action_commitment_remaining -= 1
+            # Maintain eligibility trace for committed action
             self.bg.actor.forward(aug, forced_action=self._committed_action)
-            self.bg.last_v = self.bg.critic.forward(aug)
             return self._committed_action
 
         if self._use_wm:
@@ -184,7 +208,6 @@ class SNNAgent(Agent):
             candidate_actions = list(range(self.n_actions))
             selected_action = self.active_inference.select_action(
                 state_spikes=state.astype(np.float32),
-                # <--- POPRAWKA: Przekazujemy czysty 'state', a nie rozszerzony 'aug'!
                 candidate_actions=candidate_actions,
                 pragmatic_values=pragmatic_values,
                 ne_level=self.neuromod.noradrenaline
@@ -195,21 +218,21 @@ class SNNAgent(Agent):
             # Fallback dla środowisk gęstych bez modelu świata (standardowa eksploracja z szumem)
             self.bg.actor.forward(aug)
 
-        # Forward Krytyka (V(s))
-        self.bg.last_v = self.bg.critic.forward(aug)
+        action = self.bg.actor.get_action()
 
-        # ── Commit to a motor program ────────────────────────────────
-        # Duration modulated by serotonin (Doya 2002): 5-HT encodes the
-        # temporal discount horizon. High 5-HT → long commitment (patient);
-        # low 5-HT → short commitment (impulsive, explores faster).
-        # Range: [2, 6] steps — enough for momentum but not so long that
-        # the agent ignores environmental feedback.
-        sero = self.neuromod.serotonin if hasattr(self, 'neuromod') else 0.5
-        commitment_steps = max(2, min(6, int(2 + sero * 4)))
-        self._committed_action = self.bg.actor.get_action()
-        self._action_commitment_remaining = commitment_steps - 1  # -1: current step counts
+        # Commit to this motor program for a few steps.
+        # Duration: 4 (uncertain) to 7 (confident), using actor entropy.
+        # MountainCar oscillation half-period ≈ 36 steps.  With 4-step
+        # commitment, lucky same-action streaks of 12-16 steps (~3-4
+        # decisions) occur with probability ~4% per episode — enough
+        # to occasionally build momentum.  Over 100+ episodes this gives
+        # the critic diverse position data for V(s) differentiation.
+        confidence = 1.0 - self.bg.actor.action_entropy  # 0 = uniform, 1 = certain
+        commit_extra = 3 + int(3 * confidence)  # 4..7 total steps
+        self._committed_action = action
+        self._action_commitment_remaining = commit_extra
 
-        return self.bg.actor.get_action()
+        return action
     def _peek_value(self, state_spikes: np.ndarray) -> float:
         """Bezpieczny podgląd V(s') bez niszczenia śladów membrany Krytyka."""
         return self.bg.critic.peek(state_spikes)
@@ -222,12 +245,33 @@ class SNNAgent(Agent):
         is_truncated = info.get("truncated", False) if info else False
         is_terminal = done and not is_truncated
 
-        # 1. Czyste wyliczenie błędu TD
+        # 1. Curiosity-augmented reward (Hippocampal-VTA loop)
+        #    Compute curiosity BEFORE world_model.update() so it reflects
+        #    PRE-learning surprise, not post-update residual.
+        #    Biological basis (Lisman & Grace 2005): hippocampal novelty
+        #    signal reaches VTA BEFORE dopaminergic learning updates synapses.
+        if self._use_wm:
+            self._last_curiosity = self.world_model.curiosity_signal()
+        else:
+            self._last_curiosity = 0.0
+
+        # Intrinsic reward: NOT gated by tonic_da.
+        # Biological basis (Bromberg-Martin & Hikosaka 2009): VTA has
+        # SEPARATE populations for reward-coding (medial) and novelty-
+        # coding (lateral) dopamine neurons.  Novelty responses persist
+        # independently of reward learning.  Previous (1 - tonic_da)
+        # gating created a self-defeating loop: WM learning progress
+        # raised tonic_da (via intrinsic_signal), which then suppressed
+        # the very curiosity drive that was enabling exploration —
+        # killing the signal before extrinsic reward was ever found.
+        intrinsic_r = self._intrinsic_reward_weight * self._last_curiosity
+        effective_reward = reward + intrinsic_r
+
         if is_terminal:
-            td_error = reward - self.bg.last_v
+            td_error = effective_reward - self.bg.last_v
         else:
             next_v = self._peek_value(next_aug)
-            td_error = reward + self.bg.config.gamma * next_v - self.bg.last_v
+            td_error = effective_reward + self.bg.config.gamma * next_v - self.bg.last_v
 
         clipped_td = float(np.clip(td_error, -10.0, 10.0))
 
@@ -273,12 +317,14 @@ class SNNAgent(Agent):
             # Using raw |TD| caused m_t ≈ 10 in early learning, destabilizing
             # the world model's encoder weights.
             wm_m_t = max(self.neuromod.learning_rate_modulation, 0.1)
+            # Curiosity was already computed BEFORE TD (Step 1.3: pre-update surprise)
+            pre_update_curiosity = self._last_curiosity
             pred_error = self.world_model.update(
                 state_f32, action, next_f32, m_t=wm_m_t
             )
             self.neuromod.update(
                 prediction_error=pred_error, td_error=td_error,
-                novelty=self.world_model.curiosity_signal(),
+                novelty=pre_update_curiosity,
             )
         else:
             # Soft-normalize TD error to [0,1] for neuromodulator.
@@ -356,6 +402,7 @@ class SNNAgent(Agent):
                 recorded_da=self.neuromod.learning_rate_modulation,  # Zamrożony sygnał DA!
                 bg_traces=bg_traces,
                 aug_state=self._last_aug_state,
+                curiosity=self._last_curiosity,
             )
 
             # 7b. Episodic Memory: NE-gated one-shot storage (hippocampal CA3).

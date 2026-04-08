@@ -341,11 +341,15 @@ class ReplayBuffer:
 
                     # Asymmetric sleep plasticity (Ambrose et al. 2016):
                     # Positive advantages (states better than V predicts)
-                    # get stronger consolidation. Over many episodes, this
-                    # makes success-adjacent states accumulate relatively
-                    # higher V while all V drifts toward correct scale.
-                    SLEEP_POS_RATIO = 0.5
-                    SLEEP_NEG_RATIO = 0.1
+                    # get stronger consolidation. Ratios scale inversely
+                    # with number of replayed experiences to keep total
+                    # sleep-phase weight update bounded regardless of
+                    # episode length. Biological basis: hippocampal SWR
+                    # replay gain decreases with replay count (Karlsson &
+                    # Frank 2009) — many replays each contribute less.
+                    n_exp = max(len(experiences), 1)
+                    SLEEP_POS_RATIO = 0.5 / n_exp * 200  # ≈0.5 at 200 steps, ≈1.0 at 100
+                    SLEEP_NEG_RATIO = 0.1 / n_exp * 200
                     ratio = SLEEP_POS_RATIO if norm_adv >= 0 else SLEEP_NEG_RATIO
                     sleep_signal = norm_adv * ratio * sleep_gain
 

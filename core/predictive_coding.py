@@ -115,6 +115,14 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # v_rest with time constant tau_m between input events.
         self.v *= self._mem_decay
 
+        # POPRAWKA Bug D: ff_drive injected ONCE into membrane potential
+        # before relaxation begins (models thalamo-cortical volley arriving
+        # at the start of the processing cycle). Previously ff_drive was
+        # summed into combined_gradient inside every iteration of the
+        # relaxation loop, causing 10×0.1 = 1.0× accumulation that drove
+        # 22/32 neurons above threshold and defeated k-WTA (should be k=4).
+        self.v += ff_drive
+
         # ZMODYFIKOWANE: Pętla relaksacji
         for i in range(self.pc_config.relaxation_steps):
             # 1. Przybliżenie obecnej aktywności na podstawie potencjału v
@@ -126,14 +134,20 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
             # 3. Błąd predykcji (co dostajemy vs co przewidujemy)
             self.prediction_error = pre_f32 - my_prediction
 
-            # 4. Gradient łączony: błąd PC + top-down + POPRAWKA: ff_drive z self.w
+            # 4. Gradient: ACh-weighted bottom-up error + top-down prediction.
+            #    ACh → 1.0: trust sensory input (novel environment)
+            #    ACh → 0.0: trust internal predictions (familiar state)
+            #    Biological basis (Hasselmo 2006): ACh from basal forebrain
+            #    suppresses top-down feedback in superficial cortical layers
+            #    while enhancing bottom-up processing.
             error_gradient = self.prediction_error @ self.feedback_w.T
-            combined_gradient = error_gradient + self.top_down_prediction + ff_drive
+            combined_gradient = (self.ach_level * error_gradient
+                                 + (1.0 - self.ach_level) * self.top_down_prediction)
 
             if np.linalg.norm(combined_gradient) < self.pc_config.relaxation_threshold:
                 break
 
-            # 5. Aktualizacja potencjału (gradient łączony: dół + góra + feedforward)
+            # 5. Aktualizacja potencjału (gradient łączony: dół + góra)
             self.v += self.pc_config.relaxation_rate * combined_gradient
             np.clip(self.v, self.config.v_reset, self.config.v_thresh + 10.0, out=self.v)
 

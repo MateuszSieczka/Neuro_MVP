@@ -110,9 +110,21 @@ class NeuromodulatorSystem:
         if novelty is None:
             novelty = float(np.clip(error_magnitude, 0.0, 1.0))
 
-        # ── Phasic Dopamine: RPE via logistic sigmoid ─────────────────
-        # Logistic sigmoid: td=0 → 0.5 (neutral), td>0 → >0.5, td<0 → <0.5.
-        rpe_signal = float(1.0 / (1.0 + np.exp(-td_error)))
+        # ── Phasic Dopamine: adaptive-gain linear RPE (Tobler et al. 2005) ──
+        # Real VTA DA neurons scale their gain to the variance of recent RPE:
+        #   DA_phasic = baseline + td / (rms_td + eps)
+        # This gives FULL [0, 1] range (not the sigmoid's [0.4, 0.6] band).
+        # At td=0 → DA=0.5 (neutral). td=+rms → DA≈0.85. td=-rms → DA≈0.15.
+        # The running RMS adapts the gain: high-variance phases → low gain
+        # (preventing instability), low-variance → high gain (fine-tuning).
+        self._da_rms = getattr(self, '_da_rms', 1.0)
+        self._da_rms = float(np.sqrt(
+            0.99 * self._da_rms ** 2 + 0.01 * td_error ** 2
+        ))
+        da_gain = 0.35 / max(self._da_rms, 0.1)
+        rpe_signal = float(np.clip(
+            self.config.baseline_da + da_gain * td_error, 0.0, 1.0
+        ))
 
         self.dopamine = (
                 self.dopamine * self.config.da_decay

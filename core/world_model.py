@@ -135,15 +135,15 @@ class SNNWorldModel:
         self._epistemic_baseline: float = 0.5
         self._epistemic_baseline_decay: float = 0.95
 
-        # Running baseline for curiosity_signal() sensory adaptation.
+        # Running statistics for curiosity_signal() normalization.
         # Biological basis (Ulanovsky et al. 2003; Katz et al. 2006):
         # Cortical neurons adapt their response gain to the statistics
-        # of recent input. After sustained exposure to a stimulus,
-        # responses diminish (adaptation). But when a NOVEL stimulus
-        # appears, the response relative to adapted baseline is LARGE.
-        # This ensures novelty detection works even after overall PE drops.
-        self._curiosity_baseline: float = 0.3
-        self._curiosity_baseline_decay: float = 0.97  # τ ≈ 33 steps
+        # of recent input — but on a SLOW timescale (seconds to minutes,
+        # not per-step). We track mean and variance of raw PE over a long
+        # window to normalize curiosity into a meaningful range where
+        # novel states produce clearly higher signals than familiar ones.
+        self._curiosity_history: list[float] = []
+        self._curiosity_history_maxlen: int = 2000  # ~10 episodes of history
     # ------------------------------------------------------------------
     # Encoder readout
     # ------------------------------------------------------------------
@@ -363,39 +363,51 @@ class SNNWorldModel:
         """
         Scalar intrinsic motivation from decoder prediction error.
 
-        Uses ADAPTIVE BASELINE (sensory adaptation): the raw PE is compared
-        to a running average.  This prevents curiosity collapse — even when
-        absolute PE drops as the WM learns, a visit to a novel state produces
-        PE above the adapted baseline, generating strong curiosity.
+        Uses SLOW GLOBAL NORMALIZATION: raw PE is z-scored against a long
+        history window (2000 steps ≈ 10 episodes). This produces a genuine
+        spatial gradient — well-predicted states get low curiosity, novel
+        states get high curiosity. The slow window prevents the per-step
+        EMA collapse that made curiosity ≈ 1.0 everywhere.
+
+        Biological basis (Kakade & Dayan 2002): novelty signals in
+        hippocampal-VTA loop reflect ABSOLUTE prediction quality, not
+        moment-to-moment adaptation. A state the animal has never visited
+        produces strong hippocampal mismatch regardless of recent experience.
 
         Returns:
-            Float in [0, 2] — 1.0 = baseline surprise, >1 = novel, <1 = familiar.
+            Float in [0, 2] — 0 = perfectly predicted, 1 = average surprise,
+            >1 = above-average surprise (novel).
         """
         if prediction_error is None:
             prediction_error = self.prediction_error
 
-        # Primary signal: decoder state prediction error
-        decoder_error = float(
-            np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0)
-        )
+        # Primary signal: decoder state prediction error (MSE)
+        decoder_error = float(np.mean(prediction_error ** 2))
 
         # Secondary: encoder prediction error (internal PC mismatch)
-        encoder_error = float(
-            np.clip(np.mean(np.abs(self._encoder.prediction_error)), 0.0, 1.0)
-        )
+        encoder_error = float(np.mean(self._encoder.prediction_error ** 2))
 
         raw_curiosity = 0.7 * decoder_error + 0.3 * encoder_error
 
-        # Sensory adaptation: EMA baseline tracks average PE.
-        # When PE is at baseline → curiosity ≈ 1.0 (neutral).
-        # When PE spikes (novel state) → curiosity > 1.0 (explore!).
-        # When PE drops below baseline → curiosity < 1.0 (familiar).
-        d = self._curiosity_baseline_decay
-        self._curiosity_baseline = d * self._curiosity_baseline + (1 - d) * raw_curiosity
-        baseline = max(self._curiosity_baseline, 1e-6)
+        # Slow global normalization: z-score against long history.
+        # This provides a genuine gradient: novel states have PE >> mean,
+        # well-predicted states have PE << mean.
+        self._curiosity_history.append(raw_curiosity)
+        if len(self._curiosity_history) > self._curiosity_history_maxlen:
+            self._curiosity_history = self._curiosity_history[-self._curiosity_history_maxlen:]
 
-        relative_curiosity = raw_curiosity / baseline
-        return float(np.clip(relative_curiosity, 0.0, 2.0))
+        if len(self._curiosity_history) < 10:
+            # Not enough history yet — return raw PE capped at 2.0
+            return float(np.clip(raw_curiosity * 2.0, 0.0, 2.0))
+
+        hist = np.array(self._curiosity_history)
+        mu = float(np.mean(hist))
+        sigma = float(np.std(hist)) + 1e-8
+
+        # z-score: 0 = mean surprise, positive = above-average (novel)
+        # Map to [0, 2]: add 1.0 so mean maps to 1.0, novel > 1.0, familiar < 1.0
+        z = (raw_curiosity - mu) / sigma
+        return float(np.clip(1.0 + 0.5 * z, 0.0, 2.0))
 
     def set_ach_level(self, ach: float) -> None:
         """
@@ -409,9 +421,8 @@ class SNNWorldModel:
         self._error_history.clear()
         self.prediction_error_scalar = 0.0
         self._epistemic_baseline = 0.5
-        # NOTE: do NOT reset _curiosity_baseline here — it must persist
-        # across episodes for sensory adaptation to work correctly.
-        # Resetting it would cause curiosity spikes at episode boundaries.
+        # NOTE: do NOT reset _curiosity_history here — it must persist
+        # across episodes for slow normalization to work correctly.
 
     def reset_state(self) -> None:
         """Reset transient state of encoder. Weights are preserved."""

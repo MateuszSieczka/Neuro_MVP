@@ -221,14 +221,14 @@ class SNNAgent(Agent):
         action = self.bg.actor.get_action()
 
         # Commit to this motor program for a few steps.
-        # Duration: 4 (uncertain) to 7 (confident), using actor entropy.
-        # MountainCar oscillation half-period ≈ 36 steps.  With 4-step
-        # commitment, lucky same-action streaks of 12-16 steps (~3-4
-        # decisions) occur with probability ~4% per episode — enough
-        # to occasionally build momentum.  Over 100+ episodes this gives
-        # the critic diverse position data for V(s) differentiation.
+        # Duration: 2 (uncertain) to 5 (confident), using actor entropy.
+        # Biological basis (Cisek & Kalaska 2010): basal ganglia motor
+        # programs span multiple timesteps. Commitment duration scales
+        # with decision confidence — uncertain decisions are revisited
+        # quickly while confident decisions persist. Range 2-5 balances
+        # reactivity (CartPole) with momentum building (MountainCar).
         confidence = 1.0 - self.bg.actor.action_entropy  # 0 = uniform, 1 = certain
-        commit_extra = 3 + int(3 * confidence)  # 4..7 total steps
+        commit_extra = 1 + int(4 * confidence)  # 2..5 total steps
         self._committed_action = action
         self._action_commitment_remaining = commit_extra
 
@@ -255,15 +255,14 @@ class SNNAgent(Agent):
         else:
             self._last_curiosity = 0.0
 
-        # Intrinsic reward: NOT gated by tonic_da.
-        # Biological basis (Bromberg-Martin & Hikosaka 2009): VTA has
-        # SEPARATE populations for reward-coding (medial) and novelty-
-        # coding (lateral) dopamine neurons.  Novelty responses persist
-        # independently of reward learning.  Previous (1 - tonic_da)
-        # gating created a self-defeating loop: WM learning progress
-        # raised tonic_da (via intrinsic_signal), which then suppressed
-        # the very curiosity drive that was enabling exploration —
-        # killing the signal before extrinsic reward was ever found.
+        # Intrinsic reward from novelty (hippocampal-VTA loop).
+        # With z-score curiosity normalization (Step 1.2), curiosity now
+        # genuinely varies across states: novel states get cur > 1,
+        # familiar states get cur < 1. The raw product with curiosity
+        # provides BOTH a tonic exploration bonus (V shift) AND a
+        # directional gradient toward novel regions.
+        # Biological basis (Bromberg-Martin & Hikosaka 2009): VTA lateral
+        # population fires proportionally to mismatch.
         intrinsic_r = self._intrinsic_reward_weight * self._last_curiosity
         effective_reward = reward + intrinsic_r
 
@@ -290,14 +289,17 @@ class SNNAgent(Agent):
         #    (a) consistently rewarded (high tonic DA from VTA), AND
         #    (b) making stable predictions (high serotonin from raphe).
         #    Gate = sqrt(tonic_DA × 5-HT), requiring both signals.
-        #    Linear scaling with low floor models the transition from
-        #    early-phase LTP (labile, high plasticity) to late-phase L-LTP
-        #    (protein-synthesis-dependent, protected). The floor at 0.05
-        #    corresponds to the minimal synaptic modification that occurs
-        #    even during deep consolidation (Frey & Morris 1997).
-        #    gate=0 → 1.0, gate=0.5 → 0.50, gate=0.9 → 0.10, gate=0.95 → 0.05
+        #
+        #    SOFTENED mapping (previous 1-gate caused oscillatory regression):
+        #    The original linear map (gate=0.9 → plasticity=0.10) crushed
+        #    learning too drastically after initial success, causing the
+        #    agent to forget before consolidation was complete.
+        #    New sigmoid-like curve: plasticity stays near 1.0 for gate < 0.5,
+        #    then gradually drops to floor=0.3 at gate=1.0.
+        #    This matches the biological observation that late-phase L-LTP
+        #    reduces but does not eliminate plasticity (Frey & Morris 1997).
         gate = self.neuromod.consolidation_gate
-        plasticity_scale = max(0.05, 1.0 - gate)
+        plasticity_scale = 0.3 + 0.7 / (1.0 + np.exp(8.0 * (gate - 0.7)))
 
         self.bg.critic.update(norm_td * plasticity_scale)
         self.bg.actor.update(norm_td * plasticity_scale)
@@ -326,6 +328,27 @@ class SNNAgent(Agent):
                 prediction_error=pred_error, td_error=td_error,
                 novelty=pre_update_curiosity,
             )
+
+            # 4a. Working Memory weight update (prefrontal three-factor STDP).
+            #     Biological basis (Compte et al. 2000): PFC attractor
+            #     dynamics are shaped by STDP that depends on dopaminergic
+            #     prediction error. Without this, w_ff stays at random init
+            #     and WM content is a meaningless static projection.
+            #     pred_error from world model serves as local error signal
+            #     for WM neurons (prediction errors propagate top-down in
+            #     the cortical hierarchy).
+            if self._use_working_memory:
+                # Compute WM-local prediction error: how well does current
+                # WM content predict the new sensory input?
+                wm_pred = self.working_memory.content[:self.state_size] if self.state_size <= self.working_memory.num_neurons else self.working_memory.content
+                wm_pe = np.zeros(self.working_memory.num_neurons, dtype=np.float32)
+                # Broadcast world model error to WM neuron space
+                pe_len = min(len(pred_error), self.working_memory.num_neurons)
+                wm_pe[:pe_len] = pred_error[:pe_len]
+                self.working_memory.prediction_error = wm_pe
+                self.working_memory.update_weights(
+                    m_t=wm_m_t, pred_error=wm_pe,
+                )
         else:
             # Soft-normalize TD error to [0,1] for neuromodulator.
             norm_td = float(abs(td_error) / (1.0 + abs(td_error)))

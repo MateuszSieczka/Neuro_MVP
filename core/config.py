@@ -208,6 +208,12 @@ class SNNWorldModelConfig:
                             action during mental_rehearsal().  Multiple steps
                             let the membrane accumulate action-specific signal
                             so k-WTA can differentiate subtly different inputs.
+    n_neurons_per_dim:      Population coding density for continuous state
+                            dimensions. Each dimension is encoded by this many
+                            Gaussian receptive fields (place cells). Higher
+                            values give finer spatial resolution but increase
+                            encoder input size. 0 = disable population coding
+                            (pass raw values). Ref: Pouget et al. 2000.
     """
     hidden_size: int = 64
     decode_lr: float = 0.005
@@ -217,6 +223,7 @@ class SNNWorldModelConfig:
     window_ms: int = 50
     i_inh: float = 50.0
     rehearsal_steps: int = 5
+    n_neurons_per_dim: int = 15
 
 
 @dataclass(frozen=True, kw_only=True)

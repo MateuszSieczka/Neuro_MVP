@@ -1,6 +1,7 @@
 import numpy as np
 
 from .config import SNNWorldModelConfig, PredictiveCodingConfig
+from .spike_encoder import GaussianPopulationEncoder
 
 
 
@@ -79,8 +80,27 @@ class SNNWorldModel:
         self.config = config or SNNWorldModelConfig()
         self.state_size = state_size
         self.action_size = action_size
-        self.input_size = state_size + action_size
         self.hidden_size = self.config.hidden_size
+
+        # ── Population coding (Pouget et al. 2000) ───────────────────
+        # Converts low-dimensional continuous state into a distributed
+        # population representation where every neuron fires at a
+        # non-negative rate.  This fixes two issues:
+        #   1. STDP traces (pre_active = pre_spikes > 0) can now see
+        #      all state dimensions, including negative values.
+        #   2. Representational capacity scales with n_neurons_per_dim,
+        #      not raw state dimensionality.
+        if self.config.n_neurons_per_dim > 0:
+            self._pop_encoder = GaussianPopulationEncoder(
+                n_dims=state_size,
+                n_neurons_per_dim=self.config.n_neurons_per_dim,
+            )
+            encoded_state_size = self._pop_encoder.output_size
+        else:
+            self._pop_encoder = None
+            encoded_state_size = state_size
+
+        self.input_size = encoded_state_size + action_size
 
         # ── Encoder: PredictiveCodingLayer ────────────────────────────
         encoder_pc_config = PredictiveCodingConfig(
@@ -162,7 +182,7 @@ class SNNWorldModel:
         self._last_internal_spikes = internal_activity
 
         raw = internal_activity @ self.w_decode
-        self.last_prediction = np.clip(raw, 0.0, 1.0)
+        self.last_prediction = raw
         return self.last_prediction
 
     def update(
@@ -184,7 +204,7 @@ class SNNWorldModel:
         self._last_internal_spikes = internal_activity
 
         actual = actual_next_state.astype(np.float32)
-        predicted = np.clip(internal_activity @ self.w_decode, 0.0, 1.0)
+        predicted = internal_activity @ self.w_decode
 
         # Błąd dekodera
         self.prediction_error = actual - predicted
@@ -234,7 +254,17 @@ class SNNWorldModel:
         # Full snapshot of encoder state before imagination
         saved_state = self._snapshot_encoder()
 
-        results: dict[int, dict] = {}
+        # ── Two-pass approach for relative novelty ────────────────────
+        # Pass 1: collect raw encoder PE and decoder predictions per action.
+        # Pass 2: normalize novelty across actions (relative ranking).
+        #
+        # Biological basis (Bromberg-Martin & Hikosaka 2009): dopaminergic
+        # neurons in lateral VTA encode RELATIVE information value across
+        # available options, not absolute prediction error.  An action is
+        # "epistemically valuable" when it resolves MORE uncertainty than
+        # the alternatives, not when uncertainty is high in absolute terms.
+        raw_results: list[tuple[int, float, np.ndarray, np.ndarray]] = []
+
         for action in candidate_actions:
             combined = self._build_input(current_state_spikes, action)
 
@@ -243,28 +273,53 @@ class SNNWorldModel:
 
             # Micro-imagination loop: multiple forward passes let the
             # membrane charge and k-WTA differentiate action-specific input.
+            # Collect decoder predictions per step to measure prediction
+            # stability (familiar transitions converge, novel ones oscillate).
+            step_predictions = []
             for _ in range(self.config.rehearsal_steps):
                 enc.forward(combined)
+                step_rate = np.clip(
+                    (enc.v - enc.config.v_rest)
+                    / (enc.config.v_thresh - enc.config.v_rest),
+                    0.0, 1.0,
+                )
+                step_predictions.append(step_rate @ self.w_decode)
 
-            # Graded rates for decoder readout (consistent with predict/update)
-            internal_rate = np.clip(
-                (enc.v - enc.config.v_rest)
-                / (enc.config.v_thresh - enc.config.v_rest),
-                0.0, 1.0,
-            )
-            predicted_next = np.clip(internal_rate @ self.w_decode, 0.0, 1.0)
+            predicted_next = step_predictions[-1]
 
-            # Epistemic novelty: the PC encoder's internal prediction error
-            # reflects how uncertain the model is about this (state, action)
-            # transition.  High encoder PE = top-down vs bottom-up mismatch =
-            # model cannot confidently represent this input.
-            # This replaces the previous metric (state displacement) which
-            # confused "large physical movement" with "model uncertainty".
-            # Biological basis (Friston 2010): epistemic value = expected
-            # information gain from resolving model uncertainty, not from
-            # observing large state changes.
+            # Encoder PE: top-down vs bottom-up mismatch
             encoder_pe = float(np.mean(np.abs(enc.prediction_error)))
-            novelty = float(np.clip(encoder_pe / (avg_baseline + 1e-8), 0.0, 1.0))
+
+            # Decoder instability: variance of predictions across rehearsal
+            # steps.  Familiar (state,action) → encoder converges quickly →
+            # low variance.  Novel → encoder oscillates → high variance.
+            if len(step_predictions) > 1:
+                decoder_var = float(np.mean(np.var(
+                    np.stack(step_predictions), axis=0
+                )))
+            else:
+                decoder_var = 0.0
+
+            # Combined raw epistemic signal
+            raw_epistemic = encoder_pe + decoder_var
+
+            raw_results.append((action, raw_epistemic, predicted_next, step_predictions[-1]))
+
+        # ── Pass 2: relative novelty normalization ────────────────────
+        raw_values = np.array([r[1] for r in raw_results], dtype=np.float32)
+        pe_min = float(np.min(raw_values))
+        pe_range = float(np.max(raw_values) - pe_min)
+
+        results: dict[int, dict] = {}
+        for action, raw_ep, predicted_next, _ in raw_results:
+            if pe_range > 1e-8:
+                # Relative novelty: rank within this batch of candidates.
+                # 0 = least novel candidate, 1 = most novel candidate.
+                novelty = float((raw_ep - pe_min) / pe_range)
+            else:
+                # All candidates equally (un)certain → neutral
+                novelty = 0.5
+
             results[action] = {
                 "predicted_state": predicted_next,
                 "novelty": novelty,
@@ -298,9 +353,11 @@ class SNNWorldModel:
         decoder_error = float(
             np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0)
         )
-        # Geometric mean: both must be high for curiosity to be high.
-        # This prevents spurious curiosity when only one level is surprised.
-        return float(np.sqrt(encoder_error * decoder_error + 1e-8))
+        # Arithmetic mean: either level being surprised contributes.
+        # Geometric mean suppressed curiosity when one level was near-zero
+        # (e.g. decoder well-fit but encoder still adapting), stalling
+        # exploration in the critical early phase.
+        return float(0.5 * encoder_error + 0.5 * decoder_error)
 
     def set_ach_level(self, ach: float) -> None:
         """
@@ -380,11 +437,15 @@ class SNNWorldModel:
         state_spikes: np.ndarray,
         action: int | np.ndarray,
     ) -> np.ndarray:
-        """Concatenate state spikes and action encoding into encoder input."""
+        """Concatenate (population-encoded) state and action into encoder input."""
+        state_f32 = state_spikes.astype(np.float32)
+        if self._pop_encoder is not None:
+            state_encoded = self._pop_encoder.encode(state_f32)
+        else:
+            state_encoded = state_f32
+
         if isinstance(action, (int, np.integer)):
             action_vec = self._encode_action(int(action))
         else:
             action_vec = np.asarray(action, dtype=np.float32)
-        return np.concatenate(
-            [state_spikes.astype(np.float32), action_vec]
-        )
+        return np.concatenate([state_encoded, action_vec])

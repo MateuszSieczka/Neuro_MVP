@@ -241,9 +241,18 @@ class ReplayBuffer:
                 _adv_mean = float(np.mean(_adv_arr))
                 _adv_std = float(np.std(_adv_arr)) + 1e-8
                 _max_abs = float(np.max(np.abs(_adv_arr))) + 1e-8
-                # Normalize by max absolute value: bounds signal to [-1, 1]
-                # per step, preventing any single advantage from dominating.
-                _sleep_adv_normalized = _adv_arr / _max_abs
+
+                # Variance guard (Ambrose et al. 2016): when all advantages
+                # are near-zero noise (agent stuck, V ≈ G everywhere), SWR
+                # replay has no meaningful signal to consolidate. Normalizing
+                # this noise to [-1, 1] would teach the actor random
+                # preferences. Skip BG sleep entirely in this case.
+                if _adv_std < 0.5:
+                    _sleep_adv_normalized = None
+                else:
+                    # Normalize by max absolute value: bounds signal to [-1, 1]
+                    # per step, preventing any single advantage from dominating.
+                    _sleep_adv_normalized = _adv_arr / _max_abs
 
             # Hippocampal reverse replay: most recent experience first
             for i, exp in enumerate(reversed(experiences)):
@@ -257,9 +266,20 @@ class ReplayBuffer:
                 if hasattr(world_model, 'reset_state'):
                     world_model.reset_state()
 
-                # 3. Aktualizacja: dopamina × skumulowany_zwrot
+                # 3. Aktualizacja: dopamina × bounded advantage
+                # NAPRAWA: m_t musi być ograniczone do biologicznie
+                # realistycznego zakresu. Poprzednio:
+                #   m_t = recorded_da * |G_t|  →  0.5 * 86 = 43 (!!)
+                # To powodowało 270× silniejsze uczenie w śnie niż online.
+                # Teraz: używamy znormalizowanej przewagi (jeśli dostępna,
+                # bounded [-1,1]) lub samego recorded_da. m_t ∈ [0, ~1].
+                # Biologicznie: neuromodulacja STDP zależy od phasic DA
+                # (prediction error), nie od surowego skumulowanego zwrotu.
                 G_t = cumulative_returns[i]
-                m_t = exp.recorded_da * max(abs(G_t), 0.1)
+                if _sleep_adv_normalized is not None:
+                    m_t = exp.recorded_da * max(abs(float(_sleep_adv_normalized[i])), 0.1)
+                else:
+                    m_t = max(exp.recorded_da, 0.1)
 
                 # Przekazujemy m_t wprost do modelu. World Model zadba o resztę samodzielnie!
                 world_error = world_model.update(exp.state, exp.action, exp.next_state, m_t=m_t)

@@ -116,6 +116,18 @@ class SNNAgent(Agent):
         self._best_episode_buffer: list = []  # Stores Experience objects from best episode
         self._best_episode_return: float = -np.inf
 
+        # ── Motor program commitment (action persistence) ────────────
+        # Biological basis (Redgrave et al. 2010; Doya 2002):
+        # Basal ganglia selects motor programs spanning multiple timesteps,
+        # not individual actions. Once a motor program is committed, it
+        # runs for several steps before re-evaluation. Serotonin from the
+        # dorsal raphe modulates commitment duration: high 5-HT → patient,
+        # long programs; low 5-HT → impulsive, frequent switching.
+        # This is critical for tasks requiring momentum (e.g. MountainCar)
+        # where single-step action changes cannot build useful dynamics.
+        self._action_commitment_remaining: int = 0
+        self._committed_action: int = 0
+
     def _augment_state(self, state: np.ndarray) -> np.ndarray:
         """Augment raw state with temporal context.
 
@@ -154,6 +166,16 @@ class SNNAgent(Agent):
         self._update_trace(state)
         self._last_aug_state = aug.copy()  # Cache for replay buffer in observe()
 
+        # ── Motor program persistence check ──────────────────────────
+        # If a motor program is still running, repeat the committed action.
+        # The actor and critic still forward-pass to maintain membrane state
+        # and eligibility traces, but the action is predetermined.
+        if self._action_commitment_remaining > 0:
+            self._action_commitment_remaining -= 1
+            self.bg.actor.forward(aug, forced_action=self._committed_action)
+            self.bg.last_v = self.bg.critic.forward(aug)
+            return self._committed_action
+
         if self._use_wm:
             # Active Inference: Oblicz pragmatyczne preferencje Aktora (logity MSN)
             logits = np.dot(aug, self.bg.actor.w_mu)
@@ -175,6 +197,17 @@ class SNNAgent(Agent):
 
         # Forward Krytyka (V(s))
         self.bg.last_v = self.bg.critic.forward(aug)
+
+        # ── Commit to a motor program ────────────────────────────────
+        # Duration modulated by serotonin (Doya 2002): 5-HT encodes the
+        # temporal discount horizon. High 5-HT → long commitment (patient);
+        # low 5-HT → short commitment (impulsive, explores faster).
+        # Range: [2, 6] steps — enough for momentum but not so long that
+        # the agent ignores environmental feedback.
+        sero = self.neuromod.serotonin if hasattr(self, 'neuromod') else 0.5
+        commitment_steps = max(2, min(6, int(2 + sero * 4)))
+        self._committed_action = self.bg.actor.get_action()
+        self._action_commitment_remaining = commitment_steps - 1  # -1: current step counts
 
         return self.bg.actor.get_action()
     def _peek_value(self, state_spikes: np.ndarray) -> float:
@@ -234,8 +267,14 @@ class SNNAgent(Agent):
         if self._use_wm:
             state_f32 = state.astype(np.float32)
             next_f32 = next_state.astype(np.float32)
+            # m_t = phasic DA level (bounded [0,1] by sigmoid in neuromod).
+            # Biological basis: STDP neuromodulation depends on the
+            # dopaminergic prediction error signal, not on raw |TD|.
+            # Using raw |TD| caused m_t ≈ 10 in early learning, destabilizing
+            # the world model's encoder weights.
+            wm_m_t = max(self.neuromod.learning_rate_modulation, 0.1)
             pred_error = self.world_model.update(
-                state_f32, action, next_f32, m_t=max(abs(clipped_td), 0.1)
+                state_f32, action, next_f32, m_t=wm_m_t
             )
             self.neuromod.update(
                 prediction_error=pred_error, td_error=td_error,
@@ -419,6 +458,7 @@ class SNNAgent(Agent):
     def reset(self) -> None:
         self.bg.reset_state()
         self._trace = np.zeros(self.state_size, dtype=np.float32)
+        self._action_commitment_remaining = 0
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()

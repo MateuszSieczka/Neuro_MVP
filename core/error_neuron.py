@@ -30,6 +30,16 @@ class ErrorNeuronLayer:
     One forward() = one dt step. No inner relaxation loops.
     """
 
+    # ── NetworkGraph layer interface ─────────────────────────────────
+
+    @property
+    def num_inputs(self) -> int:
+        return self.n_input
+
+    @property
+    def num_neurons(self) -> int:
+        return self.n_state
+
     def __init__(
         self,
         n_input: int,
@@ -83,6 +93,15 @@ class ErrorNeuronLayer:
         # ── Eligibility traces ────────────────────────────────────────
         self.e_bu: NDArray[np.float32] = np.zeros_like(self.w_bu)
         self.e_td: NDArray[np.float32] = np.zeros_like(self.w_td)
+
+        # ── Spike timing for causal STDP window (±20ms) ──────────────
+        self.t_since_error_spike: NDArray[np.int32] = np.full(
+            self.n_error, 1000, dtype=np.int32,
+        )
+        self.t_since_state_spike: NDArray[np.int32] = np.full(
+            self.n_state, 1000, dtype=np.int32,
+        )
+        self._stdp_window: int = 20  # ±20 timesteps
 
         # ── Rate coding (EMA of spikes) ───────────────────────────────
         self.state_rate: NDArray[np.float32] = np.zeros(
@@ -156,15 +175,29 @@ class ErrorNeuronLayer:
             + self.spikes_error.astype(np.float32) * (1.0 - rd)
         )
 
-        # ── Eligibility traces ────────────────────────────────────────
+        # ── Spike timing updates ─────────────────────────────────────
+        self.t_since_error_spike += 1
+        self.t_since_error_spike[self.spikes_error] = 0
+        self.t_since_state_spike += 1
+        self.t_since_state_spike[self.spikes_state] = 0
+
+        # ── Eligibility traces (causal ±20ms window) ─────────────────
+        error_f = self.spikes_error.astype(np.float32)
+        state_f = self.spikes_state.astype(np.float32)
+
+        # W_bu (error → state): Hebbian with causal window
         self.e_bu *= cfg.state_decay
         if np.any(self.spikes_state):
-            self.e_bu[:, self.spikes_state] += error_signal[:, np.newaxis]
+            # State neuron spiked: accumulate from error neurons that
+            # spiked within the causal window
+            bu_mask = (self.t_since_error_spike <= self._stdp_window).astype(np.float32)
+            self.e_bu[:, self.spikes_state] += (error_f * bu_mask)[:, np.newaxis]
 
+        # W_td (state → error): with causal window
         self.e_td *= cfg.error_decay
-        state_f = self.spikes_state.astype(np.float32)
         if np.any(self.spikes_error):
-            self.e_td[:, self.spikes_error] += state_f[:, np.newaxis]
+            td_mask = (self.t_since_state_spike <= self._stdp_window).astype(np.float32)
+            self.e_td[:, self.spikes_error] += (state_f * td_mask)[:, np.newaxis]
 
         return self.spikes_state
 

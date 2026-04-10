@@ -88,26 +88,33 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
             num_inputs, dtype=bool,
         )
 
+        # ── Spike timing for causal STDP window (±20ms) ──────────────
+        self.t_since_pre_spike: NDArray[np.int32] = np.full(
+            num_inputs, 1000, dtype=np.int32,
+        )
+        self.t_since_post_spike: NDArray[np.int32] = np.full(
+            num_neurons, 1000, dtype=np.int32,
+        )
+        self._stdp_window: int = 20
+
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
 
     def forward(self, pre_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Predictive coding integration: relax → spike → update feedback.
+        """Single-step predictive coding dynamics (no relaxation loop).
 
-        1. Compute feedforward drive from learned weights.
-        2. Convergence-checked relaxation loop:
-           gradient = ACh × error_gradient + (1-ACh) × top_down
-           Iterate until ||gradient|| < ε or max steps reached.
-        3. Spike detection (via CompetitiveLIFLayer's parent forward).
-        4. Update feedback weights (Hebbian: who fires predicts what input).
+        One dt step matching the spiking paradigm:
+          1. Feedforward drive from learned weights.
+          2. Single-step gradient: v += ACh × error_gradient + (1-ACh) × top_down.
+          3. Spike detection.
+          4. Update feedback prediction.
 
         Returns:
             (num_neurons,) float spike array.
         """
         pre_f32 = pre_spikes.astype(np.float32)
         ncfg = self.neuron_cfg
-        pc = self.pc_cfg
 
         # ── Feedforward drive (thalamo-cortical volley) ───────────────
         ff_drive = pre_f32 @ self.w  # (num_neurons,)
@@ -119,40 +126,27 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # ── Membrane leak ─────────────────────────────────────────────
         self.v *= self._mem_decay
 
-        # ── Inject feedforward drive once (not per relaxation iter) ───
+        # ── Inject feedforward drive ──────────────────────────────────
         self.v += ff_drive
 
-        # ── Convergence-checked relaxation loop ───────────────────────
-        rate = pc.initial_relaxation_rate
-        for _ in range(pc.max_relaxation_steps):
-            # Approximate current activation
-            r = np.clip(
-                (self.v - ncfg.v_rest) / ncfg.gap,
-                0.0, 1.0,
-            )
+        # ── Single-step prediction error gradient ─────────────────────
+        r = np.clip(
+            (self.v - ncfg.v_rest) / ncfg.gap,
+            0.0, 1.0,
+        )
+        my_prediction = r @ self.feedback_w
+        self.prediction_error = pre_f32 - my_prediction
 
-            # Our prediction of the input
-            my_prediction = r @ self.feedback_w
-            self.prediction_error = pre_f32 - my_prediction
+        # ACh-weighted gradient (Hasselmo 2006)
+        error_gradient = self.prediction_error @ self.feedback_w.T
+        combined = (
+            self.ach_level * error_gradient
+            + (1.0 - self.ach_level) * self.top_down_prediction
+        )
+        self.v += combined
+        np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
 
-            # ACh-weighted gradient (Hasselmo 2006)
-            error_gradient = self.prediction_error @ self.feedback_w.T
-            combined = (
-                self.ach_level * error_gradient
-                + (1.0 - self.ach_level) * self.top_down_prediction
-            )
-
-            grad_norm = float(np.linalg.norm(combined))
-            if grad_norm < pc.relaxation_threshold:
-                break
-
-            self.v += rate * combined
-            np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
-
-        # ── Spike phase (delegates to parent) ─────────────────────────
-        # We replicate CompetitiveLIFLayer spike detection inline because
-        # super().forward() would redo membrane integration (we already
-        # integrated via relaxation loop above).
+        # ── Spike phase ───────────────────────────────────────────────
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1
 
@@ -162,22 +156,34 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         self.v[self.has_spiked] = ncfg.v_reset
         self.refrac_count[self.has_spiked] = ncfg.refrac_period
 
-        # ── STDP traces (pre/post) ───────────────────────────────────
+        # ── Event-based STDP traces with causal ±20ms window ─────────
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
-        self.x_pre += np.clip(pre_f32, 0.0, 1.0)
+        pre_binary = (pre_f32 > 0.5).astype(np.float32)
+        self.x_pre += pre_binary
         self.x_post[self.has_spiked] += 1.0
 
-        # ── Eligibility trace (multiplicative STDP, Bi & Poo 2001) ───
+        # Update spike timing counters
+        self.t_since_pre_spike += 1
+        self.t_since_pre_spike[pre_binary > 0.5] = 0
+        self.t_since_post_spike += 1
+        self.t_since_post_spike[self.has_spiked] = 0
+
+        # Eligibility trace with causal window (Bi & Poo 2001)
         self.e *= self._elig_decay
         if np.any(self.has_spiked):
-            self.e[:, self.has_spiked] += (
-                self.stdp_cfg.a_plus * self.x_pre[:, np.newaxis]
+            post_idx = np.where(self.has_spiked)[0]
+            ltp_mask = (self.t_since_pre_spike <= self._stdp_window).astype(np.float32)
+            self.e[:, post_idx] += (
+                self.stdp_cfg.a_plus
+                * (self.x_pre * ltp_mask)[:, np.newaxis]
             )
-        pre_active = pre_f32 > 0.1
-        if np.any(pre_active):
-            self.e[pre_active, :] -= (
-                self.stdp_cfg.a_minus * self.x_post[np.newaxis, :]
+        pre_spiked = pre_binary > 0.5
+        if np.any(pre_spiked):
+            ltd_mask = (self.t_since_post_spike <= self._stdp_window).astype(np.float32)
+            self.e[pre_spiked, :] -= (
+                self.stdp_cfg.a_minus
+                * (self.x_post * ltd_mask)[np.newaxis, :]
             )
 
         # ── k-WTA window bookkeeping ─────────────────────────────────

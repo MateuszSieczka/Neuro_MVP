@@ -33,7 +33,6 @@ Changes from legacy:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -50,26 +49,6 @@ from .interneuron import InhibitoryPool
 
 if TYPE_CHECKING:
     from .world_model import SNNWorldModel
-
-
-# =====================================================================
-# Snapshot for replay
-# =====================================================================
-
-@dataclass
-class BGSnapshot:
-    """BG eligibility traces stored per experience for replay."""
-    critic_e_h: NDArray[np.float32]
-    critic_e_v: NDArray[np.float32]
-    critic_e_bv: float
-    d1_e: NDArray[np.float32]
-    d2_e: NDArray[np.float32]
-
-    def __post_init__(self) -> None:
-        for name in ('critic_e_h', 'critic_e_v', 'd1_e', 'd2_e'):
-            val = getattr(self, name)
-            if isinstance(val, np.ndarray):
-                object.__setattr__(self, name, val.copy())
 
 
 # =====================================================================
@@ -127,10 +106,25 @@ class SNNDeepCritic:
     """LIF-based Critic for value estimation (ventral striatum).
 
     Ventral striatal neurons encode V(s) as population firing rate
-    (Schultz 1998; Samejima et al. 2005). Value is read out as linear
-    projection from hidden-layer rate-coded activity. Learning uses
-    three-factor STDP modulated by dopaminergic TD error.
+    (Schultz 1998; Samejima et al. 2005). Value read out as linear
+    projection from hidden-layer rate-coded activity.
+
+    Single LIF step per forward() call — no inner integration loops.
+    V_trace EMA replaces peek/snapshot for TD error computation.
+
+    Learning: three-factor STDP modulated by dopaminergic TD error
+    with causal ±20ms timing window (Bi & Poo 2001).
     """
+
+    # ── NetworkGraph layer interface ─────────────────────────────
+
+    @property
+    def num_inputs(self) -> int:
+        return self._state_size
+
+    @property
+    def num_neurons(self) -> int:
+        return self.config.hidden_size
 
     def __init__(self, state_size: int, config: BasalGangliaConfig) -> None:
         self.config = config
@@ -166,6 +160,11 @@ class SNNDeepCritic:
         ).astype(np.float32)
         self.b_v: float = 0.0
 
+        # ── V_trace EMA (replaces peek/snapshot, τ ≈ 200ms) ──────────
+        self._v_trace_decay: float = np.exp(-config.ctx.dt / 200.0)
+        self.v_trace: float = 0.0
+        self.last_value: float = 0.0
+
         # ── InhibitoryPool for sparsity ───────────────────────────────
         self.inh_pool = InhibitoryPool(
             n_excitatory=h,
@@ -185,69 +184,91 @@ class SNNDeepCritic:
         # ── Pre/post STDP traces ──────────────────────────────────────
         self._x_pre: NDArray[np.float32] = np.zeros(state_size, dtype=np.float32)
         self._x_post: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
-        self._pre_decay: float = config.ctx.decay(20.0)  # 20ms STDP window
+        self._pre_decay: float = config.ctx.decay(20.0)
         self._post_decay: float = config.ctx.decay(20.0)
 
-    def forward(self, state_spikes: NDArray[np.float32]) -> float:
-        """Compute V(s) with LIF dynamics; update eligibility traces."""
+        # ── Spike timing for causal STDP window (±20ms) ──────────────
+        self._t_since_pre: NDArray[np.int32] = np.full(state_size, 1000, dtype=np.int32)
+        self._t_since_post: NDArray[np.int32] = np.full(h, 1000, dtype=np.int32)
+        self._stdp_window: int = 20
+
+    def forward(self, state_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Single LIF step: compute V(s), update V_trace and eligibility.
+
+        Returns:
+            (hidden_size,) spike activity (float32) for downstream layers.
+            Value estimate stored in self.last_value and tracked via self.v_trace.
+        """
         state_f32 = state_spikes.astype(np.float32)
         cfg = self.config
+        h = cfg.hidden_size
 
-        # ── Pre-synaptic trace ────────────────────────────────────────
+        # ── Event-based pre-synaptic trace ────────────────────────────
         self._x_pre *= self._pre_decay
-        self._x_pre += np.clip(state_f32, 0.0, 1.0)
+        pre_binary = (state_f32 > 0.5).astype(np.float32)
+        self._x_pre += pre_binary
+        self._t_since_pre += 1
+        self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic current ──────────────────────────────────────────
         current = (state_f32 @ self.w_h) * self._input_gain
 
-        h = cfg.hidden_size
-        for _ in range(cfg.integration_steps):
-            in_refrac = self.refrac_hidden > 0
-            self.refrac_hidden[in_refrac] -= 1
+        # ── Single LIF step (no integration loop) ─────────────────────
+        in_refrac = self.refrac_hidden > 0
+        self.refrac_hidden[in_refrac] -= 1
 
-            leaked = (
-                self.v_hidden * self._mem_decay
-                + cfg.v_rest * (1.0 - self._mem_decay)
-            )
-            noise = np.random.normal(
-                0, cfg.membrane_noise_std, h,
-            ).astype(np.float32)
-            integrated = leaked + current + noise
-            self.v_hidden = np.where(in_refrac, cfg.v_reset, integrated)
+        leaked = (
+            self.v_hidden * self._mem_decay
+            + cfg.v_rest * (1.0 - self._mem_decay)
+        )
+        noise = np.random.normal(
+            0, cfg.membrane_noise_std, h,
+        ).astype(np.float32)
+        integrated = leaked + current + noise
+        self.v_hidden = np.where(in_refrac, cfg.v_reset, integrated)
 
-            inh_current = self.inh_pool.step(self.spikes_hidden.astype(np.float32))
-            self.v_hidden -= inh_current
+        inh_current = self.inh_pool.step(self.spikes_hidden.astype(np.float32))
+        self.v_hidden -= inh_current
 
-            self.spikes_hidden = (self.v_hidden >= cfg.v_thresh) & ~in_refrac
-            self.v_hidden[self.spikes_hidden] = cfg.v_reset
-            self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
+        self.spikes_hidden = (self.v_hidden >= cfg.v_thresh) & ~in_refrac
+        self.v_hidden[self.spikes_hidden] = cfg.v_reset
+        self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
 
-            rate_compl = 1.0 - self._rate_decay
-            self.activation = (
-                self.activation * self._rate_decay
-                + self.spikes_hidden.astype(np.float32) * rate_compl
-            )
+        rate_compl = 1.0 - self._rate_decay
+        self.activation = (
+            self.activation * self._rate_decay
+            + self.spikes_hidden.astype(np.float32) * rate_compl
+        )
 
-        # ── Post-synaptic trace ───────────────────────────────────────
+        # ── Event-based post-synaptic trace ───────────────────────────
         self._x_post *= self._post_decay
         self._x_post[self.spikes_hidden] += 1.0
+        self._t_since_post += 1
+        self._t_since_post[self.spikes_hidden] = 0
 
-        # ── Eligibility: STDP correlation ─────────────────────────────
+        # ── Eligibility: causal STDP window (±20ms) ──────────────────
         self.e_h *= self._trace_decay
         if np.any(self.spikes_hidden):
-            self.e_h[:, self.spikes_hidden] += self._x_pre[:, np.newaxis]
-        pre_active = state_f32 > 0.1
-        if np.any(pre_active):
-            self.e_h[pre_active, :] += self._x_post[np.newaxis, :]
+            post_idx = np.where(self.spikes_hidden)[0]
+            ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
+            self.e_h[:, post_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
+        if np.any(pre_binary > 0.5):
+            pre_idx = pre_binary > 0.5
+            ltd_mask = (self._t_since_post <= self._stdp_window).astype(np.float32)
+            self.e_h[pre_idx, :] -= (self._x_post * ltd_mask)[np.newaxis, :]
 
         self.e_v = self.e_v * self._trace_decay + self.activation
         self.e_bv = self.e_bv * self._trace_decay + float(np.mean(self.activation))
 
-        return float(np.dot(self.w_v, self.activation) + self.b_v)
+        # ── V(s) readout + V_trace EMA ────────────────────────────────
+        current_v = float(np.dot(self.w_v, self.activation) + self.b_v)
+        self.last_value = current_v
+        self.v_trace = (
+            self.v_trace * self._v_trace_decay
+            + current_v * (1.0 - self._v_trace_decay)
+        )
 
-    def peek(self, state_spikes: NDArray[np.float32]) -> float:
-        """Estimate V(s') without modifying internal state."""
-        return float(np.dot(self.w_v, self.activation) + self.b_v)
+        return self.spikes_hidden.astype(np.float32)
 
     def update(self, td_error: float) -> None:
         """Three-factor STDP: Δw = lr × DA(td_error) × eligibility."""
@@ -279,8 +300,12 @@ class SNNDeepCritic:
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
         self.e_bv = 0.0
+        self.v_trace = 0.0
+        self.last_value = 0.0
         self._x_pre.fill(0.0)
         self._x_post.fill(0.0)
+        self._t_since_pre.fill(1000)
+        self._t_since_post.fill(1000)
         self.inh_pool.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
@@ -296,7 +321,7 @@ class SNNDeepCritic:
 # =====================================================================
 
 class D1D2Actor:
-    """Dual-pathway MSN actor with bistable dynamics.
+    """Dual-pathway MSN actor with bistable dynamics and DA-modulated STDP.
 
     D1 (direct/Go):   DA excites → facilitates selected action
     D2 (indirect/NoGo): DA inhibits → suppresses competing actions
@@ -304,9 +329,23 @@ class D1D2Actor:
     High DA → D1 dominance → exploitation
     Low DA  → D2 dominance → caution / exploration
 
-    Each action has D1 + D2 populations; net evidence = D1_rate - D2_rate.
-    Action probabilities via softmax over net evidence.
+    Learning via DA-modulated Hebbian STDP (Frank 2005):
+      D1: standard Hebbian STDP, LTP gated by positive DA (reward)
+      D2: anti-Hebbian STDP, LTP gated by negative DA (punishment)
+    No REINFORCE policy gradient — purely biological three-factor rule.
+
+    Single LIF step per forward() call — no integration loops.
     """
+
+    # ── NetworkGraph layer interface ─────────────────────────────────
+
+    @property
+    def num_inputs(self) -> int:
+        return self._state_size
+
+    @property
+    def num_neurons(self) -> int:
+        return self.action_dim
 
     def __init__(
         self,
@@ -316,6 +355,7 @@ class D1D2Actor:
         config: BasalGangliaConfig,
     ) -> None:
         self.config = config
+        self._state_size = state_size
         self.action_dim = motor_dim + internal_dim
         self.motor_dim = motor_dim
 
@@ -329,7 +369,6 @@ class D1D2Actor:
         )
 
         # ── Input gain from biophysics ────────────────────────────────
-        # Use Up-state τ for gain calculation (active selection mode)
         self._input_gain: float = _derive_input_gain(
             state_size, config.tau_m_msn_up, config,
         )
@@ -375,7 +414,7 @@ class D1D2Actor:
         # ── DA modulation state ───────────────────────────────────────
         self._da_level: float = 0.5
 
-        # ── Eligibility traces (policy gradient via STDP) ─────────────
+        # ── Eligibility traces (DA-modulated Hebbian STDP, Frank 2005) ─
         self.e_d1: NDArray[np.float32] = np.zeros(
             (state_size, self.action_dim), dtype=np.float32,
         )
@@ -388,94 +427,114 @@ class D1D2Actor:
         self._x_pre: NDArray[np.float32] = np.zeros(state_size, dtype=np.float32)
         self._pre_decay: float = config.ctx.decay(20.0)
 
+        # ── Spike timing for causal STDP window (±20ms) ──────────────
+        self._t_since_pre: NDArray[np.int32] = np.full(state_size, 1000, dtype=np.int32)
+        self._t_since_d1_spike: NDArray[np.int32] = np.full(
+            self.action_dim, 1000, dtype=np.int32,
+        )
+        self._t_since_d2_spike: NDArray[np.int32] = np.full(
+            self.action_dim, 1000, dtype=np.int32,
+        )
+        self._stdp_window: int = 20
+
         # ── Action tracking ───────────────────────────────────────────
         self._last_probs: NDArray[np.float32] | None = None
         self._last_action: int = -1
-        self._last_state: NDArray[np.float32] | None = None
+        self.last_internal_action: NDArray[np.float32] = np.array(
+            [], dtype=np.float32,
+        )
         # D1/D2 net evidence (exposed for Active Inference)
         self._d1_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
         self._d2_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+
+        # ── Fast epistemic drive (error neuron → D1 excitability) ─────
+        self._epistemic_drive: float = 0.0
 
     def set_da_level(self, da: float) -> None:
         """Set DA modulation: high DA → D1 excitation, D2 suppression."""
         self._da_level = float(np.clip(da, 0.0, 1.0))
 
+    def set_epistemic_drive(self, error_rate: NDArray[np.float32]) -> None:
+        """Fast epistemic path: error neuron error_rate → D1 excitability boost.
+
+        High prediction error → explore novel states → boost Go pathway.
+        """
+        self._epistemic_drive = float(np.clip(np.mean(error_rate), 0.0, 1.0))
+
     def forward(
         self,
         state_spikes: NDArray[np.float32],
-        forced_action: int | None = None,
-    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-        """MSN competition through D1/D2 pathways."""
-        state_f32 = state_spikes.astype(np.float32)
-        self._last_state = state_f32
-        cfg = self.config
+    ) -> NDArray[np.float32]:
+        """Single-step MSN dynamics with DA-modulated Hebbian STDP.
 
-        # ── Pre-synaptic trace ────────────────────────────────────────
+        No integration loops, no forced_action, no softmax fallback.
+
+        Returns:
+            (motor_dim,) motor action probabilities rescaled to [-1, 1].
+            Internal action stored in self.last_internal_action.
+        """
+        state_f32 = state_spikes.astype(np.float32)
+        cfg = self.config
+        ad = self.action_dim
+
+        # ── Event-based pre-synaptic trace ────────────────────────────
         self._x_pre *= self._pre_decay
-        self._x_pre += np.clip(state_f32, 0.0, 1.0)
+        pre_binary = (state_f32 > 0.5).astype(np.float32)
+        self._x_pre += pre_binary
+        self._t_since_pre += 1
+        self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic currents ─────────────────────────────────────────
         current_d1 = (state_f32 @ self.w_d1) * self._input_gain
         current_d2 = (state_f32 @ self.w_d2) * self._input_gain
 
         # ── DA modulation (Frank 2005) ────────────────────────────────
-        # D1: DA excites (scales up drive)
-        # D2: DA inhibits (scales down drive)
         da = self._da_level
         d1_mod = cfg.d1_bias + da * (1.0 - cfg.d1_bias)
         d2_mod = cfg.d2_bias * (1.0 - da) + (1.0 - cfg.d2_bias)
         current_d1 *= d1_mod
         current_d2 *= d2_mod
 
+        # ── Fast epistemic drive: error neurons → D1 excitability ─────
+        # High prediction error boosts Go pathway (explore novel states)
+        if self._epistemic_drive > 0.01:
+            current_d1 *= 1.0 + self._epistemic_drive
+
         # ── Bistable MSN decay (Wilson & Kawaguchi 1996) ──────────────
         cortical_drive = np.abs(current_d1) + np.abs(current_d2)
-        # Normalize to [0, 1] range for threshold comparison
         drive_max = np.max(cortical_drive) + 1e-8
         cortical_norm = cortical_drive / drive_max
         decay_d1 = _msn_decay(cortical_norm, cfg)
         decay_d2 = _msn_decay(cortical_norm, cfg)
 
-        # ── Multi-tick D1 integration ─────────────────────────────────
-        ad = self.action_dim
-        for _ in range(cfg.integration_steps):
-            # D1
-            in_refrac_d1 = self.refrac_d1 > 0
-            self.refrac_d1[in_refrac_d1] -= 1
-            noise_d1 = np.random.normal(
-                0, cfg.membrane_noise_std, ad,
-            ).astype(np.float32)
-            leaked_d1 = (
-                self.v_d1 * decay_d1
-                + cfg.v_rest * (1.0 - decay_d1)
-            )
-            self.v_d1 = np.where(in_refrac_d1, cfg.v_reset, leaked_d1 + current_d1 + noise_d1)
-            inh_d1 = self.inh_pool_d1.step(self.spikes_d1.astype(np.float32))
-            self.v_d1 -= inh_d1
-            self.spikes_d1 = (self.v_d1 >= cfg.v_thresh) & ~in_refrac_d1
-            self.v_d1[self.spikes_d1] = cfg.v_reset
-            self.refrac_d1[self.spikes_d1] = cfg.refrac_period
+        # ── Single LIF step: D1 ──────────────────────────────────────
+        in_refrac_d1 = self.refrac_d1 > 0
+        self.refrac_d1[in_refrac_d1] -= 1
+        noise_d1 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
+        leaked_d1 = self.v_d1 * decay_d1 + cfg.v_rest * (1.0 - decay_d1)
+        self.v_d1 = np.where(in_refrac_d1, cfg.v_reset, leaked_d1 + current_d1 + noise_d1)
+        inh_d1 = self.inh_pool_d1.step(self.spikes_d1.astype(np.float32))
+        self.v_d1 -= inh_d1
+        self.spikes_d1 = (self.v_d1 >= cfg.v_thresh) & ~in_refrac_d1
+        self.v_d1[self.spikes_d1] = cfg.v_reset
+        self.refrac_d1[self.spikes_d1] = cfg.refrac_period
 
-            # D2
-            in_refrac_d2 = self.refrac_d2 > 0
-            self.refrac_d2[in_refrac_d2] -= 1
-            noise_d2 = np.random.normal(
-                0, cfg.membrane_noise_std, ad,
-            ).astype(np.float32)
-            leaked_d2 = (
-                self.v_d2 * decay_d2
-                + cfg.v_rest * (1.0 - decay_d2)
-            )
-            self.v_d2 = np.where(in_refrac_d2, cfg.v_reset, leaked_d2 + current_d2 + noise_d2)
-            inh_d2 = self.inh_pool_d2.step(self.spikes_d2.astype(np.float32))
-            self.v_d2 -= inh_d2
-            self.spikes_d2 = (self.v_d2 >= cfg.v_thresh) & ~in_refrac_d2
-            self.v_d2[self.spikes_d2] = cfg.v_reset
-            self.refrac_d2[self.spikes_d2] = cfg.refrac_period
+        # ── Single LIF step: D2 ──────────────────────────────────────
+        in_refrac_d2 = self.refrac_d2 > 0
+        self.refrac_d2[in_refrac_d2] -= 1
+        noise_d2 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
+        leaked_d2 = self.v_d2 * decay_d2 + cfg.v_rest * (1.0 - decay_d2)
+        self.v_d2 = np.where(in_refrac_d2, cfg.v_reset, leaked_d2 + current_d2 + noise_d2)
+        inh_d2 = self.inh_pool_d2.step(self.spikes_d2.astype(np.float32))
+        self.v_d2 -= inh_d2
+        self.spikes_d2 = (self.v_d2 >= cfg.v_thresh) & ~in_refrac_d2
+        self.v_d2[self.spikes_d2] = cfg.v_reset
+        self.refrac_d2[self.spikes_d2] = cfg.refrac_period
 
-            # Rate EMA
-            rc = 1.0 - self._rate_decay
-            self.rate_d1 = self.rate_d1 * self._rate_decay + self.spikes_d1.astype(np.float32) * rc
-            self.rate_d2 = self.rate_d2 * self._rate_decay + self.spikes_d2.astype(np.float32) * rc
+        # ── Rate EMA ──────────────────────────────────────────────────
+        rc = 1.0 - self._rate_decay
+        self.rate_d1 = self.rate_d1 * self._rate_decay + self.spikes_d1.astype(np.float32) * rc
+        self.rate_d2 = self.rate_d2 * self._rate_decay + self.spikes_d2.astype(np.float32) * rc
 
         # ── Store pathway rates for Active Inference readout ──────────
         self._d1_rates = self.rate_d1.copy()
@@ -486,12 +545,11 @@ class D1D2Actor:
         motor_d2 = self.rate_d2[:self.motor_dim]
         net_evidence = motor_d1 - motor_d2
 
-        # ── Sub-threshold fallback (drift-diffusion readout) ──────────
+        # ── Action probabilities: softmax over spike-based net evidence ─
         total_rate = np.sum(np.abs(motor_d1)) + np.sum(np.abs(motor_d2))
         if total_rate < 1e-6:
-            v_diff = (self.v_d1[:self.motor_dim] - self.v_d2[:self.motor_dim])
-            v_diff = v_diff - np.mean(v_diff)
-            probs = np.exp(v_diff) / (np.sum(np.exp(v_diff)) + 1e-10)
+            # Network silent → uniform random exploration (no fallback hack)
+            probs = np.ones(self.motor_dim, dtype=np.float32) / self.motor_dim
         else:
             shifted = net_evidence - np.max(net_evidence)
             exp_val = np.exp(shifted)
@@ -500,21 +558,30 @@ class D1D2Actor:
         self._last_probs = probs
 
         # ── Action selection ──────────────────────────────────────────
-        if forced_action is not None:
-            action = forced_action
-        else:
-            action = int(np.random.choice(self.motor_dim, p=probs))
+        action = int(np.random.choice(self.motor_dim, p=probs))
         self._last_action = action
 
-        # ── Eligibility traces (STDP-based REINFORCE) ─────────────────
-        one_hot = np.zeros(self.motor_dim, dtype=np.float32)
-        one_hot[action] = 1.0
-        grad_log_pi = np.zeros(self.action_dim, dtype=np.float32)
-        grad_log_pi[:self.motor_dim] = one_hot - probs
+        # ── Spike timing updates ─────────────────────────────────────
+        self._t_since_d1_spike += 1
+        self._t_since_d1_spike[self.spikes_d1] = 0
+        self._t_since_d2_spike += 1
+        self._t_since_d2_spike[self.spikes_d2] = 0
 
-        self.e_d1 = self.e_d1 * self._trace_decay + np.outer(state_f32, grad_log_pi)
-        # D2 trace: anti-correlation (NoGo pathway opposes selected action)
-        self.e_d2 = self.e_d2 * self._trace_decay - np.outer(state_f32, grad_log_pi)
+        # ── DA-modulated Hebbian STDP eligibility (Frank 2005) ────────
+        # D1 (Go): standard Hebbian — pre × post_spike
+        # D2 (NoGo): standard Hebbian — pre × post_spike
+        # Weight update modulated by TD error sign in update()
+        self.e_d1 *= self._trace_decay
+        if np.any(self.spikes_d1):
+            d1_idx = np.where(self.spikes_d1)[0]
+            ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
+            self.e_d1[:, d1_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
+
+        self.e_d2 *= self._trace_decay
+        if np.any(self.spikes_d2):
+            d2_idx = np.where(self.spikes_d2)[0]
+            ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
+            self.e_d2[:, d2_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
 
         # ── Motor output ──────────────────────────────────────────────
         motor_action = probs * 2.0 - 1.0  # [0,1] → [-1,1]
@@ -522,21 +589,29 @@ class D1D2Actor:
         # ── Internal actions (WM gate, etc.) ──────────────────────────
         if self.action_dim > self.motor_dim:
             internal_logits = state_f32 @ self.w_d1[:, self.motor_dim:]
-            internal_action = 1.0 / (1.0 + np.exp(-np.clip(internal_logits, -10, 10)))
+            self.last_internal_action = 1.0 / (
+                1.0 + np.exp(-np.clip(internal_logits, -10, 10))
+            )
         else:
-            internal_action = np.array([], dtype=np.float32)
+            self.last_internal_action = np.array([], dtype=np.float32)
 
-        return motor_action.astype(np.float32), internal_action.astype(np.float32)
+        return motor_action.astype(np.float32)
 
     def update(self, td_error: float) -> None:
-        """Three-factor STDP: D1 learns from +TD, D2 from -TD (Frank 2005)."""
+        """DA-modulated three-factor STDP (Frank 2005 Go/NoGo model).
+
+        D1 (Go): positive TD → DA burst → strengthen active Go synapses (LTP)
+        D2 (NoGo): negative TD → DA dip → strengthen active NoGo synapses (LTP)
+
+        No REINFORCE grad_log_pi — purely Hebbian with dopaminergic gating.
+        """
         td = float(np.clip(td_error, -50.0, 50.0))
         cfg = self.config
 
-        # D1 (Go): positive TD → strengthen selected action
-        self.w_d1 += cfg.actor_lr * td * self.e_d1
-        # D2 (NoGo): negative TD → strengthen suppression of bad actions
-        self.w_d2 += cfg.actor_lr * (-td) * self.e_d2
+        # D1: positive DA (reward) drives Go pathway LTP
+        self.w_d1 += cfg.actor_lr * max(td, 0.0) * self.e_d1
+        # D2: negative DA (punishment) drives NoGo pathway LTP
+        self.w_d2 += cfg.actor_lr * max(-td, 0.0) * self.e_d2
 
         # Homeostatic column normalisation + Dale's law
         for w in (self.w_d1, self.w_d2):
@@ -589,9 +664,11 @@ class D1D2Actor:
         self.e_d1.fill(0.0)
         self.e_d2.fill(0.0)
         self._x_pre.fill(0.0)
+        self._t_since_pre.fill(1000)
+        self._t_since_d1_spike.fill(1000)
+        self._t_since_d2_spike.fill(1000)
         self._last_probs = None
         self._last_action = -1
-        self._last_state = None
         self._d1_rates.fill(0.0)
         self._d2_rates.fill(0.0)
         self.inh_pool_d1.reset_state()
@@ -767,7 +844,8 @@ class ActiveInferenceModule:
 class BasalGangliaAGISystem:
     """Integrated BG: D1/D2 Actor + LIF Critic + Active Inference.
 
-    Exploration via LIF membrane noise + DA modulation of D1/D2 balance.
+    TD error uses V_trace EMA instead of peek/snapshot:
+      δ = r + γ × V_now - V_trace
     """
 
     def __init__(
@@ -780,7 +858,6 @@ class BasalGangliaAGISystem:
         self.config = config or BasalGangliaConfig()
         self.critic = SNNDeepCritic(state_size, self.config)
         self.actor = D1D2Actor(state_size, motor_dim, internal_dim, self.config)
-        self.last_v: float = 0.0
 
     def step(
         self,
@@ -789,13 +866,15 @@ class BasalGangliaAGISystem:
         is_terminal: bool = False,
         da_level: float = 0.5,
     ) -> tuple[NDArray[np.float32], NDArray[np.float32], float]:
-        """One BG step: critic → TD → update → actor forward."""
-        current_v = self.critic.forward(state_spikes)
+        """One BG step: critic → TD (via V_trace) → update → actor."""
+        self.critic.forward(state_spikes)
+        current_v = self.critic.last_value
 
+        # TD error: δ = r + γ × V_now - V_trace (Schultz 1998)
         if is_terminal:
-            td_error = reward - self.last_v
+            td_error = reward - self.critic.v_trace
         else:
-            td_error = reward + self.config.gamma * current_v - self.last_v
+            td_error = reward + self.config.gamma * current_v - self.critic.v_trace
 
         td_error = float(np.clip(td_error, -50.0, 50.0))
 
@@ -803,38 +882,18 @@ class BasalGangliaAGISystem:
         self.critic.update(td_error)
         self.actor.update(td_error)
 
-        motor_action, internal_action = self.actor.forward(state_spikes)
-        self.last_v = 0.0 if is_terminal else current_v
+        motor_action = self.actor.forward(state_spikes)
 
-        return motor_action, internal_action, td_error
+        return motor_action, self.actor.last_internal_action, td_error
 
     def reset_state(self) -> None:
         """Reset transient state between episodes."""
-        self.last_v = 0.0
         self.critic.reset_state()
         self.actor.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
         self.critic.set_plasticity_timescales(ne)
         self.actor.set_plasticity_timescales(ne)
-
-    def snapshot_traces(self) -> BGSnapshot:
-        """Capture current eligibility traces for replay."""
-        return BGSnapshot(
-            critic_e_h=self.critic.e_h,
-            critic_e_v=self.critic.e_v,
-            critic_e_bv=self.critic.e_bv,
-            d1_e=self.actor.e_d1,
-            d2_e=self.actor.e_d2,
-        )
-
-    def restore_traces(self, snap: BGSnapshot) -> None:
-        """Restore eligibility traces from replay snapshot."""
-        self.critic.e_h[:] = snap.critic_e_h
-        self.critic.e_v[:] = snap.critic_e_v
-        self.critic.e_bv = snap.critic_e_bv
-        self.actor.e_d1[:] = snap.d1_e
-        self.actor.e_d2[:] = snap.d2_e
 
     def compute_exploration_noise(
         self,

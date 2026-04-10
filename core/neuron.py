@@ -87,6 +87,16 @@ class LIFLayer:
         # Post-synaptic trace: incremented on post spike, decays with τ_minus
         self.x_post: NDArray[np.float32] = np.zeros(num_neurons, dtype=np.float32)
 
+        # ── Spike timing for causal STDP window (±20ms, Bi & Poo 2001) ─
+        # Time since last spike (in timesteps). Large init = no recent spike.
+        self.t_since_pre_spike: NDArray[np.int32] = np.full(
+            num_inputs, 1000, dtype=np.int32,
+        )
+        self.t_since_post_spike: NDArray[np.int32] = np.full(
+            num_neurons, 1000, dtype=np.int32,
+        )
+        self._stdp_window: int = 20  # ±20 timesteps (±20ms at dt=1ms)
+
         # ── Eligibility trace (three-factor, Graupner & Brunel 2012) ─
         self.e: NDArray[np.float32] = np.zeros(
             (num_inputs, num_neurons), dtype=np.float32,
@@ -150,8 +160,14 @@ class LIFLayer:
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
 
-        # Pre trace increment (rate-weighted, clamped to [0,1])
-        self.x_pre += np.clip(pre_f32, 0.0, 1.0)
+        # Event-based pre trace: increment only on discrete spikes (Bi & Poo 2001)
+        pre_binary = (pre_f32 > 0.5).astype(np.float32)
+        self.x_pre += pre_binary
+
+        # Update spike timing counters
+        self.t_since_pre_spike += 1
+        self.t_since_pre_spike[pre_binary > 0.5] = 0
+        self.t_since_post_spike += 1
 
         # 2. Refractory management
         in_refrac = self.refrac_count > 0
@@ -182,24 +198,32 @@ class LIFLayer:
         # 6. Reset spiked neurons
         self.v[self.has_spiked] = self.neuron_cfg.v_reset
         self.refrac_count[self.has_spiked] = self.neuron_cfg.refrac_period
+        # Event-based post trace: increment by 1.0 on spike event
         self.x_post[self.has_spiked] += 1.0
+        self.t_since_post_spike[self.has_spiked] = 0
 
-        # 7. Eligibility trace update — multiplicative STDP (Bi & Poo 2001)
-        # LTP: pre-before-post → A+ × x_pre × δ(post)
-        # LTD: post-before-pre → -A- × x_post × δ(pre)
+        # 7. Eligibility trace — causal STDP window (±20ms, Bi & Poo 2001)
+        # LTP: pre-before-post within window → A+ × x_pre × δ(post)
+        # LTD: post-before-pre within window → -A- × x_post × δ(pre)
         self.e *= self._elig_decay
 
         if np.any(self.has_spiked):
-            # Post spike: LTP contribution from pre trace
-            self.e[:, self.has_spiked] += (
-                self.stdp_cfg.a_plus * self.x_pre[:, np.newaxis]
+            # Post spike: LTP from pre traces within causal window
+            post_idx = np.where(self.has_spiked)[0]
+            # Mask: only pre neurons that spiked within ±window
+            ltp_mask = (self.t_since_pre_spike <= self._stdp_window).astype(np.float32)
+            self.e[:, post_idx] += (
+                self.stdp_cfg.a_plus
+                * (self.x_pre * ltp_mask)[:, np.newaxis]
             )
 
-        pre_active = pre_f32 > 0.1
-        if np.any(pre_active):
-            # Pre spike: LTD contribution from post trace
-            self.e[pre_active, :] -= (
-                self.stdp_cfg.a_minus * self.x_post[np.newaxis, :]
+        pre_spiked = pre_binary > 0.5
+        if np.any(pre_spiked):
+            # Pre spike: LTD from post traces within causal window
+            ltd_mask = (self.t_since_post_spike <= self._stdp_window).astype(np.float32)
+            self.e[pre_spiked, :] -= (
+                self.stdp_cfg.a_minus
+                * (self.x_post * ltd_mask)[np.newaxis, :]
             )
 
         # 8. Homeostatic threshold adaptation (if configured)

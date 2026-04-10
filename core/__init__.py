@@ -78,7 +78,6 @@ from .basal_ganglia import (
     ActiveInferenceModule,
     D1D2Actor,
     SNNDeepCritic,
-    BGSnapshot,
 )
 
 # -- Network orchestration --

@@ -23,7 +23,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .config import ReplayBufferConfig
-from .basal_ganglia import BGSnapshot
 from .sequence_memory import SequenceMemory
 
 if TYPE_CHECKING:
@@ -46,7 +45,6 @@ class Experience:
     prediction_error: NDArray[np.float32]
     encoder_e_bu: NDArray[np.float32]
     encoder_spikes: NDArray[np.float32]
-    bg_snapshot: BGSnapshot | None = None
     aug_state: NDArray[np.float32] | None = None
     salience: float = 0.0
     recorded_da: float = 0.0
@@ -159,7 +157,7 @@ class ReplayBuffer:
         """Reverse-chronological replay for critic/actor consolidation.
 
         Computes Monte Carlo returns backward, normalizes advantages,
-        then updates BG and world model.
+        then updates BG and world model. Uses V_trace for baseline.
         """
         wm_saved = world_model.snapshot_encoder()
 
@@ -174,14 +172,15 @@ class ReplayBuffer:
             g = exp.reward + eff_gamma * g
             cumulative_returns.append(g)
 
-        # Batch-normalise advantages
+        # Batch-normalise advantages using V_trace
         intrinsic_weight = 0.1
         all_advantages: list[float] = []
         for i, exp in enumerate(reversed(experiences)):
             g_aug = cumulative_returns[i] + intrinsic_weight * exp.curiosity
-            vs = bg.critic.peek(
-                exp.aug_state if exp.aug_state is not None else exp.state,
-            )
+            # Use critic forward to get current V estimate (also updates V_trace)
+            aug = exp.aug_state if exp.aug_state is not None else exp.state
+            bg.critic.forward(aug)
+            vs = bg.critic.last_value
             all_advantages.append(g_aug - vs)
 
         adv_arr = np.array(all_advantages, dtype=np.float32)
@@ -202,16 +201,15 @@ class ReplayBuffer:
             )
             errors.append(float(np.mean(world_error ** 2)))
 
-            if exp.bg_snapshot is not None:
-                bg.restore_traces(exp.bg_snapshot)
-                norm_adv = float(adv_norm[i])
-                n_exp = min(max(len(experiences), 1), 200)
-                pos_ratio = 0.5 / n_exp * 200
-                neg_ratio = 0.1 / n_exp * 200
-                ratio = pos_ratio if norm_adv >= 0 else neg_ratio
-                sleep_signal = norm_adv * ratio * sleep_gain
-                bg.critic.update(sleep_signal)
-                bg.actor.update(sleep_signal)
+            # Direct TD update scaled by advantage (no snapshot restore)
+            norm_adv = float(adv_norm[i])
+            n_exp = min(max(len(experiences), 1), 200)
+            pos_ratio = (0.5 * 200) / max(n_exp, 1)
+            neg_ratio = (0.1 * 200) / max(n_exp, 1)
+            ratio = pos_ratio if norm_adv >= 0 else neg_ratio
+            sleep_signal = norm_adv * ratio * sleep_gain
+            bg.critic.update(sleep_signal)
+            bg.actor.update(sleep_signal)
 
         world_model.restore_encoder(wm_saved)
         return errors

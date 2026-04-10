@@ -34,7 +34,6 @@ from .config import (
     HomeostaticConfig,
     CompetitiveConfig,
     PyramidalConfig,
-    PredictiveCodingConfig,
     init_weights,
 )
 from .competitive_layer import CompetitiveLIFLayer
@@ -57,10 +56,8 @@ class PyramidalLayer(CompetitiveLIFLayer):
         stdp_cfg: STDPConfig | None = None,
         homeo_cfg: HomeostaticConfig | None = None,
         comp_cfg: CompetitiveConfig | None = None,
-        pc_cfg: PredictiveCodingConfig | None = None,
     ) -> None:
         self.pyr_cfg = pyr_cfg or PyramidalConfig()
-        self.pc_cfg = pc_cfg or PredictiveCodingConfig()
         ncfg = neuron_cfg or NeuronConfig()
         hcfg = homeo_cfg or HomeostaticConfig()
 
@@ -115,6 +112,15 @@ class PyramidalLayer(CompetitiveLIFLayer):
             num_neurons, dtype=np.float32,
         )
 
+        # ── Spike timing for causal STDP window (±20ms) ──────────────
+        self.t_since_pre_spike: NDArray[np.int32] = np.full(
+            num_inputs, 1000, dtype=np.int32,
+        )
+        self.t_since_post_spike: NDArray[np.int32] = np.full(
+            num_neurons, 1000, dtype=np.int32,
+        )
+        self._stdp_window: int = 20
+
         # ── ACh modulation ────────────────────────────────────────────
         self._ach_apical_scale: float = 1.0
 
@@ -126,12 +132,17 @@ class PyramidalLayer(CompetitiveLIFLayer):
         pre_f32 = pre_spikes.astype(np.float32)
         ncfg = self.neuron_cfg
         pyr = self.pyr_cfg
-        pc = self.pc_cfg
 
-        # ── STDP trace update ─────────────────────────────────────────
+        # ── Event-based STDP trace update (Bi & Poo 2001) ────────────
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
-        self.x_pre += np.clip(pre_f32, 0.0, 1.0)
+        pre_binary = (pre_f32 > 0.5).astype(np.float32)
+        self.x_pre += pre_binary
+
+        # Update spike timing counters
+        self.t_since_pre_spike += 1
+        self.t_since_pre_spike[pre_binary > 0.5] = 0
+        self.t_since_post_spike += 1
 
         # ── 1. Apical integration (passive, slow) ────────────────────
         apical_current = self.top_down_prediction.astype(np.float32)
@@ -142,7 +153,6 @@ class PyramidalLayer(CompetitiveLIFLayer):
         )
 
         # ── 2. Ca²⁺ plateau trigger (voltage-dependent, Larkum 2013) ─
-        # m_Ca = sigmoid((V_apical - V_half) / k)
         ca_activation = 1.0 / (
             1.0 + np.exp(-(self.v_apical - pyr.ca_v_half) / pyr.ca_k)
         )
@@ -157,26 +167,20 @@ class PyramidalLayer(CompetitiveLIFLayer):
         # ── 4. Proactive k-WTA inhibition ─────────────────────────────
         self._apply_proactive_inhibition()
 
-        # ── 5. Convergence-checked relaxation loop ────────────────────
+        # ── 5. Single-step dynamics (no relaxation loop) ──────────────
+        # One dt step: v += rate × (ach × error_gradient + (1-ach) × top_down)
         self.v *= self._mem_decay
-        self.v += ff_drive  # Inject once
+        self.v += ff_drive
 
-        rate = pc.initial_relaxation_rate
-        for _ in range(pc.max_relaxation_steps):
-            r = np.clip(
-                (self.v - ncfg.v_rest) / ncfg.gap, 0.0, 1.0,
-            )
-            my_prediction = r @ self.w_apical.T
-            self.prediction_error = pre_f32 - my_prediction
-            error_gradient = self.prediction_error @ self.w_apical
+        r = np.clip((self.v - ncfg.v_rest) / ncfg.gap, 0.0, 1.0)
+        my_prediction = r @ self.w_apical.T
+        self.prediction_error = pre_f32 - my_prediction
+        error_gradient = self.prediction_error @ self.w_apical
 
-            combined = error_gradient + ff_drive
-            grad_norm = float(np.linalg.norm(combined))
-            if grad_norm < pc.relaxation_threshold:
-                break
-
-            self.v += rate * combined
-            np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
+        ach = self._ach_apical_scale
+        combined = ach * error_gradient + (1.0 - ach) * self.top_down_prediction
+        self.v += combined
+        np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
 
         # ── 6. Effective threshold (apical priming + ACh) ─────────────
         effective_thresh = (
@@ -201,17 +205,23 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.v[self.has_spiked] = ncfg.v_reset
         self.refrac_count[self.has_spiked] = ncfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
+        self.t_since_post_spike[self.has_spiked] = 0
 
-        # ── 8. Eligibility traces (Bi & Poo STDP) ────────────────────
+        # ── 8. Eligibility traces — causal ±20ms window (Bi & Poo) ───
         self.e *= self._elig_decay
         if np.any(self.has_spiked):
-            self.e[:, self.has_spiked] += (
-                self.stdp_cfg.a_plus * self.x_pre[:, np.newaxis]
+            post_idx = np.where(self.has_spiked)[0]
+            ltp_mask = (self.t_since_pre_spike <= self._stdp_window).astype(np.float32)
+            self.e[:, post_idx] += (
+                self.stdp_cfg.a_plus
+                * (self.x_pre * ltp_mask)[:, np.newaxis]
             )
-        pre_active = pre_f32 > 0.1
-        if np.any(pre_active):
-            self.e[pre_active, :] -= (
-                self.stdp_cfg.a_minus * self.x_post[np.newaxis, :]
+        pre_spiked = pre_binary > 0.5
+        if np.any(pre_spiked):
+            ltd_mask = (self.t_since_post_spike <= self._stdp_window).astype(np.float32)
+            self.e[pre_spiked, :] -= (
+                self.stdp_cfg.a_minus
+                * (self.x_post * ltd_mask)[np.newaxis, :]
             )
 
         # ── 9. k-WTA window bookkeeping ──────────────────────────────
@@ -222,11 +232,18 @@ class PyramidalLayer(CompetitiveLIFLayer):
             self._reset_window()
 
         # ── 10. Burst detection (BAC firing, Larkum 1999) ─────────────
+        #  Synapse-specific burst boost (Payeur et al. 2021):
+        #  boost ∝ presynaptic activity × burst factor
         self.is_burst = self.has_spiked & self.in_plateau
         if np.any(self.is_burst):
             burst_f = self.is_burst.astype(np.float32)
-            boost = 1.0 + (pyr.burst_stdp_factor - 1.0) * burst_f
-            self.e *= boost[np.newaxis, :]
+            # Synapse-specific: active synapses boosted, silent unchanged
+            self.e *= (
+                1.0
+                + (pyr.burst_stdp_factor - 1.0)
+                * burst_f[np.newaxis, :]
+                * self.x_pre[:, np.newaxis]
+            )
 
         # ── 11. Homeostatic adaptation ────────────────────────────────
         self._update_adaptive_threshold()

@@ -17,15 +17,11 @@ Changes from legacy:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .config import EpisodicMemoryConfig
-
-if TYPE_CHECKING:
-    from .basal_ganglia import BGSnapshot
 
 
 # =====================================================================
@@ -43,7 +39,6 @@ class Episode:
     prediction_error: NDArray[np.float32] | None = None
     encoder_e_bu: NDArray[np.float32] | None = None
     encoder_spikes: NDArray[np.float32] | None = None
-    bg_snapshot: "BGSnapshot | None" = None
     aug_state: NDArray[np.float32] | None = None
     # Consolidation tracking
     replay_count: int = 0
@@ -122,7 +117,6 @@ class EpisodicMemory:
         prediction_error: NDArray[np.float32] | None = None,
         encoder_e_bu: NDArray[np.float32] | None = None,
         encoder_spikes: NDArray[np.float32] | None = None,
-        bg_snapshot: "BGSnapshot | None" = None,
         aug_state: NDArray[np.float32] | None = None,
     ) -> bool:
         """Store an episode if NE-gated and novel. Returns True if stored."""
@@ -144,7 +138,6 @@ class EpisodicMemory:
             prediction_error=prediction_error,
             encoder_e_bu=encoder_e_bu,
             encoder_spikes=encoder_spikes,
-            bg_snapshot=bg_snapshot,
             aug_state=aug_state,
         )
 

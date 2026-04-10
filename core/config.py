@@ -282,17 +282,13 @@ class PredictiveCodingConfig(BaseConfig):
 
     Reference: Friston (2010), Rao & Ballard (1999)
 
-    relaxation_steps and relaxation_rate replaced by convergence criterion:
-      Iterate until ||gradient|| < ε or max 20 steps, with adaptive step size
-      bounded by Lipschitz constant of the generative model gradient.
+    Single-step dynamics matching the spiking paradigm:
+      v += ACh × error_gradient + (1-ACh) × top_down
+    No inner relaxation loops.
     """
     feedback_strength: float = 0.5
     feedback_learning_rate: float = 0.005
-    max_relaxation_steps: int = 20    # Upper bound (convergence checked)
-    relaxation_threshold: float = 0.01  # Gradient norm convergence criterion
     feedback_norm: bool = True
-    # Adaptive step size: initial rate, bounded by 1/L (Lipschitz)
-    initial_relaxation_rate: float = 0.1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -748,7 +744,6 @@ class BasalGangliaConfig(BaseConfig):
     refrac_period: int = 2
     membrane_noise_std: float = 2.0  # mV background cortical noise
     hidden_size: int = 128
-    integration_steps: int = 10
     w_clip: float = 3.0
     w_clip_critic: float = 5.0
     # D1/D2 pathway balance (Frank 2005)

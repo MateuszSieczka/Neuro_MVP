@@ -107,26 +107,42 @@ class SynapticChannels:
         self,
         v_post: NDArray[np.float32],
     ) -> NDArray[np.float32]:
-        """Compute total synaptic current from all channels.
+        """Compute total synaptic current from all channels (Ohm's law).
 
-        AMPA, GABA-A, GABA-B: current-based (g directly adds to/subtracts from v)
-        NMDA: voltage-dependent via Mg²⁺ block factor B(V).
+        Conductance-based model with reversal potentials:
+          I_exc = (g_ampa + g_nmda × B(V)) × (V - E_exc)
+          I_inh = (g_gaba_a + g_gaba_b) × (V - E_inh)
+          I_total = I_exc + I_inh
 
-        I_total = g_ampa + g_nmda × B(V) - g_gaba_a - g_gaba_b
+        At V < E_exc (0 mV): excitatory current is negative (depolarizing
+        in the convention dV/dt ~ -I, or depolarizing if we add I to V
+        with the driving force providing correct sign).
+
+        Reference: Jahr & Stevens (1990), Destexhe et al. (1998)
 
         Args:
-            v_post: (n_post,) postsynaptic membrane potential.
+            v_post: (n_post,) postsynaptic membrane potential (mV).
 
         Returns:
             (n_post,) total synaptic current (positive = depolarizing).
         """
+        cfg = self.config
+
         # NMDA voltage-dependent Mg²⁺ block (Jahr & Stevens 1990)
         mg_block = SynapseConfig.nmda_mg_block(v_post)
 
-        i_exc = self.g_ampa + self.g_nmda * mg_block
-        i_inh = self.g_gaba_a + self.g_gaba_b
+        # Excitatory: driving force (V - E_exc), E_exc = 0 mV
+        # At rest V=-70 mV → (V - 0) = -70 → g × (-70) is negative
+        # We want depolarizing = positive, so negate: I = g × (E_exc - V)
+        g_exc = self.g_ampa + self.g_nmda * mg_block
+        i_exc = g_exc * (cfg.e_exc - v_post)
 
-        return i_exc - i_inh
+        # Inhibitory: driving force toward E_inh = -75 mV
+        # At rest V=-70 mV → (E_inh - V) = -75 - (-70) = -5 → hyperpolarizing
+        g_inh = self.g_gaba_a + self.g_gaba_b
+        i_inh = g_inh * (cfg.e_inh - v_post)
+
+        return i_exc + i_inh
 
     def reset(self) -> None:
         """Reset all conductance traces to zero."""

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,8 +28,12 @@ from .spike_encoder import PoissonEncoder
 if TYPE_CHECKING:
     from .attention import SpatialAttentionController
     from .neuromodulator import NeuromodulatorSystem
-    from .predictive_coding import PredictiveCodingLayer
     from .sequence_memory import HierarchicalSequenceMemory, SequenceMemory
+
+# Duck-typed layer protocol: must expose forward(input_spikes) -> NDArray,
+# num_inputs: int, num_neurons: int.  Optional: set_ach_level, set_ne_level,
+# prediction_error, receive_prediction, generate_prediction, update_weights,
+# trigger_phase_reset, reset_state.
 
 
 # ------------------------------------------------------------------
@@ -79,7 +83,7 @@ class NetworkGraph:
     ) -> None:
         self.ctx = ctx or DEFAULT_CONTEXT
 
-        self._layers: dict[str, PredictiveCodingLayer] = {}
+        self._layers: dict[str, Any] = {}
         self._order: list[str] = []
         self._order_dirty: bool = True
         self._connections: list[LayerConnection] = []
@@ -88,6 +92,9 @@ class NetworkGraph:
         self._sequence_memories: dict[
             str, SequenceMemory | HierarchicalSequenceMemory
         ] = {}
+
+        # Layers updated via TD error directly (skip in update_weights)
+        self._td_updated_layers: set[str] = set()
 
         self.oscillator = ThetaGammaOscillator(
             config=osc_config or OscillatorConfig(), ctx=self.ctx,
@@ -106,13 +113,30 @@ class NetworkGraph:
     # Layer registration
     # ------------------------------------------------------------------
 
-    def add_layer(self, name: str, layer: PredictiveCodingLayer) -> None:
-        """Register a layer under a unique name."""
+    def add_layer(self, name: str, layer: Any) -> None:
+        """Register a layer under a unique name.
+
+        Layer must implement:
+          - forward(input_spikes: NDArray) -> NDArray
+          - num_inputs: int
+          - num_neurons: int
+        """
         if name in self._layers:
             raise ValueError(f"Layer '{name}' already registered.")
         self._layers[name] = layer
         self._order.append(name)
         self._order_dirty = True
+
+    def mark_td_updated(self, *layer_names: str) -> None:
+        """Mark layers that receive TD-based updates directly.
+
+        These layers are skipped during update_weights() to avoid
+        double-updating (BG critic/actor get DA-modulated STDP separately).
+        """
+        for name in layer_names:
+            if name not in self._layers:
+                raise ValueError(f"Layer '{name}' not registered.")
+            self._td_updated_layers.add(name)
 
     def connect(
         self,
@@ -154,7 +178,7 @@ class NetworkGraph:
     # Accessors
     # ------------------------------------------------------------------
 
-    def get_layer(self, name: str) -> PredictiveCodingLayer:
+    def get_layer(self, name: str) -> Any:
         return self._layers[name]
 
     @property
@@ -355,10 +379,14 @@ class NetworkGraph:
         """Apply three-factor plasticity to all layers.
 
         Plasticity signal combines DA direction with NE gating window.
+        Layers marked via mark_td_updated() are skipped (they receive
+        TD-error-based updates directly from the agent).
         """
         plasticity_signal: float = neuromodulator.learning_rate_modulation
 
-        for layer in self._layers.values():
+        for name, layer in self._layers.items():
+            if name in self._td_updated_layers:
+                continue
             if hasattr(layer, "update_weights"):
                 pe = (
                     layer.prediction_error

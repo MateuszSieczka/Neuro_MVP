@@ -25,9 +25,15 @@ class WorkingMemoryModule:
     Dual gating (O'Reilly & Frank 2006):
       ACh gates sensory input (bottom-up relevance)
       DA gates update signal (reward PE → new context important)
-      Gate OPEN:  ACh ≥ threshold AND DA ≥ threshold (conjunction)
-      Gate CLOSED: sustain content through w_lateral alone
+      Gate signal = σ(gain×(ACh-thresh)) × σ(gain×(DA-thresh))
+      Soft gating scales feedforward current, not binary on/off.
     """
+
+    # ── NetworkGraph layer interface ─────────────────────────────
+
+    @property
+    def num_inputs(self) -> int:
+        return self.num_external_inputs
 
     def __init__(
         self,
@@ -73,8 +79,11 @@ class WorkingMemoryModule:
         self._post_decay: float = cfg.ctx.decay(cfg.tau_post)
         self._content_decay: float = cfg.content_decay
 
-        # ── Gate state ────────────────────────────────────────────────
-        self.gate_open: bool = False
+        # ── Gate state (soft sigmoid) ────────────────────────────────
+        self._gate_signal: float = 0.0
+        self._gate_gain: float = 8.0  # sigmoid steepness
+        self._ach_level: float = 0.0
+        self._da_level: float = 0.0
 
         # ── Content: low-pass filtered activity (attractor trace) ─────
         self.content: NDArray[np.float32] = np.zeros(
@@ -91,40 +100,43 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
 
     def gate(self, ach_level: float, da_level: float = 1.0) -> None:
-        """Dual ACh+DA conjunction gate.
+        """Dual ACh+DA soft conjunction gate (O'Reilly & Frank 2006).
 
-        Gate opens only when BOTH ACh ≥ threshold AND DA ≥ threshold.
-        ACh gates sensory input, DA gates update signal.
+        gate_signal = σ(gain×(ACh-thresh)) × σ(gain×(DA-thresh))
+        Smooth sigmoid replaces binary threshold for gradient-friendly dynamics.
         """
         cfg = self.config
-        self.gate_open = (
-            float(ach_level) >= cfg.ach_gate_threshold
-            and float(da_level) >= cfg.da_gate_threshold
-        )
+        self._ach_level = float(ach_level)
+        self._da_level = float(da_level)
+        g = self._gate_gain
+        ach_sig = 1.0 / (1.0 + np.exp(-g * (ach_level - cfg.ach_gate_threshold)))
+        da_sig = 1.0 / (1.0 + np.exp(-g * (da_level - cfg.da_gate_threshold)))
+        self._gate_signal = float(ach_sig * da_sig)
 
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
 
-    def forward(self, external_input: NDArray[np.float32]) -> NDArray[np.bool_]:
+    def forward(self, external_input: NDArray[np.float32]) -> NDArray[np.float32]:
         """One timestep of WM dynamics.
 
-        OPEN:   integrates external_input through w_ff + recurrent w_lateral.
-        CLOSED: ignores external_input; sustains content through w_lateral.
+        Feedforward current scaled by soft gate signal [0, 1].
+        Recurrent attractor always active for content maintenance.
+
+        Returns:
+            (num_neurons,) spike array as float32.
         """
         cfg = self.config
+        gate = self._gate_signal
 
         # ── Trace decay ───────────────────────────────────────────────
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
 
-        # ── Input current ─────────────────────────────────────────────
-        if self.gate_open:
-            ext_f32 = external_input.astype(np.float32)
-            external_current = ext_f32 @ self.w_ff
-            self.x_pre += np.clip(ext_f32, 0.0, 1.0)
-        else:
-            external_current = np.zeros(self.num_neurons, dtype=np.float32)
+        # ── Input current (scaled by soft gate) ─────────────────────
+        ext_f32 = external_input.astype(np.float32)
+        external_current = gate * (ext_f32 @ self.w_ff)
+        self.x_pre += np.clip(ext_f32, 0.0, 1.0) * gate
 
         # Recurrent contribution always active (attractor maintenance)
         recurrent_current = (
@@ -147,15 +159,14 @@ class WorkingMemoryModule:
         self.refrac_count[self.has_spiked] = cfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
 
-        # ── Eligibility traces (feedforward, gate-gated) ─────────────
-        if self.gate_open:
-            self.e *= self._trace_decay
+        # ── Eligibility traces (feedforward, gate-scaled) ───────────
+        self.e *= self._trace_decay
+        if gate > 0.01:
             if np.any(self.has_spiked):
-                self.e[:, self.has_spiked] += self.x_pre[:, np.newaxis]
-            ext_f32 = external_input.astype(np.float32)
+                self.e[:, self.has_spiked] += gate * self.x_pre[:, np.newaxis]
             pre_active = ext_f32 > 0.1
             if np.any(pre_active):
-                self.e[pre_active, :] += self.x_post[np.newaxis, :]
+                self.e[pre_active, :] += gate * self.x_post[np.newaxis, :]
 
         # ── Content update + lateral learning ─────────────────────────
         self.content = (
@@ -164,7 +175,19 @@ class WorkingMemoryModule:
         )
         self._update_lateral_weights()
 
-        return self.has_spiked
+        return self.has_spiked.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # NetworkGraph-compatible neuromodulator setters
+    # ------------------------------------------------------------------
+
+    def set_ach_level(self, ach: float) -> None:
+        """ACh level for gating (re-evaluated on next gate() call)."""
+        self._ach_level = float(ach)
+
+    def set_ne_level(self, ne: float) -> None:
+        """NE level — no direct effect on WM dynamics."""
+        pass
 
     # ------------------------------------------------------------------
     # Lateral Hebbian learning
@@ -211,4 +234,6 @@ class WorkingMemoryModule:
         self.has_spiked.fill(False)
         self.content.fill(0.0)
         self.prediction_error.fill(1.0)
-        self.gate_open = False
+        self._gate_signal = 0.0
+        self._ach_level = 0.0
+        self._da_level = 0.0

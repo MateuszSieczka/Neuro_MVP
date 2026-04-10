@@ -1,534 +1,358 @@
 """
-arena.snn_agent — Adapter connecting the Neuro_MVP SNN to the arena Agent protocol.
+arena.snn_agent — Adapter connecting the SNN to the arena Agent protocol.
+
+Clean pipeline with explicit data flow (Phase 9 rewrite):
+  1. Encode state → population spikes
+  2. WM gate (ACh + DA conjunction) → augmented state
+  3. BG: critic evaluates, actor D1/D2 proposes actions
+  4. Active inference: combines pragmatic + epistemic → final action
+  5. Observe outcome: update WM, world model, BG, neuromodulator
+  6. Episodic storage (NE-gated)
+  7. End-of-episode: SWS consolidation, then REM refinement
+
+No task-specific tuning. Agent discovers parameters through:
+  - Exploration noise: derived from epistemic uncertainty + NE
+  - reward_scale: adaptive Welford normalization (in neuromodulator)
+  - hidden_size: based on input dimensionality
 """
 
 from __future__ import annotations
 
-import numpy as np
-import dataclasses
 from typing import Any
 
+import numpy as np
+from numpy.typing import NDArray
+
 from arena.core import Agent
-from core.basal_ganglia import BasalGangliaAGISystem, ContinuousBGConfig
-from core.neuromodulator import NeuromodulatorSystem
-from core.world_model import SNNWorldModel
-from core.config import (
-    NeuromodulatorConfig,
-    SNNWorldModelConfig,
-    WorkingMemoryConfig,
-    EpisodicMemoryConfig,
+from core.basal_ganglia import (
+    ActiveInferenceModule,
+    BasalGangliaAGISystem,
+    BGSnapshot,
 )
-from core.replay_buffer import ReplayBuffer
-from core.active_inference import ActiveInferenceModule
+from core.config import (
+    BasalGangliaConfig,
+    EpisodicMemoryConfig,
+    NeuromodulatorConfig,
+    ReplayBufferConfig,
+    WorkingMemoryConfig,
+    WorldModelConfig,
+)
 from core.episodic_memory import EpisodicMemory
+from core.neuromodulator import NeuromodulatorSystem
+from core.replay_buffer import Experience, ReplayBuffer
 from core.working_memory import WorkingMemoryModule
+from core.world_model import SNNWorldModel
+
 
 class SNNAgent(Agent):
+    """SNN-based RL agent using Basal Ganglia + Active Inference.
+
+    All learning arises from biologically grounded mechanisms:
+      - D1/D2 MSN pathways for action selection (Frank 2005)
+      - DA TD-error for critic/actor plasticity
+      - ACh/DA conjunction gating for working memory (O'Reilly & Frank 2006)
+      - NE-gated episodic storage (O'Neill et al. 2010)
+      - SWS/REM two-phase sleep consolidation
+      - Expected Free Energy for exploration/exploitation (Friston 2010)
+    """
+
     def __init__(
         self,
         state_size: int,
         n_actions: int,
-        bg_config: ContinuousBGConfig | None = None,
-        wm_config: SNNWorldModelConfig | None = None,
+        bg_config: BasalGangliaConfig | None = None,
+        wm_config: WorldModelConfig | None = None,
         nm_config: NeuromodulatorConfig | None = None,
+        ep_config: EpisodicMemoryConfig | None = None,
+        rb_config: ReplayBufferConfig | None = None,
+        wmem_config: WorkingMemoryConfig | None = None,
         use_world_model: bool = True,
-        trace_decay: float = 0.0,
+        use_working_memory: bool = True,
     ) -> None:
         self.state_size = state_size
         self.n_actions = n_actions
         self._use_wm = use_world_model
-        self._trace_decay = trace_decay
-        self._use_trace = trace_decay > 0.0
+        self._use_working_memory = use_working_memory and use_world_model
 
-        # Working Memory: activated when both world model and trace are used.
-        # Biological grounding: prefrontal working memory operates regardless
-        # of input dimensionality. Even low-dimensional inputs are expanded
-        # into a higher-dimensional persistent attractor representation
-        # (Goldman-Rakic 1995). The minimum population size (8 neurons)
-        # ensures enough capacity for stable attractor dynamics.
-        self._use_working_memory = self._use_wm and self._use_trace
+        # ── Working Memory ────────────────────────────────────────────
+        self._wm_num_neurons = max(8, state_size)
         if self._use_working_memory:
-            self._wm_num_neurons = max(8, state_size)
             self.working_memory = WorkingMemoryModule(
                 num_external_inputs=state_size,
                 num_neurons=self._wm_num_neurons,
+                config=wmem_config,
             )
             bg_input_size = state_size + self._wm_num_neurons
-        elif self._use_trace:
-            bg_input_size = state_size * 2
         else:
             bg_input_size = state_size
 
-        self._bg_config = bg_config or ContinuousBGConfig(
-            gamma=0.95, critic_lr=0.01, actor_lr=0.005,
-            exploration_noise=0.3, hidden_size=64,
-        )
-
+        # ── Basal Ganglia (D1/D2 Actor + LIF Critic) ─────────────────
+        self._bg_config = bg_config or BasalGangliaConfig()
         self.bg = BasalGangliaAGISystem(
-            state_size=bg_input_size, motor_dim=n_actions,
-            internal_dim=1, config=self._bg_config,
+            state_size=bg_input_size,
+            motor_dim=n_actions,
+            internal_dim=1,
+            config=self._bg_config,
         )
 
-        # Zawsze włączamy Neuromodulator (nawet bez modelu świata)
+        # ── Neuromodulator ────────────────────────────────────────────
         self.neuromod = NeuromodulatorSystem(nm_config)
 
+        # ── World Model + Active Inference ────────────────────────────
         if self._use_wm:
-            self._wm_config = wm_config or SNNWorldModelConfig(
-                hidden_size=32, k_winners=4, rehearsal_steps=5,
-            )
             self.world_model = SNNWorldModel(
-                state_size=state_size, action_size=n_actions, config=self._wm_config,
+                state_size=state_size,
+                action_size=n_actions,
+                config=wm_config,
             )
             self.active_inference = ActiveInferenceModule(self.world_model)
-            self.replay_buffer = ReplayBuffer(capacity=1000)
+            self.replay_buffer = ReplayBuffer(config=rb_config)
+            self.episodic_memory = EpisodicMemory(
+                state_dim=state_size, config=ep_config,
+            )
 
-            # Episodic Memory (hippocampal CA3 one-shot binding):
-            # Stores rare, high-NE transitions for injection into replay
-            # buffer during sleep. Critical for sparse-reward environments
-            # where a single success must be remembered despite hundreds
-            # of failures (O'Neill et al. 2010; Cheng & Frank 2008).
-            self.episodic_memory = EpisodicMemory(state_dim=state_size)
-
-        self._trace = np.zeros(state_size, dtype=np.float32)
+        # ── Transient state ───────────────────────────────────────────
         self._last_td_error: float = 0.0
         self._step_count: int = 0
-        self._episode_return: float = 0.0   # Accumulated return for tonic DA
+        self._episode_return: float = 0.0
         self._episode_steps: int = 0
-        self._last_aug_state: np.ndarray | None = None  # Cached augmented state from act()
+        self._last_aug_state: NDArray[np.float32] | None = None
+        self._last_curiosity: float = 0.0
 
-        # ── Intrinsic curiosity reward (Hippocampal-VTA loop) ────────
-        # Biological basis (Kakade & Dayan 2002; Lisman & Grace 2005):
-        # VTA dopamine neurons respond to NOVELTY as well as reward.
-        # The hippocampal-VTA loop sends novelty signals that directly
-        # modulate dopaminergic RPE. This intrinsic reward prevents the
-        # dead-gradient trap where V(s) converges to a flat constant
-        # and TD error → 0 in sparse-reward environments.
-        # Weight is modulated by (1 - tonic_da): when extrinsic reward
-        # is found, intrinsic drive fades — pure Active Inference.
-        self._intrinsic_reward_weight: float = 0.5
-        self._last_curiosity: float = 0.0  # Curiosity at current step
+        # ── Exploration noise smoothing (D1/D2 receptor inertia) ──────
+        self._smooth_noise: float = 1.0
 
-        # ── Exploration noise smoothing (D1/D2 receptor inertia) ─────
-        # Biological basis: striatal receptor density changes over
-        # hours/days, not per-step. A single bad episode should NOT
-        # spike exploration — the noise "policy" must be tonic,
-        # integrating over many episodes to avoid vicious cycles
-        # (bad episode → high noise → bad episode → ...).
-        # τ_noise ≈ 200 steps (one full episode) ensures episode-level
-        # smoothing while still tracking genuine environmental changes.
-        self._smooth_noise: float = 1.0  # Starts at max exploration
-        self._noise_filter_decay: float = 0.98  # τ ≈ 50 steps (~1/3 episode)
-
-        # ── Best-episode priority replay (hippocampal "golden trace") ─
-        # Biology: hippocampus preferentially replays reward-associated
-        # trajectories during SWR bursts (Dupret et al. 2010), with
-        # frequency proportional to reward magnitude. This ensures
-        # rare but significant experiences are consolidated across
-        # multiple sleep cycles, not just once.
-        self._best_episode_buffer: list = []  # Stores Experience objects from best episode
+        # ── Best-episode tracking for sleep gain ──────────────────────
         self._best_episode_return: float = -np.inf
 
-        # ── Motor program commitment (action persistence) ────────────
-        # Biological basis (Redgrave et al. 2010; Doya 2002):
-        # Basal ganglia selects motor programs spanning multiple timesteps,
-        # not individual actions. Once a motor program is committed, it
-        # runs for several steps before re-evaluation. Serotonin from the
-        # dorsal raphe modulates commitment duration: high 5-HT → patient,
-        # long programs; low 5-HT → impulsive, frequent switching.
-        # This is critical for tasks requiring momentum (e.g. MountainCar)
-        # where single-step action changes cannot build useful dynamics.
-        self._action_commitment_remaining: int = 0
-        self._committed_action: int = 0
+    # ------------------------------------------------------------------
+    # State augmentation
+    # ------------------------------------------------------------------
 
-    def _augment_state(self, state: np.ndarray) -> np.ndarray:
-        """Augment raw state with temporal context.
-
-        When WorkingMemory is active (WM mode):
-          State is concatenated with WM's persistent content signal.
-          The WM module sustains activity through recurrent attractor
-          dynamics (tau_m=300ms), providing a biologically grounded
-          temporal context that outlasts the original stimulus.
-          ACh gates WM update: high ACh (novel situation) → accept new
-          input; low ACh (familiar) → sustain existing content.
-
-        Fallback (trace mode):
-          Simple exponential moving average of past states.
-        """
+    def _augment_state(self, state: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Concatenate raw state with WM content (if enabled)."""
         state_f32 = state.astype(np.float32)
         if self._use_working_memory:
-            # Gate WM by ACh level from neuromodulator
-            self.working_memory.gate(self.neuromod.acetylcholine)
-            # Forward pass: integrate input if gate open, sustain if closed
+            da_level = max(self.neuromod.learning_rate_modulation, 0.0)
+            self.working_memory.gate(
+                ach_level=self.neuromod.bottom_up_gain,
+                da_level=da_level,
+            )
             self.working_memory.forward(state_f32)
-            # Content is the low-pass filtered activation (rate-coded)
             wm_signal = self.working_memory.content.copy()
             return np.concatenate([state_f32, wm_signal])
-        elif self._use_trace:
-            return np.concatenate([state_f32, self._trace])
-        else:
-            return state_f32
+        return state_f32
 
-    def _update_trace(self, state: np.ndarray) -> None:
-        """Update simple EMA trace (only used in non-WM trace mode)."""
-        if self._use_trace and not self._use_working_memory:
-            self._trace = self._trace * self._trace_decay + state.astype(np.float32)
+    # ------------------------------------------------------------------
+    # Action selection
+    # ------------------------------------------------------------------
 
     def act(self, state: np.ndarray) -> int:
         aug = self._augment_state(state)
-        self._update_trace(state)
-        self._last_aug_state = aug.copy()  # Cache for replay buffer in observe()
+        self._last_aug_state = aug.copy()
 
-        # Always compute V(s) for proper TD error in observe()
+        # Pre-compute critic value for TD error in observe()
         self.bg.last_v = self.bg.critic.forward(aug)
 
-        # ── Motor program commitment (BG action persistence) ─────────
-        # Biological basis (Redgrave et al. 2010; Bogacz et al. 2010):
-        # Basal ganglia motor programs span multiple timesteps — once
-        # selected, a program executes for its characteristic duration
-        # before re-evaluation. This mirrors the ~200ms minimum
-        # inter-decision interval in primate motor cortex.
-        #
-        # Commitment duration depends on decision confidence (entropy
-        # of the actor's action distribution). Low entropy = confident
-        # → longer program (up to 5 steps). High entropy = uncertain
-        # → shorter program (2 steps). This models the evidence-
-        # accumulation-to-threshold framework: confident decisions
-        # commit more strongly.
-        if self._action_commitment_remaining > 0:
-            self._action_commitment_remaining -= 1
-            # Maintain eligibility trace for committed action
-            self.bg.actor.forward(aug, forced_action=self._committed_action)
-            return self._committed_action
+        # Set DA level on actor for D1/D2 modulation
+        da_level = float(np.clip(
+            self.neuromod.learning_rate_modulation + 0.5, 0.0, 1.0,
+        ))
+        self.bg.actor.set_da_level(da_level)
 
         if self._use_wm:
-            # Active Inference: Oblicz pragmatyczne preferencje Aktora (logity MSN)
-            logits = np.dot(aug, self.bg.actor.w_mu)
-            pragmatic_values = {a: float(logits[a]) for a in range(self.n_actions)}
-
-            candidate_actions = list(range(self.n_actions))
-            selected_action = self.active_inference.select_action(
+            # Active Inference: expected free energy selection
+            selected = self.active_inference.select_action(
                 state_spikes=state.astype(np.float32),
-                candidate_actions=candidate_actions,
-                pragmatic_values=pragmatic_values,
-                ne_level=self.neuromod.noradrenaline
+                candidate_actions=list(range(self.n_actions)),
+                actor=self.bg.actor,
+                ne_level=self.neuromod.competition_sharpness,
             )
-            # Zmuszamy Aktora do wykonania tej akcji, by policy gradient i ślad E zapisały się poprawnie
-            self.bg.actor.forward(aug, forced_action=selected_action)
+            self.bg.actor.forward(aug, forced_action=selected)
         else:
-            # Fallback dla środowisk gęstych bez modelu świata (standardowa eksploracja z szumem)
             self.bg.actor.forward(aug)
 
-        action = self.bg.actor.get_action()
+        return self.bg.actor.get_action()
 
-        # Commit to this motor program for a few steps.
-        # Duration: 2 (uncertain) to 5 (confident), using actor entropy.
-        # Biological basis (Cisek & Kalaska 2010): basal ganglia motor
-        # programs span multiple timesteps. Commitment duration scales
-        # with decision confidence — uncertain decisions are revisited
-        # quickly while confident decisions persist. Range 2-5 balances
-        # reactivity (CartPole) with momentum building (MountainCar).
-        confidence = 1.0 - self.bg.actor.action_entropy  # 0 = uniform, 1 = certain
-        commit_extra = 1 + int(4 * confidence)  # 2..5 total steps
-        self._committed_action = action
-        self._action_commitment_remaining = commit_extra
-
-        return action
-    def _peek_value(self, state_spikes: np.ndarray) -> float:
-        """Bezpieczny podgląd V(s') bez niszczenia śladów membrany Krytyka."""
-        return self.bg.critic.peek(state_spikes)
+    # ------------------------------------------------------------------
+    # Observation & learning
+    # ------------------------------------------------------------------
 
     def observe(
-        self, state: np.ndarray, action: int, reward: float,
-        next_state: np.ndarray, done: bool, info: dict[str, Any] | None = None,
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+        info: dict[str, Any] | None = None,
     ) -> None:
         next_aug = self._augment_state(next_state)
         is_truncated = info.get("truncated", False) if info else False
         is_terminal = done and not is_truncated
 
-        # 1. Curiosity-augmented reward (Hippocampal-VTA loop)
-        #    Compute curiosity BEFORE world_model.update() so it reflects
-        #    PRE-learning surprise, not post-update residual.
-        #    Biological basis (Lisman & Grace 2005): hippocampal novelty
-        #    signal reaches VTA BEFORE dopaminergic learning updates synapses.
+        # ── 1. Pre-update curiosity (Lisman & Grace 2005) ─────────────
         if self._use_wm:
             self._last_curiosity = self.world_model.curiosity_signal()
         else:
             self._last_curiosity = 0.0
 
-        # Intrinsic reward from novelty (hippocampal-VTA loop).
-        # With z-score curiosity normalization (Step 1.2), curiosity now
-        # genuinely varies across states: novel states get cur > 1,
-        # familiar states get cur < 1. The raw product with curiosity
-        # provides BOTH a tonic exploration bonus (V shift) AND a
-        # directional gradient toward novel regions.
-        # Biological basis (Bromberg-Martin & Hikosaka 2009): VTA lateral
-        # population fires proportionally to mismatch.
-        intrinsic_r = self._intrinsic_reward_weight * self._last_curiosity
+        # ── 2. Intrinsic reward (inverse tonic DA weighting) ──────────
+        intrinsic_weight = 0.1 * (1.0 - self.neuromod.learning_rate_modulation)
+        intrinsic_r = max(intrinsic_weight, 0.0) * self._last_curiosity
         effective_reward = reward + intrinsic_r
 
+        # ── 3. TD error ───────────────────────────────────────────────
         if is_terminal:
             td_error = effective_reward - self.bg.last_v
         else:
-            next_v = self._peek_value(next_aug)
-            td_error = effective_reward + self.bg.config.gamma * next_v - self.bg.last_v
+            next_v = self.bg.critic.peek(next_aug)
+            td_error = (
+                effective_reward
+                + self._bg_config.gamma * next_v
+                - self.bg.last_v
+            )
+        td_error = float(np.clip(td_error, -50.0, 50.0))
 
-        clipped_td = float(np.clip(td_error, -10.0, 10.0))
-
-        # 2. Adaptive DA gain normalization (Tobler, Fiorillo & Schultz 2005)
-        #    VTA dopamine neurons scale their phasic burst magnitude inversely
-        #    with the variance of recent reward prediction errors. This is a
-        #    fundamental property of midbrain DA signaling:
-        #    - High variance → low gain → prevents weight explosions
-        #    - Low variance → high gain → fine-tuning during consolidation
-        #    The BG system maintains a running RMS of TD error for this.
-        norm_td = self.bg.normalize_td(clipped_td)
-
-        # 3. Consolidation-gated plasticity modulation
-        #    Biological basis (Niv et al. 2007; Doya 2002):
-        #    Plasticity decreases when the agent is BOTH:
-        #    (a) consistently rewarded (high tonic DA from VTA), AND
-        #    (b) making stable predictions (high serotonin from raphe).
-        #    Gate = sqrt(tonic_DA × 5-HT), requiring both signals.
-        #
-        #    SOFTENED mapping (previous 1-gate caused oscillatory regression):
-        #    The original linear map (gate=0.9 → plasticity=0.10) crushed
-        #    learning too drastically after initial success, causing the
-        #    agent to forget before consolidation was complete.
-        #    New sigmoid-like curve: plasticity stays near 1.0 for gate < 0.5,
-        #    then gradually drops to floor=0.3 at gate=1.0.
-        #    This matches the biological observation that late-phase L-LTP
-        #    reduces but does not eliminate plasticity (Frey & Morris 1997).
+        # ── 4. Consolidation-gated plasticity ─────────────────────────
         gate = self.neuromod.consolidation_gate
-        plasticity_scale = 0.3 + 0.7 / (1.0 + np.exp(8.0 * (gate - 0.7)))
+        plasticity_scale = 0.8 + 0.2 / (1.0 + np.exp(8.0 * (gate - 0.7)))
 
-        self.bg.critic.update(norm_td * plasticity_scale)
-        self.bg.actor.update(norm_td * plasticity_scale)
-
+        self.bg.critic.update(td_error * plasticity_scale)
+        self.bg.actor.update(td_error * plasticity_scale)
         self._last_td_error = td_error
 
-        # 4. Neuromodulator update (raw TD for proper NE/DA/5-HT dynamics)
-        #    Note: neuromod receives RAW td_error, not normalized — the phasic
-        #    DA sigmoid and NE channels need the actual error magnitude to
-        #    properly track surprise and RPE direction.
+        # ── 5. World model + neuromodulator update ────────────────────
         if self._use_wm:
             state_f32 = state.astype(np.float32)
             next_f32 = next_state.astype(np.float32)
-            # m_t = phasic DA level (bounded [0,1] by sigmoid in neuromod).
-            # Biological basis: STDP neuromodulation depends on the
-            # dopaminergic prediction error signal, not on raw |TD|.
-            # Using raw |TD| caused m_t ≈ 10 in early learning, destabilizing
-            # the world model's encoder weights.
             wm_m_t = max(self.neuromod.learning_rate_modulation, 0.1)
-            # Curiosity was already computed BEFORE TD (Step 1.3: pre-update surprise)
-            pre_update_curiosity = self._last_curiosity
+
             pred_error = self.world_model.update(
-                state_f32, action, next_f32, m_t=wm_m_t
+                state_f32, action, next_f32, m_t=wm_m_t,
             )
             self.neuromod.update(
-                prediction_error=pred_error, td_error=td_error,
-                novelty=pre_update_curiosity,
+                prediction_error=pred_error,
+                td_error=td_error,
+                novelty=self._last_curiosity,
             )
 
-            # 4a. Working Memory weight update (prefrontal three-factor STDP).
-            #     Biological basis (Compte et al. 2000): PFC attractor
-            #     dynamics are shaped by STDP that depends on dopaminergic
-            #     prediction error. Without this, w_ff stays at random init
-            #     and WM content is a meaningless static projection.
-            #     pred_error from world model serves as local error signal
-            #     for WM neurons (prediction errors propagate top-down in
-            #     the cortical hierarchy).
+            # Working Memory plasticity
             if self._use_working_memory:
-                # Compute WM-local prediction error: how well does current
-                # WM content predict the new sensory input?
-                wm_pred = self.working_memory.content[:self.state_size] if self.state_size <= self.working_memory.num_neurons else self.working_memory.content
                 wm_pe = np.zeros(self.working_memory.num_neurons, dtype=np.float32)
-                # Broadcast world model error to WM neuron space
                 pe_len = min(len(pred_error), self.working_memory.num_neurons)
                 wm_pe[:pe_len] = pred_error[:pe_len]
                 self.working_memory.prediction_error = wm_pe
-                self.working_memory.update_weights(
-                    m_t=wm_m_t, pred_error=wm_pe,
-                )
+                self.working_memory.update_weights(m_t=wm_m_t, pred_error=wm_pe)
         else:
-            # Soft-normalize TD error to [0,1] for neuromodulator.
-            norm_td = float(abs(td_error) / (1.0 + abs(td_error)))
+            norm_pe = float(abs(td_error) / (1.0 + abs(td_error)))
             self.neuromod.update(
-                prediction_error=np.array([norm_td], dtype=np.float32),
-                td_error=td_error, novelty=0.0,
+                prediction_error=np.array([norm_pe], dtype=np.float32),
+                td_error=td_error,
+                novelty=0.0,
             )
 
-        # 4b. Episode-level tonic DA update (ventral striatum → VTA)
+        # ── 6. Tonic DA (episode-level) ───────────────────────────────
         self._episode_return += reward
         self._episode_steps += 1
         if done:
-            # Save return for best-episode tracking (needed in sleep phase below)
-            self._last_episode_return = self._episode_return
-            # Compute episode-average prediction error for intrinsic progress
             ep_pe = 0.0
-            if hasattr(self, 'world_model') and hasattr(self.world_model, '_error_history') and self.world_model._error_history:
-                ep_pe = float(np.mean(self.world_model._error_history))
-            self.neuromod.update_tonic_da(self._episode_return, self._episode_steps,
-                                          prediction_error_avg=ep_pe)
+            if self._use_wm and self.world_model.error_history:
+                ep_pe = float(np.mean(self.world_model.error_history))
+            self.neuromod.update_tonic_da(
+                self._episode_return,
+                self._episode_steps,
+                prediction_error_avg=ep_pe,
+            )
             self._episode_return = 0.0
             self._episode_steps = 0
 
-        # 5. NE-driven trace compression (closed loop: TD → NM → BG timescales)
+        # ── 7. NE-driven trace compression ────────────────────────────
         self.bg.set_plasticity_timescales(ne=self.neuromod.tau_compression)
 
         if self._use_wm:
             self.neuromod.apply_to_layer(self.world_model)
+            self.world_model.set_rehearsal_depth(self.neuromod.planning_horizon)
 
-        # 6. Exploration control: delegate to BG which combines serotonin,
-        #    tonic DA floor, and action entropy (Proposal 2).
-        #
-        #    Smoothing (D1/D2 receptor inertia): the raw target noise is
-        #    filtered through a slow EMA to prevent individual bad episodes
-        #    from spiking exploration into a vicious failure cascade.
-        #    Biologically, receptor density changes on timescales of
-        #    hours/days, not seconds (Seamans & Yang 2004).
-        _target_noise = self.bg.compute_exploration_noise(
-            self.neuromod.serotonin, self.neuromod.tonic_da
-        )
-        d = self._noise_filter_decay
-        self._smooth_noise = self._smooth_noise * d + _target_noise * (1.0 - d)
-        self.bg.actor.noise_scale = self._smooth_noise
+        # ── 8. Exploration noise (per-episode smoothing) ──────────────
+        if done:
+            target_noise = self.bg.compute_exploration_noise(
+                self.neuromod.planning_horizon,
+                getattr(self.neuromod, 'tonic_da', 0.0),
+            )
+            self._smooth_noise = self._smooth_noise * 0.8 + target_noise * 0.2
 
-        # 7. Zapis do Replay Buffer (tylko z World Modelem)
+        # ── 9. Store experience ───────────────────────────────────────
         if self._use_wm:
-            # SNNWorldModel posiada wewnątrz warstwę PredictiveCodingLayer jako _encoder
-            layer_traces = {'encoder': self.world_model._encoder.e}
-            layer_outputs = {'encoder': self.world_model._encoder.has_spiked.astype(np.float32)}
-            layer_errors = {'encoder': self.world_model._encoder.prediction_error}
+            bg_snap = self.bg.snapshot_traces()
+            pred_error_local = pred_error  # noqa: F841 — from step 5 above
 
-            # BG eligibility trace snapshot (Lansink et al. 2009):
-            # Hippocampal place cells co-fire with ventral striatal neurons
-            # during behavior. During subsequent sleep SWR, these co-activation
-            # patterns are replayed, reactivating the striatal eligibility
-            # traces that were present during the original experience.
-            bg_traces = {
-                'critic_e_h': self.bg.critic.e_h.copy(),
-                'critic_e_v': self.bg.critic.e_v.copy(),
-                'critic_e_bv': np.array([self.bg.critic.e_bv], dtype=np.float32),
-                'actor_e': self.bg.actor.e_actor.copy(),
-            }
-
-            self.replay_buffer.store(
+            exp = Experience(
                 state=state.astype(np.float32),
                 action=action,
                 reward=reward,
                 next_state=next_state.astype(np.float32),
-                layer_traces=layer_traces,
-                layer_outputs=layer_outputs,
-                prediction_error=pred_error,
-                layer_errors=layer_errors,
-                salience=self.neuromod.noradrenaline,  # Salience = NE (arousal/zaskoczenie)
-                recorded_da=self.neuromod.learning_rate_modulation,  # Zamrożony sygnał DA!
-                bg_traces=bg_traces,
+                prediction_error=pred_error_local,
+                encoder_e_bu=self.world_model.encoder.e_bu.copy(),
+                encoder_spikes=self.world_model.encoder.spikes_state.astype(
+                    np.float32,
+                ),
+                bg_snapshot=bg_snap,
                 aug_state=self._last_aug_state,
+                salience=self.neuromod.competition_sharpness,
+                recorded_da=self.neuromod.learning_rate_modulation,
                 curiosity=self._last_curiosity,
+                done=done,
             )
+            self.replay_buffer.store(exp)
 
-            # 7b. Episodic Memory: NE-gated one-shot storage (hippocampal CA3).
-            #     When NE is high (surprise/arousal), store this transition
-            #     in the episodic memory for later injection during sleep.
-            #     Critical for sparse-reward environments where successful
-            #     episodes are rare and would be diluted in the main buffer
-            #     (O'Neill et al. 2010; Cheng & Frank 2008).
+            # NE-gated episodic memory (one-shot, O'Neill et al. 2010)
             self.episodic_memory.try_store(
                 state=state.astype(np.float32),
                 action=action,
                 reward=reward,
                 next_state=next_state.astype(np.float32),
-                ne_level=self.neuromod.noradrenaline,
-                bg_traces={
-                    'critic_e_h': self.bg.critic.e_h.copy(),
-                    'critic_e_v': self.bg.critic.e_v.copy(),
-                    'critic_e_bv': np.array([self.bg.critic.e_bv], dtype=np.float32),
-                    'actor_e': self.bg.actor.e_actor.copy(),
-                },
+                ne_level=self.neuromod.competition_sharpness,
+                prediction_error=pred_error_local.copy(),
+                encoder_e_bu=self.world_model.encoder.e_bu.copy(),
+                encoder_spikes=self.world_model.encoder.spikes_state.astype(
+                    np.float32,
+                ),
+                bg_snapshot=bg_snap,
                 aug_state=self._last_aug_state,
-                layer_traces={'encoder': self.world_model._encoder.e.copy()},
-                layer_outputs={'encoder': self.world_model._encoder.has_spiked.astype(np.float32)},
-                prediction_error=pred_error.copy(),
             )
 
-        # 8. Faza snu (Offline Consolidation) na koniec epizodu
+        # ── 10. Sleep phase (end of episode) ──────────────────────────
         if done and self._use_wm and len(self.replay_buffer) > 0:
-            # 8a. Inject episodic memories into replay buffer before sleep.
-            for ep in self.episodic_memory.recall_all():
-                self.replay_buffer.store(
-                    state=ep.state,
-                    action=ep.action,
-                    reward=ep.reward,
-                    next_state=ep.next_state,
-                    layer_traces=ep.layer_traces,
-                    layer_outputs=ep.layer_outputs,
-                    prediction_error=(
-                        ep.prediction_error
-                        if ep.prediction_error is not None
-                        else np.zeros(self.state_size, dtype=np.float32)
-                    ),
-                    salience=ep.salience,
-                    recorded_da=self.neuromod.learning_rate_modulation,
-                    bg_traces=ep.bg_traces,
-                    aug_state=ep.aug_state,
-                )
-
-            # 8b. Proportional sleep gain (VTA DA modulation of replay).
-            #     Biology (Bethus et al. 2010; McNamara et al. 2014):
-            #     VTA phasic dopamine during hippocampal SWR determines
-            #     the gain of hippocampal-to-cortical plasticity. Better
-            #     episodes trigger stronger DA burst, which amplifies the
-            #     replay consolidation signal. This ensures that rare but
-            #     significantly better episodes receive proportionally
-            #     STRONGER consolidation, while mediocre or bad episodes
-            #     receive weaker consolidation.
-            #
-            #     Gain is computed as a z-score of the current episode's
-            #     return relative to recent history, clipped to [0.3, 2.5].
-            #     This provides up to 2.5× amplification for +3σ episodes
-            #     and 0.3× attenuation for very bad episodes.
-            ep_return = getattr(self, '_last_episode_return', 0.0)
-            # Track best return for diagnostics
-            if ep_return > self._best_episode_return:
-                self._best_episode_return = ep_return
+            # Sleep gain from episode quality (Bethus et al. 2010)
+            if self._episode_return > self._best_episode_return:
+                self._best_episode_return = self._episode_return
 
             sleep_gain = 1.0
-            if len(self.neuromod._reward_history) >= 5:
-                _r_arr = np.array(self.neuromod._reward_history)
-                _r_mean = float(np.mean(_r_arr))
-                _r_std = float(np.std(_r_arr)) + 1e-8
-                _quality = (ep_return - _r_mean) / _r_std
-                # Only AMPLIFY good episodes, never attenuate bad ones.
-                # Bad episodes still contain useful learning signal (state
-                # dynamics, non-goal value landscape). Attenuating them
-                # slows down critic learning during early training.
-                # Amplification range: [1.0, 2.5] — a +3σ episode gets
-                # 2.5× consolidation, average episode gets 1.0×.
-                sleep_gain = max(1.0, float(np.clip(1.0 + 0.5 * _quality, 1.0, 2.5)))
+            if hasattr(self.neuromod, '_reward_history') and len(
+                self.neuromod._reward_history,
+            ) >= 5:
+                r_arr = np.array(self.neuromod._reward_history)
+                r_mean = float(np.mean(r_arr))
+                r_std = float(np.std(r_arr)) + 1e-8
+                quality = (self._episode_return - r_mean) / r_std
+                sleep_gain = float(np.clip(1.0 + 0.5 * quality, 1.0, 2.5))
 
-            layers_dict = {'encoder': self.world_model._encoder}
             self.replay_buffer.sleep_phase(
-                layers=layers_dict,
                 world_model=self.world_model,
                 neuromodulator=self.neuromod,
                 bg=self.bg,
                 sleep_gain=sleep_gain,
             )
-            # Biological basis (McClelland et al. 1995, Complementary Learning
-            # Systems): hippocampus maintains recent experience traces across
-            # multiple sleep cycles, not just one. The buffer's FIFO capacity
-            # limit naturally drops old experiences, modelling the days-to-weeks
-            # decay of hippocampal traces as they transfer to neocortex.
-            # Removing clear() allows successful trajectories to be replayed
-            # across multiple sleep phases, matching SWR multi-night replay.
 
         self._step_count += 1
 
+    # ------------------------------------------------------------------
+    # Episode reset
+    # ------------------------------------------------------------------
+
     def reset(self) -> None:
         self.bg.reset_state()
-        self._trace = np.zeros(self.state_size, dtype=np.float32)
-        self._action_commitment_remaining = 0
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()

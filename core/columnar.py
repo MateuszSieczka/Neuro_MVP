@@ -101,7 +101,7 @@ def build_columnar_network(
         col = PredictiveCodingLayer(
             num_inputs=receptive_field_size,
             num_neurons=neurons_per_column,
-            config=column_config,
+            pc_cfg=column_config,
         )
         net.add_layer(name, col)
         column_names.append(name)
@@ -111,7 +111,7 @@ def build_columnar_network(
     assoc = PredictiveCodingLayer(
         num_inputs=total_column_outputs,
         num_neurons=assoc_neurons,
-        config=assoc_config,
+        pc_cfg=assoc_config,
     )
     net.add_layer(assoc_name, assoc)
 

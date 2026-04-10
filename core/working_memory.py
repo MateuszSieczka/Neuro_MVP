@@ -1,30 +1,32 @@
+"""
+Working Memory — prefrontal attractor dynamics with dual ACh+DA gating.
+
+Reference:
+  Goldman-Rakic (1995)  Prefrontal persistent activity
+  O'Reilly & Frank (2006)  "Making working memory work"
+
+Changes from legacy:
+  1. Dual gating: ACh (sensory) AND DA (update signal) — conjunction gate
+  2. Uses WorkingMemoryConfig from config.py (derived mem_decay, content_decay)
+  3. Gate opens only when BOTH ACh ≥ threshold AND DA ≥ threshold
+"""
+
+from __future__ import annotations
+
 import numpy as np
+from numpy.typing import NDArray
+
 from .config import WorkingMemoryConfig
 
 
 class WorkingMemoryModule:
-    """
-    Persistent working memory via recurrent attractor dynamics.
+    """Persistent WM via recurrent attractor dynamics with dual gating.
 
-    Biological grounding:
-      - Prefrontal cortex maintains task-relevant representations through
-        re-entrant loops among pyramidal neurons.
-      - Slow membrane time constant (tau_m ≈ 300 ms) allows voltage to persist
-        between sparse input events.
-      - Hebbian lateral weights form "cliques" of co-active neurons; once a
-        clique is seeded it sustains itself via recurrent excitation.
-
-    Gating:
-      - Acetylcholine (ACh) opens/closes the gate.
-      - Gate OPEN  (ACh ≥ threshold): layer accepts external sensory input,
-        updates content, and learns lateral associations.
-      - Gate CLOSED (ACh < threshold): layer ignores external input and
-        sustains current content through w_lateral alone.
-
-    Weight convention:
-      - w_ff:      (num_external_inputs × num_neurons) — feedforward from senses.
-      - w_lateral: (num_neurons × num_neurons)         — recurrent attractor loop.
-                   Diagonal is always zero (no self-excitation).
+    Dual gating (O'Reilly & Frank 2006):
+      ACh gates sensory input (bottom-up relevance)
+      DA gates update signal (reward PE → new context important)
+      Gate OPEN:  ACh ≥ threshold AND DA ≥ threshold (conjunction)
+      Gate CLOSED: sustain content through w_lateral alone
     """
 
     def __init__(
@@ -36,93 +38,97 @@ class WorkingMemoryModule:
         self.config = config or WorkingMemoryConfig()
         self.num_neurons = num_neurons
         self.num_external_inputs = num_external_inputs
+        cfg = self.config
 
         # ── Membrane state ────────────────────────────────────────────
-        self.v: np.ndarray = np.full(num_neurons, self.config.v_rest, dtype=np.float32)
-        self.has_spiked: np.ndarray = np.zeros(num_neurons, dtype=bool)
-        self.refrac_count: np.ndarray = np.zeros(num_neurons, dtype=np.int32)
+        self.v: NDArray[np.float32] = np.full(
+            num_neurons, cfg.v_rest, dtype=np.float32,
+        )
+        self.has_spiked: NDArray[np.bool_] = np.zeros(num_neurons, dtype=bool)
+        self.refrac_count: NDArray[np.int32] = np.zeros(num_neurons, dtype=np.int32)
 
         # ── Synaptic weights ──────────────────────────────────────────
-        self.w_ff: np.ndarray = np.random.uniform(
-            0.1, 0.5, (num_external_inputs, num_neurons)
+        self.w_ff: NDArray[np.float32] = np.random.uniform(
+            0.1, 0.5, (num_external_inputs, num_neurons),
         ).astype(np.float32)
-
-        self.w_lateral: np.ndarray = np.zeros(
-            (num_neurons, num_neurons), dtype=np.float32
-        )  # Diagonal stays zero throughout learning
-
-        # ── Eligibility traces (for feedforward path only) ────────────
-        self.e: np.ndarray = np.zeros(
-            (num_external_inputs, num_neurons), dtype=np.float32
+        self.w_lateral: NDArray[np.float32] = np.zeros(
+            (num_neurons, num_neurons), dtype=np.float32,
         )
-        self.x_pre: np.ndarray = np.zeros(num_external_inputs, dtype=np.float32)
-        self.x_post: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
 
-        # ── Pre-computed exact exponential decay factors ───────────────
-        self._mem_decay: float = np.exp(-self.config.dt / self.config.tau_m)
-        self._trace_decay: float = np.exp(-self.config.dt / self.config.tau_e)
-        self._pre_decay: float = np.exp(-self.config.dt / self.config.tau_pre)
-        self._post_decay: float = np.exp(-self.config.dt / self.config.tau_post)
+        # ── Eligibility traces ────────────────────────────────────────
+        self.e: NDArray[np.float32] = np.zeros(
+            (num_external_inputs, num_neurons), dtype=np.float32,
+        )
+        self.x_pre: NDArray[np.float32] = np.zeros(
+            num_external_inputs, dtype=np.float32,
+        )
+        self.x_post: NDArray[np.float32] = np.zeros(
+            num_neurons, dtype=np.float32,
+        )
 
-        # ── Gate and content ──────────────────────────────────────────
+        # ── Precomputed decays from config ────────────────────────────
+        self._mem_decay: float = cfg.mem_decay
+        self._trace_decay: float = cfg.ctx.decay(cfg.tau_e)
+        self._pre_decay: float = cfg.ctx.decay(cfg.tau_pre)
+        self._post_decay: float = cfg.ctx.decay(cfg.tau_post)
+        self._content_decay: float = cfg.content_decay
+
+        # ── Gate state ────────────────────────────────────────────────
         self.gate_open: bool = False
-        # POPRAWKA Bug B: content to gasnący ślad aktywności (filtr dolnoprzepustowy),
-        # NIE binarny spike z poprzedniego kroku. Neurony w refrakcji mogą dalej
-        # podtrzymywać atraktor przez wolno gasnący ślad (tau ≈ tau_m = 300 ms).
-        self.content: np.ndarray = np.zeros(num_neurons, dtype=np.float32)
-        # Zanik śladu zawartości: wolniejszy niż tau_m, by atraktor przetrwał refrakcję.
-        # Używamy tau_m z konfiguracji (300 ms dla WM), co daje ≈ exp(-1/300) ≈ 0.9967.
-        self._content_decay: float = float(np.exp(-self.config.dt / self.config.tau_m))
-        # Inicjalizacja atrybutu, którego oczekuje system podczas uczenia / konsolidacji
-        self.prediction_error: np.ndarray = np.ones(num_neurons, dtype=np.float32)
+
+        # ── Content: low-pass filtered activity (attractor trace) ─────
+        self.content: NDArray[np.float32] = np.zeros(
+            num_neurons, dtype=np.float32,
+        )
+
+        # ── Prediction error placeholder ──────────────────────────────
+        self.prediction_error: NDArray[np.float32] = np.ones(
+            num_neurons, dtype=np.float32,
+        )
+
     # ------------------------------------------------------------------
-    # Gating interface
+    # Dual gating (O'Reilly & Frank 2006)
     # ------------------------------------------------------------------
 
-    def gate(self, ach_level: float) -> None:
-        """
-        Open or close the working memory gate.
+    def gate(self, ach_level: float, da_level: float = 1.0) -> None:
+        """Dual ACh+DA conjunction gate.
 
-        Args:
-            ach_level: Acetylcholine level from NeuromodulatorSystem (0–1).
-                       Gate opens when ach_level ≥ config.gate_threshold.
+        Gate opens only when BOTH ACh ≥ threshold AND DA ≥ threshold.
+        ACh gates sensory input, DA gates update signal.
         """
-        self.gate_open = float(ach_level) >= self.config.gate_threshold
+        cfg = self.config
+        self.gate_open = (
+            float(ach_level) >= cfg.ach_gate_threshold
+            and float(da_level) >= cfg.da_gate_threshold
+        )
 
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
 
-    def forward(self, external_input: np.ndarray) -> np.ndarray:
+    def forward(self, external_input: NDArray[np.float32]) -> NDArray[np.bool_]:
+        """One timestep of WM dynamics.
+
+        OPEN:   integrates external_input through w_ff + recurrent w_lateral.
+        CLOSED: ignores external_input; sustains content through w_lateral.
         """
-        One timestep of working memory dynamics.
+        cfg = self.config
 
-        When OPEN:  integrates external_input through w_ff + recurrent via w_lateral.
-        When CLOSED: ignores external_input; sustains content through w_lateral only.
-
-        Args:
-            external_input: Sensory or layer-below spike pattern (num_external_inputs,).
-
-        Returns:
-            Boolean spike array (num_neurons,).
-        """
         # ── Trace decay ───────────────────────────────────────────────
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
 
         # ── Input current ─────────────────────────────────────────────
         if self.gate_open:
-            external_current = external_input.astype(np.float32) @ self.w_ff
-            pre_active = external_input > 0
-            self.x_pre[pre_active] += 1.0
+            ext_f32 = external_input.astype(np.float32)
+            external_current = ext_f32 @ self.w_ff
+            self.x_pre += np.clip(ext_f32, 0.0, 1.0)
         else:
-            # Gate closed: external path is suppressed
             external_current = np.zeros(self.num_neurons, dtype=np.float32)
-            pre_active = np.zeros(self.num_external_inputs, dtype=bool)
 
-        # Recurrent contribution is always active (attractor maintenance)
+        # Recurrent contribution always active (attractor maintenance)
         recurrent_current = (
-            self.content @ self.w_lateral * self.config.lateral_strength
+            self.content @ self.w_lateral * cfg.lateral_strength
         )
         total_current = external_current + recurrent_current
 
@@ -130,32 +136,32 @@ class WorkingMemoryModule:
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1
 
-        integrated_v = self.v * self._mem_decay + (
-            self.config.v_rest + total_current
-        ) * (1.0 - self._mem_decay)
+        integrated_v = (
+            self.v * self._mem_decay
+            + (cfg.v_rest + total_current) * (1.0 - self._mem_decay)
+        )
+        self.v = np.where(in_refrac, cfg.v_reset, integrated_v)
+        self.has_spiked = (self.v >= cfg.v_thresh) & ~in_refrac
 
-        self.v = np.where(in_refrac, self.config.v_reset, integrated_v)
-        self.has_spiked = (self.v >= self.config.v_thresh) & ~in_refrac
-
-        self.v[self.has_spiked] = self.config.v_reset
-        self.refrac_count[self.has_spiked] = self.config.refrac_period
+        self.v[self.has_spiked] = cfg.v_reset
+        self.refrac_count[self.has_spiked] = cfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
 
-        # ── Eligibility traces (feedforward path, gate-gated) ─────────
+        # ── Eligibility traces (feedforward, gate-gated) ─────────────
         if self.gate_open:
             self.e *= self._trace_decay
             if np.any(self.has_spiked):
                 self.e[:, self.has_spiked] += self.x_pre[:, np.newaxis]
+            ext_f32 = external_input.astype(np.float32)
+            pre_active = ext_f32 > 0.1
             if np.any(pre_active):
                 self.e[pre_active, :] += self.x_post[np.newaxis, :]
 
-        # ── Update content, then learn lateral connections ────────────
-        # POPRAWKA Bug B: Ślad aktywności zamiast binarnych spike'ów.
-        # Każdy spike dodaje 1.0 do śladu; ślad gaśnie z tau_m.
-        # Neurony w refrakcji (has_spiked=False) nie dodają 0 — ich poprzedni ślad
-        # po prostu gaśnie. Recurrent_current pozostaje niezerowe przez cały okres
-        # refrakcji, co podtrzymuje atraktor.
-        self.content = self.content * self._content_decay + self.has_spiked.astype(np.float32)
+        # ── Content update + lateral learning ─────────────────────────
+        self.content = (
+            self.content * self._content_decay
+            + self.has_spiked.astype(np.float32)
+        )
         self._update_lateral_weights()
 
         return self.has_spiked
@@ -165,41 +171,27 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
 
     def _update_lateral_weights(self) -> None:
-        """
-        Hebbian co-activation rule: neurons that fire together wire together.
-
-        Row-wise L∞ normalization prevents runaway lateral excitation
-        (equivalent to Oja's rule in the limit).
-        Self-connections (diagonal) are always kept at zero.
-        """
+        """Hebbian co-activation: neurons that fire together wire together."""
         active = self.has_spiked.astype(np.float32)
         if np.sum(active) < 2:
             return
 
         dw = self.config.lateral_lr * np.outer(active, active)
-        np.fill_diagonal(dw, 0.0)  # No self-excitation
+        np.fill_diagonal(dw, 0.0)
         self.w_lateral += dw
 
-        # Soft normalization: clip rows that exceed 1.0 maximum weight
+        # Soft normalisation
         row_max = np.max(self.w_lateral, axis=1, keepdims=True)
         scale = np.where(row_max > 1.0, row_max, 1.0)
         self.w_lateral /= scale
-
-        # Ensure diagonal stays zero after normalization
         np.fill_diagonal(self.w_lateral, 0.0)
 
     # ------------------------------------------------------------------
-    # Feedforward weight update (three-factor rule, same as LIFLayer)
+    # Weight update (three-factor rule)
     # ------------------------------------------------------------------
 
-    def update_weights(self, m_t: float, pred_error: np.ndarray) -> None:
-        """
-        Three-factor STDP update for feedforward weights.
-
-        Args:
-            m_t:        Dopaminergic modulation signal (scalar).
-            pred_error: Prediction error vector (num_neurons,).
-        """
+    def update_weights(self, m_t: float, pred_error: NDArray[np.float32]) -> None:
+        """Three-factor STDP for feedforward weights."""
         if np.isclose(m_t, 0.0):
             return
         dw = self.config.learning_rate * m_t * self.e * pred_error
@@ -210,10 +202,7 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
 
     def reset_state(self) -> None:
-        """
-        Reset transient neuron state between episodes.
-        Learned weights (w_ff and w_lateral) are preserved.
-        """
+        """Reset transient state. Learned weights preserved."""
         self.v.fill(self.config.v_rest)
         self.e.fill(0.0)
         self.x_pre.fill(0.0)
@@ -222,3 +211,4 @@ class WorkingMemoryModule:
         self.has_spiked.fill(False)
         self.content.fill(0.0)
         self.prediction_error.fill(1.0)
+        self.gate_open = False

@@ -46,7 +46,7 @@ from core.working_memory import WorkingMemoryModule
 from core.neuromodulator import NeuromodulatorSystem
 from core.basal_ganglia import BasalGangliaAGISystem, ContinuousBGConfig
 from core.world_model import SNNWorldModel
-from core.replay_buffer import ReplayBuffer
+from core.replay_buffer import ReplayBuffer, Experience
 from core.network import NetworkGraph
 from core.sequence_memory import SequenceMemory
 from core.config import (
@@ -591,7 +591,7 @@ class TestContinualLearningResilience(unittest.TestCase):
         self.net = NetworkGraph()
         self.net.add_layer("L1", self.layer)
 
-        bg_cfg = ContinuousBGConfig(critic_lr=0.05, tau_hidden=5.0, hidden_size=64)
+        bg_cfg = ContinuousBGConfig(critic_lr=0.05, hidden_size=64)
         self.bg = BasalGangliaAGISystem(
             state_size=self.state_dim, motor_dim=self.action_dim, config=bg_cfg,
         )
@@ -617,14 +617,14 @@ class TestContinualLearningResilience(unittest.TestCase):
             self.wm.update(l1_repr, motor, l1_repr, m_t=self.nm.learning_rate_modulation)
 
             if store:
-                self.buffer.store(
+                self.buffer.store(Experience(
                     state=l1_repr, action=motor, reward=reward, next_state=l1_repr,
-                    layer_traces={"L1": self.layer.e.copy()},
-                    layer_outputs={"L1": l1_repr},
                     prediction_error=self.layer.prediction_error,
-                    layer_errors={"L1": self.layer.prediction_error},
+                    encoder_e_bu=self.wm.encoder.e_bu.copy(),
+                    encoder_spikes=self.wm.encoder.spikes_state.astype(np.float32),
+                    bg_snapshot=self.bg.snapshot_traces(),
                     salience=1.0 if is_terminal else 0.0,
-                )
+                ))
             self.net.update_weights(self.nm)
             self.nm.update(self.layer.prediction_error, td_error=td_err)
 
@@ -664,7 +664,7 @@ class TestContinualLearningResilience(unittest.TestCase):
         v_a_after_interference = self._eval_critic(eval_a)
 
         # Phase 3: Sleep consolidation (replays task A experiences)
-        self.buffer.sleep_phase({"L1": self.layer}, self.wm, self.nm)
+        self.buffer.sleep_phase(self.wm, self.nm, self.bg)
 
         v_a_after_sleep = self._eval_critic(eval_a)
 
@@ -721,9 +721,7 @@ class TestMentalRehearsalImagination(unittest.TestCase):
 
         wm_cfg = SNNWorldModelConfig(
             hidden_size=16,
-            k_winners=5,
             decode_lr=0.02,
-            feedback_learning_rate=0.01,
         )
         self.wm = SNNWorldModel(
             state_size=self.state_dim,
@@ -743,38 +741,32 @@ class TestMentalRehearsalImagination(unittest.TestCase):
         for _ in range(20):
             self.wm.update(state, 0, state, m_t=0.3)
 
-        enc = self.wm._encoder
+        enc = self.wm.encoder
 
         # Snapshot before rehearsal
-        v_before = enc.v.copy()
-        spikes_before = enc.has_spiked.copy()
-        refrac_before = enc.refrac_count.copy()
-        e_before = enc.e.copy()
-        x_pre_before = enc.x_pre.copy()
-        x_post_before = enc.x_post.copy()
+        v_before = enc.v_state.copy()
+        spikes_before = enc.spikes_state.copy()
+        refrac_before = enc.refrac_state.copy()
+        e_before = enc.e_bu.copy()
 
         # Run mental rehearsal with multiple candidate actions
         results = self.wm.mental_rehearsal(state, [0, 1, 2])
 
         # Verify state is restored
-        np.testing.assert_array_equal(enc.v, v_before,
+        np.testing.assert_array_equal(enc.v_state, v_before,
                                       "Rehearsal zmodyfikował potencjał membrany.")
-        np.testing.assert_array_equal(enc.has_spiked, spikes_before,
+        np.testing.assert_array_equal(enc.spikes_state, spikes_before,
                                       "Rehearsal zmodyfikował stan impulsów.")
-        np.testing.assert_array_equal(enc.refrac_count, refrac_before,
+        np.testing.assert_array_equal(enc.refrac_state, refrac_before,
                                       "Rehearsal zmodyfikował stan refrakcji.")
-        np.testing.assert_array_equal(enc.e, e_before,
+        np.testing.assert_array_equal(enc.e_bu, e_before,
                                       "Rehearsal zmodyfikował ślady kwalifikowalności.")
-        np.testing.assert_array_equal(enc.x_pre, x_pre_before,
-                                      "Rehearsal zmodyfikował ślad presynaptyczny.")
-        np.testing.assert_array_equal(enc.x_post, x_post_before,
-                                      "Rehearsal zmodyfikował ślad postsynaptyczny.")
 
         # Results should exist for all 3 actions
         self.assertEqual(len(results), 3)
         for action_id in [0, 1, 2]:
             self.assertIn(action_id, results)
-            self.assertIn("predicted_state", results[action_id])
+            self.assertIsNotNone(results[action_id].predicted_state)
 
         print("\n[Imagination] State correctly restored after rehearsal.")
 
@@ -794,7 +786,7 @@ class TestMentalRehearsalImagination(unittest.TestCase):
         # Warm up encoder membranes
         for _ in range(50):
             combined = self.wm._build_input(state, action)
-            self.wm._encoder.forward(combined)
+            self.wm.encoder.forward(combined)
 
         # Early prediction (untrained decoder)
         early_pred = self.wm.predict(state, action)
@@ -839,7 +831,7 @@ class TestMentalRehearsalImagination(unittest.TestCase):
         # Warm up encoder membranes
         for _ in range(50):
             combined = self.wm._build_input(state, 0)
-            self.wm._encoder.forward(combined)
+            self.wm.encoder.forward(combined)
 
         # Train both transitions (interleaved)
         for _ in range(300):

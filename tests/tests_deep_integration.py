@@ -30,7 +30,7 @@ from core.sequence_memory import SequenceMemory
 from core.basal_ganglia import BasalGangliaAGISystem, ContinuousBGConfig
 from core.world_model import SNNWorldModel
 from core.neuromodulator import NeuromodulatorSystem
-from core.replay_buffer import ReplayBuffer
+from core.replay_buffer import ReplayBuffer, Experience
 
 
 # =====================================================================
@@ -192,6 +192,7 @@ class TestHierarchicalPredictiveCoding(unittest.TestCase):
     """
 
     def setUp(self):
+        np.random.seed(42)
         self.dim = 8  # Square: num_inputs == num_neurons
 
         self.pc_config = PredictiveCodingConfig(
@@ -399,7 +400,7 @@ class TestRewardGatedScalability(unittest.TestCase):
         self.net = NetworkGraph()
         self.net.add_layer("L1", self.layer)
 
-        bg_cfg = ContinuousBGConfig(critic_lr=0.05, tau_hidden=5.0, hidden_size=64)
+        bg_cfg = ContinuousBGConfig(critic_lr=0.05, hidden_size=64)
         self.bg = BasalGangliaAGISystem(
             state_size=self.hidden_dim, motor_dim=self.action_dim, config=bg_cfg,
         )
@@ -440,14 +441,14 @@ class TestRewardGatedScalability(unittest.TestCase):
             motor, _, td_err = self.bg.step(l1_repr, reward=reward, is_terminal=is_terminal)
             self.wm.update(l1_repr, motor, l1_repr, m_t=self.nm.learning_rate_modulation)
 
-            self.buffer.store(
+            self.buffer.store(Experience(
                 state=l1_repr, action=motor, reward=reward, next_state=l1_repr,
-                layer_traces={"L1": self.layer.e.copy()},
-                layer_outputs={"L1": l1_repr},
                 prediction_error=self.layer.prediction_error,
-                layer_errors={"L1": self.layer.prediction_error},
+                encoder_e_bu=self.wm.encoder.e_bu.copy(),
+                encoder_spikes=self.wm.encoder.spikes_state.astype(np.float32),
+                bg_snapshot=self.bg.snapshot_traces(),
                 salience=1.0 if is_terminal else 0.0,
-            )
+            ))
             self.net.update_weights(self.nm)
             self.nm.update(self.layer.prediction_error, td_error=td_err)
 
@@ -520,7 +521,7 @@ class TestRewardGatedScalability(unittest.TestCase):
         from core.config import SNNWorldModelConfig
 
         # Smaller hidden layer = more concentrated excitation = reliable spikes
-        wm_cfg = SNNWorldModelConfig(hidden_size=16, k_winners=5, decode_lr=0.02)
+        wm_cfg = SNNWorldModelConfig(hidden_size=16, decode_lr=0.02)
         wm = SNNWorldModel(
             state_size=self.hidden_dim, action_size=self.action_dim, config=wm_cfg,
         )
@@ -532,7 +533,7 @@ class TestRewardGatedScalability(unittest.TestCase):
         # Warmup: let encoder membranes stabilize
         for _ in range(50):
             combined = wm._build_input(l1_repr, dummy_action)
-            wm._encoder.forward(combined)
+            wm.encoder.forward(combined)
 
         # Record early MSE
         early_mse = []
@@ -567,7 +568,7 @@ class TestRewardGatedScalability(unittest.TestCase):
             self._run_episode(stimulus, episode_len=50)
 
         # Consolidation
-        self.buffer.sleep_phase({"L1": self.layer}, self.wm, self.nm)
+        self.buffer.sleep_phase(self.wm, self.nm, self.bg)
 
         # Check all weight matrices
         weight_checks = [

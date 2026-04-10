@@ -1,27 +1,89 @@
+"""core -- Biologically grounded SNN components for AGI foundation."""
+
+# -- Configuration --
 from .config import (
-    LIFConfig,
-    HomeostaticLIFConfig,
-    KWTAConfig,
+    NeuronConfig,
+    STDPConfig,
+    HomeostaticConfig,
+    CompetitiveConfig,
     PredictiveCodingConfig,
+    PyramidalConfig,
+    ErrorNeuronConfig,
+    InhibitoryPoolConfig,
     WorkingMemoryConfig,
     NeuromodulatorConfig,
-    SequenceMemoryConfig,
-    SNNWorldModelConfig,
-    EpisodicMemoryConfig,
+    OscillatorConfig,
+    AstrocyteConfig,
     AttentionConfig,
+    SequenceMemoryConfig,
+    WorldModelConfig,
+    EpisodicMemoryConfig,
+    ReplayBufferConfig,
     ActiveInferenceConfig,
+    BasalGangliaConfig,
+    ReceptorType,
+    SynapseType,
+    ReceptorProfile,
+    CORTICAL_L4_RECEPTORS,
+    CORTICAL_L5_RECEPTORS,
+    PFC_RECEPTORS,
+    STRIATUM_D1_RECEPTORS,
+    STRIATUM_D2_RECEPTORS,
+    init_weights,
+    compute_weight_std,
 )
+
+# -- Simulation context --
+from .simulation_context import SimulationContext, DEFAULT_CONTEXT
+from .free_energy import (
+    variational_free_energy,
+    expected_free_energy,
+    precision_weighted_update,
+)
+
+# -- Receptor pharmacology --
+from .receptor import receptor_effect, compute_layer_modulation
+
+# -- Synapse models --
+from .synapse import SynapticChannels
+
+# -- Neuron layers --
 from .neuron import LIFLayer
 from .competitive_layer import CompetitiveLIFLayer
 from .predictive_coding import PredictiveCodingLayer
+from .pyramidal_neuron import PyramidalLayer
+from .error_neuron import ErrorNeuronLayer
+from .interneuron import InhibitoryPool
+
+# -- Neuromodulation --
 from .neuromodulator import NeuromodulatorSystem
-from .working_memory import WorkingMemoryModule
-from .replay_buffer import ReplayBuffer, Experience
-from .world_model import SNNWorldModel
-from .spike_encoder import PoissonEncoder
-from .sequence_memory import SequenceMemory
-from .network import NetworkGraph, LayerConnection
-from .episodic_memory import EpisodicMemory, Episode
-from .columnar import build_columnar_network, split_input
+from .oscillator import ThetaGammaOscillator
+from .astrocyte import AstrocyteField
+
+# -- Attention --
 from .attention import SpatialAttentionController
-from .active_inference import ActiveInferenceModule
+
+# -- Memory systems --
+from .working_memory import WorkingMemoryModule
+from .episodic_memory import EpisodicMemory, Episode
+from .replay_buffer import ReplayBuffer, Experience
+from .sequence_memory import SequenceMemory, HierarchicalSequenceMemory
+
+# -- World model --
+from .world_model import SNNWorldModel, EncoderSnapshot, RehearsalResult
+
+# -- Basal ganglia --
+from .basal_ganglia import (
+    BasalGangliaAGISystem,
+    ActiveInferenceModule,
+    D1D2Actor,
+    SNNDeepCritic,
+    BGSnapshot,
+)
+
+# -- Network orchestration --
+from .network import NetworkGraph, LayerConnection
+from .columnar import build_columnar_network, split_input
+
+# -- Encoding --
+from .spike_encoder import PoissonEncoder, GaussianPopulationEncoder

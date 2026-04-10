@@ -1,486 +1,848 @@
-import numpy as np
+"""
+Basal Ganglia — D1/D2 dual-pathway action selection with Active Inference.
+
+Reference:
+  Frank (2005)  "Dynamic dopamine modulation in the basal ganglia"
+  Gurney, Prescott & Redgrave (2001)  "A computational model of action
+      selection in the basal ganglia"
+  Wilson & Kawaguchi (1996)  "In vivo intracellular recording ... MSNs"
+  Friston (2010)  "The free-energy principle: a unified brain theory"
+  Schultz (1998)  "Predictive reward signal of DA neurons"
+
+Architecture:
+  D1-MSN (direct/Go):   DA excites → disinhibits thalamus → facilitates action
+  D2-MSN (indirect/NoGo): DA inhibits → maintains STN inhibition → suppresses
+  Critic (ventral striatum): V(s) estimation via LIF population
+  Active Inference:      G(a) = -pragmatic(a) + ambiguity - β × epistemic(a)
+                         BG D1 ≈ pragmatic, D2 ≈ cost/risk, world model ≈ epistemic
+
+MSN bistable dynamics (Wilson & Kawaguchi 1996):
+  Down state: τ_m ≈ 80ms, high threshold (quiescent)
+  Up state:   τ_m ≈ 25ms, low threshold (ready to fire)
+  Transition gated by cortical input level
+
+Changes from legacy:
+  1. D1/D2 pathway split replaces single actor
+  2. Bistable MSN membrane dynamics (Up/Down state)
+  3. Active Inference merged: BG directly computes G(a)
+  4. Input gain derived from biophysics (no arbitrary 3.0× multiplier)
+  5. Uses BasalGangliaConfig + ActiveInferenceConfig from config.py
+  6. Weight init via init_weights() (PSP-target scaling)
+  7. InhibitoryPool from new interneuron.py with inhibitory STDP
+"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Tuple
+from typing import TYPE_CHECKING
+
+import numpy as np
+from numpy.typing import NDArray
+
+from .config import (
+    BasalGangliaConfig,
+    ActiveInferenceConfig,
+    InhibitoryPoolConfig,
+    init_weights,
+)
+from .free_energy import expected_free_energy
+from .interneuron import InhibitoryPool
+
+if TYPE_CHECKING:
+    from .world_model import SNNWorldModel
 
 
-@dataclass(frozen=True, kw_only=True)
-class ContinuousBGConfig:
-    gamma: float = 0.99
-    critic_lr: float = 7e-3   # Tempo uczenia Krytyka — szybkie z krótkim tau_e_critic=5
-    actor_lr: float = 5e-3    # Aktor z policy gradient trace — wyższe lr z konsolidacją
-    tau_e: float = 20.0       # Bazowe tau dla aktora (NMDA/Ca²⁺, ~1s)
-    tau_e_critic: float = 5.0 # Krótsze tau dla krytyka — szybsza konwergencja V(s)
-    tau_hidden: float = 2.0   # Stała czasowa membrany ukrytej — krótka dla szybkiej odpowiedzi
-    dt: float = 1.0
-    exploration_noise: float = 0.3  # Temperatura softmax (wyższa na starcie → eksploracja)
-    hidden_size: int = 128  # Rozmiar warstwy ukrytej Krytyka
-    tau_ne_compression: float = 4.0  # Max trace-tau compression factor at NE=1.0
-    w_clip: float = 3.0      # Synaptic saturation for actor: max |w| (receptor density / spine volume)
-    w_clip_critic: float = 5.0  # Ventral striatal critic: wider dynamic range needed to
-                                 # represent cumulative V(s) across long episodes (Schultz 1998)
-    td_rms_decay: float = 0.999  # Slow decay for running RMS of TD error (adaptive DA gain)
+# =====================================================================
+# Snapshot for replay
+# =====================================================================
 
+@dataclass
+class BGSnapshot:
+    """BG eligibility traces stored per experience for replay."""
+    critic_e_h: NDArray[np.float32]
+    critic_e_v: NDArray[np.float32]
+    critic_e_bv: float
+    d1_e: NDArray[np.float32]
+    d2_e: NDArray[np.float32]
+
+    def __post_init__(self) -> None:
+        for name in ('critic_e_h', 'critic_e_v', 'd1_e', 'd2_e'):
+            val = getattr(self, name)
+            if isinstance(val, np.ndarray):
+                object.__setattr__(self, name, val.copy())
+
+
+# =====================================================================
+# Bistable MSN helpers
+# =====================================================================
+
+def _msn_decay(
+    cortical_drive: NDArray[np.float32],
+    cfg: BasalGangliaConfig,
+    threshold: float = 0.3,
+) -> NDArray[np.float32]:
+    """Per-neuron membrane decay switching between Up and Down state.
+
+    Wilson & Kawaguchi (1996): MSN bistability.
+      cortical_drive > threshold → Up state (fast τ, ready to fire)
+      cortical_drive ≤ threshold → Down state (slow τ, quiescent)
+
+    Returns per-neuron decay factor exp(-dt / τ_effective).
+    """
+    up_mask = cortical_drive > threshold
+    tau = np.where(
+        up_mask,
+        cfg.tau_m_msn_up,
+        cfg.tau_m_msn_down,
+    )
+    return np.exp(-cfg.ctx.dt / tau).astype(np.float32)
+
+
+def _derive_input_gain(
+    fan_in: int,
+    tau_m: float,
+    cfg: BasalGangliaConfig,
+    target_rate: float = 0.05,
+) -> float:
+    """Derive synaptic gain from biophysics — no arbitrary multiplier.
+
+    I_thresh = gap × (1 - decay): current needed to reach threshold in one dt.
+    Expected active inputs = fan_in × target_rate.
+    Gain = I_thresh / (expected_active × w_mean), where w_mean ≈ PSP_target init.
+
+    This replaces the old `3.0 × gap × sqrt(fan_in)` formula.
+    """
+    decay = np.exp(-cfg.ctx.dt / tau_m)
+    gap = abs(cfg.v_thresh - cfg.v_rest)
+    i_thresh = gap * (1.0 - decay)
+    expected_active = max(1.0, fan_in * target_rate)
+    return float(i_thresh / expected_active)
+
+
+# =====================================================================
+# LIF Critic (ventral striatum)
+# =====================================================================
 
 class SNNDeepCritic:
-    """
-    Głęboki Krytyk (Nieliniowy). Posiada jedną warstwę ukrytą LIF,
-    aby poprawnie estymować funkcję wartości dla złożonych, nieliniowych
-    przestrzeni (rozwiązanie problemu XOR/szachownicy).
+    """LIF-based Critic for value estimation (ventral striatum).
+
+    Ventral striatal neurons encode V(s) as population firing rate
+    (Schultz 1998; Samejima et al. 2005). Value is read out as linear
+    projection from hidden-layer rate-coded activity. Learning uses
+    three-factor STDP modulated by dopaminergic TD error.
     """
 
-    def __init__(self, state_size: int, config: ContinuousBGConfig):
+    def __init__(self, state_size: int, config: BasalGangliaConfig) -> None:
         self.config = config
         self._state_size = state_size
+        h = config.hidden_size
 
-        # --- Xavier-like init: std = 1/sqrt(fan_in) ---
-        # Zapewnia, że wariancja aktywacji jest ~1 niezależnie od state_size.
-        h_std = 1.0 / np.sqrt(state_size)
-        self.w_h = np.random.uniform(-h_std, h_std, (state_size, config.hidden_size)).astype(np.float32)
+        # ── Precomputed membrane decay ────────────────────────────────
+        self._mem_decay: float = config.ctx.decay(config.tau_m_critic)
 
-        v_std = 1.0 / np.sqrt(config.hidden_size)
-        self.w_v = np.random.uniform(-v_std, v_std, config.hidden_size).astype(np.float32)
+        # ── Input gain from biophysics ────────────────────────────────
+        self._input_gain: float = _derive_input_gain(
+            state_size, config.tau_m_critic, config,
+        )
 
-        # Biases — biological: resting potential / spontaneous activity.
-        # Hidden bias b_h shifts each neuron's activation independently
-        # of the current state, enabling non-zero V(s) at the origin.
-        # Output bias b_v represents the baseline expected value.
-        self.b_h = np.zeros(config.hidden_size, dtype=np.float32)
+        # ── Weights via principled init ───────────────────────────────
+        self.w_h: NDArray[np.float32] = init_weights(state_size, h, excitatory=True)
+
+        # ── LIF state (warm start near threshold) ─────────────────────
+        self.v_hidden: NDArray[np.float32] = np.random.uniform(
+            config.v_rest, config.v_thresh, h,
+        ).astype(np.float32)
+        self.spikes_hidden: NDArray[np.bool_] = np.zeros(h, dtype=bool)
+        self.refrac_hidden: NDArray[np.int32] = np.zeros(h, dtype=np.int32)
+
+        # ── Rate-coded activation (EMA of spikes) ─────────────────────
+        self.activation: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        self._rate_decay: float = config.ctx.decay(config.tau_m_critic)
+
+        # ── Readout weights: hidden rates → V(s) ─────────────────────
+        v_std = 1.0 / np.sqrt(h)
+        self.w_v: NDArray[np.float32] = np.random.uniform(
+            -v_std, v_std, h,
+        ).astype(np.float32)
         self.b_v: float = 0.0
 
-        # Ślady dla propagacji błędu
-        self.e_h = np.zeros((state_size, config.hidden_size), dtype=np.float32)
-        self.e_v = np.zeros(config.hidden_size, dtype=np.float32)
-        self.e_bv: float = 0.0  # trace for output bias (constant input = 1)
-        self._trace_decay = np.exp(-self.config.dt / self.config.tau_e_critic)
-        self._mem_decay: float = float(np.exp(-self.config.dt / self.config.tau_hidden))
+        # ── InhibitoryPool for sparsity ───────────────────────────────
+        self.inh_pool = InhibitoryPool(
+            n_excitatory=h,
+            config=InhibitoryPoolConfig(
+                ctx=config.ctx,
+                n_interneurons=max(4, h // 4),
+                target_sparsity=0.15,
+            ),
+        )
 
-        # Potencjał membrany neuronów ukrytych
-        self.v_hidden = np.zeros(config.hidden_size, dtype=np.float32)
-        # Ciągła aktywacja (rate-code)
-        self.activation = np.zeros(config.hidden_size, dtype=np.float32)
+        # ── Eligibility traces (three-factor STDP) ────────────────────
+        self.e_h: NDArray[np.float32] = np.zeros((state_size, h), dtype=np.float32)
+        self.e_v: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        self.e_bv: float = 0.0
+        self._trace_decay: float = config.ctx.decay(config.tau_e_critic)
 
-    # ------------------------------------------------------------------
-    # Activation
-    # ------------------------------------------------------------------
+        # ── Pre/post STDP traces ──────────────────────────────────────
+        self._x_pre: NDArray[np.float32] = np.zeros(state_size, dtype=np.float32)
+        self._x_post: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        self._pre_decay: float = config.ctx.decay(20.0)  # 20ms STDP window
+        self._post_decay: float = config.ctx.decay(20.0)
 
-    def _graded_activation(self, v: np.ndarray) -> np.ndarray:
-        """Graded rate-code activation.
-
-        tanh zapewnia bounded [-1,1] output. Xavier init + krótkie
-        tau_hidden utrzymują |v| w zakresie liniowym tanh (~1–2)
-        bez potrzeby ręcznego gain.
-        """
-        return np.tanh(v)
-
-    # ------------------------------------------------------------------
-    # Forward / Peek
-    # ------------------------------------------------------------------
-
-    def forward(self, state_spikes: np.ndarray) -> float:
+    def forward(self, state_spikes: NDArray[np.float32]) -> float:
+        """Compute V(s) with LIF dynamics; update eligibility traces."""
         state_f32 = state_spikes.astype(np.float32)
+        cfg = self.config
 
-        # 1. Direct feedforward activation (rate-coded value representation).
-        #    Ventral striatal neurons encode expected value as firing RATE,
-        #    not as membrane state.  V(s) must be a function of the current
-        #    state only — it should NOT depend on previous states via
-        #    leaky membrane integration.  Temporal credit assignment is
-        #    handled by the eligibility traces (e_h, e_v), not membrane
-        #    persistence.  (Samejima, Ueda, Doya & Kimura 2005)
-        self.v_hidden = np.dot(state_f32, self.w_h) + self.b_h
+        # ── Pre-synaptic trace ────────────────────────────────────────
+        self._x_pre *= self._pre_decay
+        self._x_pre += np.clip(state_f32, 0.0, 1.0)
 
-        # 2. Ciągła aktywacja z adaptacyjnym gain
-        self.activation = self._graded_activation(self.v_hidden)
+        # ── Synaptic current ──────────────────────────────────────────
+        current = (state_f32 @ self.w_h) * self._input_gain
 
-        # 3. Ślady kwalifikowalności (accumulating traces)
-        # Akumulacja wzmacnia sygnał korelacyjny: e_ss ≈ act/(1-decay) ≈ tau_e × act.
-        # Stabilność zapewnia w_clip (synaptic saturation).
-        self.e_h = self.e_h * self._trace_decay + np.outer(state_f32, self.activation)
+        h = cfg.hidden_size
+        for _ in range(cfg.integration_steps):
+            in_refrac = self.refrac_hidden > 0
+            self.refrac_hidden[in_refrac] -= 1
+
+            leaked = (
+                self.v_hidden * self._mem_decay
+                + cfg.v_rest * (1.0 - self._mem_decay)
+            )
+            noise = np.random.normal(
+                0, cfg.membrane_noise_std, h,
+            ).astype(np.float32)
+            integrated = leaked + current + noise
+            self.v_hidden = np.where(in_refrac, cfg.v_reset, integrated)
+
+            inh_current = self.inh_pool.step(self.spikes_hidden.astype(np.float32))
+            self.v_hidden -= inh_current
+
+            self.spikes_hidden = (self.v_hidden >= cfg.v_thresh) & ~in_refrac
+            self.v_hidden[self.spikes_hidden] = cfg.v_reset
+            self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
+
+            rate_compl = 1.0 - self._rate_decay
+            self.activation = (
+                self.activation * self._rate_decay
+                + self.spikes_hidden.astype(np.float32) * rate_compl
+            )
+
+        # ── Post-synaptic trace ───────────────────────────────────────
+        self._x_post *= self._post_decay
+        self._x_post[self.spikes_hidden] += 1.0
+
+        # ── Eligibility: STDP correlation ─────────────────────────────
+        self.e_h *= self._trace_decay
+        if np.any(self.spikes_hidden):
+            self.e_h[:, self.spikes_hidden] += self._x_pre[:, np.newaxis]
+        pre_active = state_f32 > 0.1
+        if np.any(pre_active):
+            self.e_h[pre_active, :] += self._x_post[np.newaxis, :]
+
         self.e_v = self.e_v * self._trace_decay + self.activation
-        # Output bias trace: gated by network activity (mean |activation|).
-        # Biological basis: the bias represents tonic firing rate adaptation,
-        # which should only update when the network is genuinely processing
-        # input — not accumulate a constant +1 gradient that saturates the
-        # trace and amplifies drift during offline replay.
-        self.e_bv = self.e_bv * self._trace_decay + float(np.mean(np.abs(self.activation)))
-        # Ca²⁺ saturation — ślady ograniczone pojemnością kolca dendrytycznego.
-        # Zapobiega akumulacji przy bardzo długich epizodach.
-        np.clip(self.e_h, -2.0, 2.0, out=self.e_h)
-        np.clip(self.e_v, -2.0, 2.0, out=self.e_v)
-        self.e_bv = float(np.clip(self.e_bv, -2.0, 2.0))
+        self.e_bv = self.e_bv * self._trace_decay + float(np.mean(self.activation))
 
         return float(np.dot(self.w_v, self.activation) + self.b_v)
 
-    def peek(self, state_spikes: np.ndarray) -> float:
-        """Estimate V(s') without modifying internal state (membrane, traces)."""
-        state_f32 = state_spikes.astype(np.float32)
-        v_hid = np.dot(state_f32, self.w_h) + self.b_h
-        act = self._graded_activation(v_hid)
-        return float(np.dot(self.w_v, act) + self.b_v)
+    def peek(self, state_spikes: NDArray[np.float32]) -> float:
+        """Estimate V(s') without modifying internal state."""
+        return float(np.dot(self.w_v, self.activation) + self.b_v)
 
     def update(self, td_error: float) -> None:
-        """Biologiczna reguła uczenia: δ × ślad kwalifikowalności.
+        """Three-factor STDP: Δw = lr × DA(td_error) × eligibility."""
+        td = float(np.clip(td_error, -50.0, 50.0))
+        cfg = self.config
 
-        Warstwa wyjściowa (w_v): reguła Hebba modulowana dopaminą:
-            Δw_v = lr × δ × e_v
+        self.w_v += cfg.critic_lr * td * self.e_v
+        self.b_v += cfg.critic_lr * td * self.e_bv
 
-        Warstwa ukryta (w_h): TD error jest propagowany wstecz przez w_v,
-        analogicznie do sygnału z jądra podwzgórzowego (STN) modulującego
-        plastyczność korowo-prążkowiową.  Pochodna tanh' modeluje
-        nieliniową odpowiedź dendrytyczną neuronu postsynaptycznego.
+        self.w_h += cfg.critic_lr * td * self.e_h
 
-        Dendritic saturation (Williams & Stuart 2003):
-        The backpropagating signal through the apical dendrite has bounded
-        amplitude due to nonlinear dendritic processing.  We normalize the
-        feedback vector to prevent downstream weight growth (w_v at clip)
-        from destabilizing the hidden layer's learned features.
-
-        Per-synapse bounds are enforced by:
-        - trace clips (±2.0): Ca²⁺ saturation in dendritic spines
-        - weight clips: receptor density / spine volume limits
-        - feedback normalization: dendritic amplitude saturation
-        - TD clipping: bounded influence of extreme events
-        """
-        td_error = float(np.clip(td_error, -10.0, 10.0))
-
-        # Warstwa wyjściowa: prosta reguła δ×e
-        self.w_v += self.config.critic_lr * td_error * self.e_v
-        # Output bias: ∂V/∂b_v = 1 → trace e_bv accumulates constant input
-        self.b_v += self.config.critic_lr * td_error * self.e_bv
-
-        # Warstwa ukryta: δ propagowany wstecz przez w_v z pochodną aktywacji.
-        # tanh'(x) = 1 - tanh(x)² — modeluje nieliniową odpowiedź dendrytu.
-        activation_deriv = 1.0 - self.activation ** 2
-        feedback = self.w_v * activation_deriv   # (hidden,)
-
-        # Dendritic saturation: bound the feedback magnitude so that
-        # growth of w_v (needed to represent large V(s)) does not
-        # amplify the w_h gradient into instability.
-        fb_norm = float(np.linalg.norm(feedback))
-        if fb_norm > 1.0:
-            feedback = feedback / fb_norm
-
-        self.w_h += self.config.critic_lr * td_error * self.e_h * feedback[np.newaxis, :]
-
-        # Hidden bias: same gradient as w_h with input=1, so trace = e_v
-        # (which already accumulates activation). Biologically: resting
-        # potential adaptation driven by neuromodulatory TD signal.
-        self.b_h += self.config.critic_lr * td_error * self.e_v * feedback
-        np.clip(self.b_h, -5.0, 5.0, out=self.b_h)
-
-        # Synaptic saturation (output layer)
-        wc = self.config.w_clip_critic
+        # Homeostatic column normalisation
+        wc = cfg.w_clip_critic
         np.clip(self.w_v, -wc, wc, out=self.w_v)
-
-        # Homeostatic dendritic scaling (Turrigiano 2008):
-        # Maintain per-neuron total afferent input at a level that keeps
-        # tanh in its responsive (pre-saturation) range.
-        # Correct target: h_target = 1.0 gives Var(pre_activation) = 1
-        # because Var(x·w) = state_size × Var(x_i) × E[w²]
-        #                   = state_size × 1 × (h_target²/state_size)
-        #                   = h_target².
-        # With h_target=1: pre-activations ≈ N(0,1), tanh'(1) ≈ 0.42.
-        # The previous sqrt(fan_in) was a scaling error that saturated
-        # tanh for all state dims (tanh'(2)=0.07, tanh'(4)≈0).
-        h_target = 1.0
-        for j in range(self.config.hidden_size):
+        for j in range(cfg.hidden_size):
             col_norm = float(np.linalg.norm(self.w_h[:, j]))
-            if col_norm > h_target:
-                self.w_h[:, j] *= h_target / col_norm
-
+            if col_norm > wc:
+                self.w_h[:, j] *= wc / col_norm
 
     def reset_state(self) -> None:
-        """Reset transient state (membrane, traces). Weights/biases preserved."""
-        self.v_hidden.fill(0.0)
+        """Reset transient state between episodes. Weights preserved."""
+        cfg = self.config
+        self.v_hidden[:] = np.random.uniform(
+            cfg.v_rest, cfg.v_thresh, cfg.hidden_size,
+        ).astype(np.float32)
+        self.spikes_hidden.fill(False)
+        self.refrac_hidden.fill(0)
         self.activation.fill(0.0)
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
         self.e_bv = 0.0
+        self._x_pre.fill(0.0)
+        self._x_post.fill(0.0)
+        self.inh_pool.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
-        """
-        Dynamicznie dostosowuje stałe czasowe śladów kwalifikowalności
-        w odpowiedzi na poziom noradrenaliny.
-
-        Wysoka NE (wykrycie zmiany kontekstu) → kompresja tau_e →
-        stare korelacje zanikają szybciej → szybsze odłączenie od
-        poprzedniej polityki.
-
-        Niska NE (stabilne środowisko) → pełne tau_e → konsolidacja.
-        """
+        """NE modulates eligibility trace decay (Aston-Jones & Cohen 2005)."""
         ne = float(np.clip(ne, 0.0, 1.0))
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
-        eff_tau_e = self.config.tau_e_critic / ne_factor
-        self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
+        eff_tau = self.config.tau_e_critic / ne_factor
+        self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
 
 
-class SNNContinuousActor:
-    """
-    Aktor oparty na polityce softmax z mechanizmem dopaminowym.
+# =====================================================================
+# D1/D2 MSN Actor (dorsal striatum)
+# =====================================================================
 
-    Biologicznie odpowiada ścieżce korowo-prążkowiowej:
-    - Wagi w_mu: synapsy korowo-prążkowiowe (cortex → striatum)
-    - Logity: aktywacja neuronów MSN (medium spiny neurons)
-    - Softmax: kompetycja lateralna w prążkowiu (GPe/GPi)
-    - Ślad kwalifikowalności: NMDA/Ca²⁺ ślad na aktywnej synapsie
-    - TD error → Dopamina: moduluje plastyczność STDP
+class D1D2Actor:
+    """Dual-pathway MSN actor with bistable dynamics.
 
-    Reguła uczenia (policy gradient z eligibility trace):
-      e_t = decay * e_{t-1} + ∇_θ log π(a|s)
-      Δw = lr × δ × e_t
+    D1 (direct/Go):   DA excites → facilitates selected action
+    D2 (indirect/NoGo): DA inhibits → suppresses competing actions
 
-    gdzie ∇ log π(a|s) = state ⊗ (one_hot(a) - π(·|s))
-    Biologicznie: wybrany neuron MSN (D1) ma pozytywny ślad,
-    niewybrany (D2) — negatywny proporcjonalnie do π.
+    High DA → D1 dominance → exploitation
+    Low DA  → D2 dominance → caution / exploration
 
-    Homeostatic synaptic scaling (Turrigiano 2008):
-    Each MSN (output neuron) maintains its total afferent synaptic
-    strength near a target level. If the column norm grows beyond
-    target, all incoming synapses to that neuron are multiplicatively
-    scaled down. This prevents policy lock-in from monotonic weight
-    growth while preserving the RELATIVE structure of learned weights.
+    Each action has D1 + D2 populations; net evidence = D1_rate - D2_rate.
+    Action probabilities via softmax over net evidence.
     """
 
-    # Target L2 norm per MSN column — set from init scale.
-    # Biological: the target firing rate that homeostatic scaling maintains.
-
-    def __init__(self, state_size: int, motor_dim: int, internal_dim: int, config: ContinuousBGConfig):
+    def __init__(
+        self,
+        state_size: int,
+        motor_dim: int,
+        internal_dim: int,
+        config: BasalGangliaConfig,
+    ) -> None:
         self.config = config
         self.action_dim = motor_dim + internal_dim
         self.motor_dim = motor_dim
 
-        # Umiarkowane losowe init — wystarczające do zróżnicowania logitów,
-        # ale nie na tyle duże by stworzyć silne początkowe bias.
-        # Biologicznie: niezorganizowane synapsy przed treningiem.
-        self.w_mu = np.random.uniform(-0.1, 0.1, (state_size, self.action_dim)).astype(np.float32)
+        # ── D1 pathway weights (cortex → D1-MSN) ─────────────────────
+        self.w_d1: NDArray[np.float32] = init_weights(
+            state_size, self.action_dim, excitatory=True,
+        )
+        # ── D2 pathway weights (cortex → D2-MSN) ─────────────────────
+        self.w_d2: NDArray[np.float32] = init_weights(
+            state_size, self.action_dim, excitatory=True,
+        )
 
-        # Ślad kwalifikowalności polityki (policy gradient trace)
-        self.e_actor = np.zeros((state_size, self.action_dim), dtype=np.float32)
-        self._trace_decay = np.exp(-self.config.dt / self.config.tau_e)
+        # ── Input gain from biophysics ────────────────────────────────
+        # Use Up-state τ for gain calculation (active selection mode)
+        self._input_gain: float = _derive_input_gain(
+            state_size, config.tau_m_msn_up, config,
+        )
 
-        # Temperatura eksploracji — mutowalny mnożnik:
-        # maleje po sukcesach (serotonina wysoka), rośnie po porażkach.
-        self.noise_scale: float = 1.0
+        # ── D1-MSN membrane state ────────────────────────────────────
+        self.v_d1: NDArray[np.float32] = np.random.uniform(
+            config.v_rest, config.v_thresh, self.action_dim,
+        ).astype(np.float32)
+        self.spikes_d1: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
+        self.refrac_d1: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
+        self.rate_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
-        # Zapamiętujemy ostatnią politykę i akcję dla update
-        self._last_probs: np.ndarray | None = None
+        # ── D2-MSN membrane state ────────────────────────────────────
+        self.v_d2: NDArray[np.float32] = np.random.uniform(
+            config.v_rest, config.v_thresh, self.action_dim,
+        ).astype(np.float32)
+        self.spikes_d2: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
+        self.refrac_d2: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
+        self.rate_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+
+        # ── Rate EMA decay ────────────────────────────────────────────
+        self._rate_decay: float = 0.9  # Fast averaging for action selection
+
+        # ── InhibitoryPool for D1 competition ─────────────────────────
+        self.inh_pool_d1 = InhibitoryPool(
+            n_excitatory=self.action_dim,
+            config=InhibitoryPoolConfig(
+                ctx=config.ctx,
+                n_interneurons=max(2, self.action_dim // 2),
+                target_sparsity=1.0 / max(motor_dim, 1),
+            ),
+        )
+        # ── InhibitoryPool for D2 competition ─────────────────────────
+        self.inh_pool_d2 = InhibitoryPool(
+            n_excitatory=self.action_dim,
+            config=InhibitoryPoolConfig(
+                ctx=config.ctx,
+                n_interneurons=max(2, self.action_dim // 2),
+                target_sparsity=1.0 / max(motor_dim, 1),
+            ),
+        )
+
+        # ── DA modulation state ───────────────────────────────────────
+        self._da_level: float = 0.5
+
+        # ── Eligibility traces (policy gradient via STDP) ─────────────
+        self.e_d1: NDArray[np.float32] = np.zeros(
+            (state_size, self.action_dim), dtype=np.float32,
+        )
+        self.e_d2: NDArray[np.float32] = np.zeros(
+            (state_size, self.action_dim), dtype=np.float32,
+        )
+        self._trace_decay: float = config.ctx.decay(config.tau_e_actor)
+
+        # ── Pre-synaptic traces ───────────────────────────────────────
+        self._x_pre: NDArray[np.float32] = np.zeros(state_size, dtype=np.float32)
+        self._pre_decay: float = config.ctx.decay(20.0)
+
+        # ── Action tracking ───────────────────────────────────────────
+        self._last_probs: NDArray[np.float32] | None = None
         self._last_action: int = -1
-        self._last_state: np.ndarray | None = None
+        self._last_state: NDArray[np.float32] | None = None
+        # D1/D2 net evidence (exposed for Active Inference)
+        self._d1_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self._d2_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
-    @staticmethod
-    def _softmax(logits: np.ndarray) -> np.ndarray:
-        """Numerycznie stabilna softmax."""
-        x = logits - logits.max()
-        e = np.exp(x)
-        return e / e.sum()
+    def set_da_level(self, da: float) -> None:
+        """Set DA modulation: high DA → D1 excitation, D2 suppression."""
+        self._da_level = float(np.clip(da, 0.0, 1.0))
 
-    def forward(self, state_spikes: np.ndarray, forced_action: int | None = None) -> Tuple[np.ndarray, np.ndarray]:
-        """Oblicza politykę i próbkuje akcję."""
+    def forward(
+        self,
+        state_spikes: NDArray[np.float32],
+        forced_action: int | None = None,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """MSN competition through D1/D2 pathways."""
         state_f32 = state_spikes.astype(np.float32)
         self._last_state = state_f32
+        cfg = self.config
 
-        # Logity = stan × wagi  (aktywacja MSN)
-        logits = np.dot(state_f32, self.w_mu)
+        # ── Pre-synaptic trace ────────────────────────────────────────
+        self._x_pre *= self._pre_decay
+        self._x_pre += np.clip(state_f32, 0.0, 1.0)
 
-        # Temperatura eksploracji: noise_scale > 1 → bardziej losowa;
-        # noise_scale → 0 → greedy.  Odpowiada inwersji temperatury β = 1/T.
-        temperature = max(self.config.exploration_noise * self.noise_scale, 1e-4)
-        probs = self._softmax(logits[:self.motor_dim] / temperature)
+        # ── Synaptic currents ─────────────────────────────────────────
+        current_d1 = (state_f32 @ self.w_d1) * self._input_gain
+        current_d2 = (state_f32 @ self.w_d2) * self._input_gain
+
+        # ── DA modulation (Frank 2005) ────────────────────────────────
+        # D1: DA excites (scales up drive)
+        # D2: DA inhibits (scales down drive)
+        da = self._da_level
+        d1_mod = cfg.d1_bias + da * (1.0 - cfg.d1_bias)
+        d2_mod = cfg.d2_bias * (1.0 - da) + (1.0 - cfg.d2_bias)
+        current_d1 *= d1_mod
+        current_d2 *= d2_mod
+
+        # ── Bistable MSN decay (Wilson & Kawaguchi 1996) ──────────────
+        cortical_drive = np.abs(current_d1) + np.abs(current_d2)
+        # Normalize to [0, 1] range for threshold comparison
+        drive_max = np.max(cortical_drive) + 1e-8
+        cortical_norm = cortical_drive / drive_max
+        decay_d1 = _msn_decay(cortical_norm, cfg)
+        decay_d2 = _msn_decay(cortical_norm, cfg)
+
+        # ── Multi-tick D1 integration ─────────────────────────────────
+        ad = self.action_dim
+        for _ in range(cfg.integration_steps):
+            # D1
+            in_refrac_d1 = self.refrac_d1 > 0
+            self.refrac_d1[in_refrac_d1] -= 1
+            noise_d1 = np.random.normal(
+                0, cfg.membrane_noise_std, ad,
+            ).astype(np.float32)
+            leaked_d1 = (
+                self.v_d1 * decay_d1
+                + cfg.v_rest * (1.0 - decay_d1)
+            )
+            self.v_d1 = np.where(in_refrac_d1, cfg.v_reset, leaked_d1 + current_d1 + noise_d1)
+            inh_d1 = self.inh_pool_d1.step(self.spikes_d1.astype(np.float32))
+            self.v_d1 -= inh_d1
+            self.spikes_d1 = (self.v_d1 >= cfg.v_thresh) & ~in_refrac_d1
+            self.v_d1[self.spikes_d1] = cfg.v_reset
+            self.refrac_d1[self.spikes_d1] = cfg.refrac_period
+
+            # D2
+            in_refrac_d2 = self.refrac_d2 > 0
+            self.refrac_d2[in_refrac_d2] -= 1
+            noise_d2 = np.random.normal(
+                0, cfg.membrane_noise_std, ad,
+            ).astype(np.float32)
+            leaked_d2 = (
+                self.v_d2 * decay_d2
+                + cfg.v_rest * (1.0 - decay_d2)
+            )
+            self.v_d2 = np.where(in_refrac_d2, cfg.v_reset, leaked_d2 + current_d2 + noise_d2)
+            inh_d2 = self.inh_pool_d2.step(self.spikes_d2.astype(np.float32))
+            self.v_d2 -= inh_d2
+            self.spikes_d2 = (self.v_d2 >= cfg.v_thresh) & ~in_refrac_d2
+            self.v_d2[self.spikes_d2] = cfg.v_reset
+            self.refrac_d2[self.spikes_d2] = cfg.refrac_period
+
+            # Rate EMA
+            rc = 1.0 - self._rate_decay
+            self.rate_d1 = self.rate_d1 * self._rate_decay + self.spikes_d1.astype(np.float32) * rc
+            self.rate_d2 = self.rate_d2 * self._rate_decay + self.spikes_d2.astype(np.float32) * rc
+
+        # ── Store pathway rates for Active Inference readout ──────────
+        self._d1_rates = self.rate_d1.copy()
+        self._d2_rates = self.rate_d2.copy()
+
+        # ── Net evidence: D1 - D2 per action (Go - NoGo) ─────────────
+        motor_d1 = self.rate_d1[:self.motor_dim]
+        motor_d2 = self.rate_d2[:self.motor_dim]
+        net_evidence = motor_d1 - motor_d2
+
+        # ── Sub-threshold fallback (drift-diffusion readout) ──────────
+        total_rate = np.sum(np.abs(motor_d1)) + np.sum(np.abs(motor_d2))
+        if total_rate < 1e-6:
+            v_diff = (self.v_d1[:self.motor_dim] - self.v_d2[:self.motor_dim])
+            v_diff = v_diff - np.mean(v_diff)
+            probs = np.exp(v_diff) / (np.sum(np.exp(v_diff)) + 1e-10)
+        else:
+            shifted = net_evidence - np.max(net_evidence)
+            exp_val = np.exp(shifted)
+            probs = exp_val / (np.sum(exp_val) + 1e-10)
+        probs = probs.astype(np.float32)
         self._last_probs = probs
 
-        # Próbkowanie akcji (ε-softmax)
+        # ── Action selection ──────────────────────────────────────────
         if forced_action is not None:
             action = forced_action
         else:
             action = int(np.random.choice(self.motor_dim, p=probs))
-
         self._last_action = action
 
-        # Ślad kwalifikowalności (policy gradient):
-        # ∇ log π(a|s) = state ⊗ (one_hot(a) - π(·|s))
-        # Biologicznie: D1 MSN wybranej akcji = +1,
-        # wszystkie MSN hamowane proporcjonalnie do π (kompetycja GPe).
-        grad_log_pi = np.zeros(self.action_dim, dtype=np.float32)
+        # ── Eligibility traces (STDP-based REINFORCE) ─────────────────
         one_hot = np.zeros(self.motor_dim, dtype=np.float32)
         one_hot[action] = 1.0
+        grad_log_pi = np.zeros(self.action_dim, dtype=np.float32)
         grad_log_pi[:self.motor_dim] = one_hot - probs
 
-        self.e_actor = self.e_actor * self._trace_decay + np.outer(state_f32, grad_log_pi)
-        # Ca²⁺ saturation — trace per synapse is bounded by dendritic spine capacity
-        np.clip(self.e_actor, -1.0, 1.0, out=self.e_actor)
+        self.e_d1 = self.e_d1 * self._trace_decay + np.outer(state_f32, grad_log_pi)
+        # D2 trace: anti-correlation (NoGo pathway opposes selected action)
+        self.e_d2 = self.e_d2 * self._trace_decay - np.outer(state_f32, grad_log_pi)
 
-        # Motor output jako ciągły wektor (kompatybilność z continuous API)
-        motor_action = probs * 2.0 - 1.0   # map [0,1] → [-1,1]
+        # ── Motor output ──────────────────────────────────────────────
+        motor_action = probs * 2.0 - 1.0  # [0,1] → [-1,1]
 
-        # Akcje wewnętrzne (bramka WM): drugi segment logitów
+        # ── Internal actions (WM gate, etc.) ──────────────────────────
         if self.action_dim > self.motor_dim:
-            internal_logits = logits[self.motor_dim:]
-            internal_action = 1.0 / (1.0 + np.exp(-internal_logits))  # sigmoid → [0,1]
+            internal_logits = state_f32 @ self.w_d1[:, self.motor_dim:]
+            internal_action = 1.0 / (1.0 + np.exp(-np.clip(internal_logits, -10, 10)))
         else:
             internal_action = np.array([], dtype=np.float32)
 
-        return motor_action, internal_action
+        return motor_action.astype(np.float32), internal_action.astype(np.float32)
 
     def update(self, td_error: float) -> None:
-        """Policy gradient: δ × eligibility trace + homeostatic scaling.
+        """Three-factor STDP: D1 learns from +TD, D2 from -TD (Frank 2005)."""
+        td = float(np.clip(td_error, -50.0, 50.0))
+        cfg = self.config
 
-        Per-synapse Hebbian update followed by per-neuron (column)
-        homeostatic normalization (Turrigiano 2008).
+        # D1 (Go): positive TD → strengthen selected action
+        self.w_d1 += cfg.actor_lr * td * self.e_d1
+        # D2 (NoGo): negative TD → strengthen suppression of bad actions
+        self.w_d2 += cfg.actor_lr * (-td) * self.e_d2
 
-        The scaling preserves relative weight structure (which input
-        features matter more for each action) while bounding absolute
-        magnitude. This prevents the monotonic weight growth that
-        causes policy lock-in during long successful episodes.
-        """
-        td_error = float(np.clip(td_error, -10.0, 10.0))
-
-        self.w_mu += self.config.actor_lr * td_error * self.e_actor
-
-        # Homeostatic synaptic scaling: per-column (per-MSN) normalization.
-        # Each column of w_mu represents all afferent synapses to one MSN.
-        # If column norm exceeds target, scale down multiplicatively.
-        # This is a slow process (hours in biology) — we apply it every step
-        # but the effect is gentle (only kicks in when norm exceeds target).
-        for j in range(self.action_dim):
-            col_norm = float(np.linalg.norm(self.w_mu[:, j]))
-            # Używamy naturalnego limitu w_clip zamiast twardego 1.0
-            if col_norm > self.config.w_clip:
-                self.w_mu[:, j] *= self.config.w_clip / col_norm
-
-        np.clip(self.w_mu, -self.config.w_clip, self.config.w_clip, out=self.w_mu)
+        # Homeostatic column normalisation + Dale's law
+        for w in (self.w_d1, self.w_d2):
+            np.maximum(w, 0.0, out=w)  # Dale's law: excitatory weights
+            for j in range(self.action_dim):
+                col_norm = float(np.linalg.norm(w[:, j]))
+                if col_norm > cfg.w_clip:
+                    w[:, j] *= cfg.w_clip / col_norm
 
     def get_action(self) -> int:
-        """Zwraca ostatnio wybraną dyskretną akcję."""
         return self._last_action
 
     @property
     def action_entropy(self) -> float:
-        """Normalized entropy of last action distribution [0, 1].
-
-        Biological basis: competition uncertainty in striatum.
-        When multiple MSNs are equally active (high entropy), thalamic
-        output is less decisive → more variable behavior.
-        When one MSN dominates (low entropy) → deterministic action.
-        """
+        """Normalized entropy of action distribution [0, 1]."""
         if self._last_probs is None:
             return 1.0
         p = self._last_probs
         entropy = -float(np.sum(p * np.log(p + 1e-10)))
-        max_entropy = float(np.log(self.motor_dim))
+        max_entropy = float(np.log(max(self.motor_dim, 2)))
         if max_entropy < 1e-8:
             return 0.0
         return float(np.clip(entropy / max_entropy, 0.0, 1.0))
 
+    @property
+    def pragmatic_values(self) -> NDArray[np.float32]:
+        """D1 rates as pragmatic value proxy per action."""
+        return self._d1_rates[:self.motor_dim].copy()
+
+    @property
+    def cost_values(self) -> NDArray[np.float32]:
+        """D2 rates as cost/risk proxy per action."""
+        return self._d2_rates[:self.motor_dim].copy()
+
     def reset_state(self) -> None:
-        """Reset transient traces. Weights are preserved."""
-        self.e_actor.fill(0.0)
+        """Reset transient state. Weights preserved."""
+        cfg = self.config
+        self.v_d1[:] = np.random.uniform(
+            cfg.v_rest, cfg.v_thresh, self.action_dim,
+        ).astype(np.float32)
+        self.v_d2[:] = np.random.uniform(
+            cfg.v_rest, cfg.v_thresh, self.action_dim,
+        ).astype(np.float32)
+        self.spikes_d1.fill(False)
+        self.spikes_d2.fill(False)
+        self.refrac_d1.fill(0)
+        self.refrac_d2.fill(0)
+        self.rate_d1.fill(0.0)
+        self.rate_d2.fill(0.0)
+        self.e_d1.fill(0.0)
+        self.e_d2.fill(0.0)
+        self._x_pre.fill(0.0)
         self._last_probs = None
         self._last_action = -1
         self._last_state = None
+        self._d1_rates.fill(0.0)
+        self._d2_rates.fill(0.0)
+        self.inh_pool_d1.reset_state()
+        self.inh_pool_d2.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
-        """
-        Dostosowuje zanik śladu polityki do poziomu NE.
-        Wysoka NE → krótsze okno korelacji szum→nagroda → szybsze przełączanie polityki.
-        """
+        """NE modulates policy trace decay."""
         ne = float(np.clip(ne, 0.0, 1.0))
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
-        eff_tau_e = self.config.tau_e / ne_factor
-        self._trace_decay = float(np.exp(-self.config.dt / eff_tau_e))
+        eff_tau = self.config.tau_e_actor / ne_factor
+        self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
 
+
+# =====================================================================
+# Active Inference integration
+# =====================================================================
+
+class ActiveInferenceModule:
+    """Expected Free Energy action selection wrapping world model + BG.
+
+    G(a) = -pragmatic(a) + ambiguity - β×epistemic(a)
+      pragmatic ≈ D1-MSN rate (expected reward)
+      cost      ≈ D2-MSN rate (expected risk)
+      epistemic ≈ world model prediction uncertainty
+      β modulated by NE (curiosity drive → exploration)
+    """
+
+    def __init__(
+        self,
+        world_model: "SNNWorldModel",
+        config: ActiveInferenceConfig | None = None,
+    ) -> None:
+        self.world_model = world_model
+        self.config = config or ActiveInferenceConfig()
+        self.action_size = world_model.action_size
+
+        # Diagnostic outputs
+        self.last_epistemic_values: dict[int, float] = {}
+        self.last_pragmatic_values: dict[int, float] = {}
+        self.last_total_values: dict[int, float] = {}
+        self.last_selected_action: int = 0
+
+    def compute_epistemic_values(
+        self,
+        state_spikes: NDArray[np.float32],
+        candidate_actions: list[int],
+    ) -> dict[int, float]:
+        """Epistemic value = prediction uncertainty per action."""
+        results = self.world_model.mental_rehearsal(
+            state_spikes, candidate_actions,
+        )
+        epistemic: dict[int, float] = {}
+        for action in candidate_actions:
+            info = results[action]
+            if self.config.uncertainty_method == "novelty":
+                epistemic[action] = info.novelty
+            else:
+                epistemic[action] = self._variance_uncertainty(
+                    state_spikes, action,
+                )
+        return epistemic
+
+    def _variance_uncertainty(
+        self,
+        state_spikes: NDArray[np.float32],
+        action: int,
+        n_samples: int = 3,
+    ) -> float:
+        """Prediction uncertainty via variance across perturbed inputs."""
+        predictions: list[NDArray[np.float32]] = []
+        for _ in range(n_samples):
+            noise = np.random.normal(
+                0, 0.05, state_spikes.shape,
+            ).astype(np.float32)
+            perturbed = np.clip(state_spikes + noise, 0.0, 1.0)
+            result = self.world_model.mental_rehearsal(perturbed, [action])
+            predictions.append(result[action].predicted_state)
+        if len(predictions) < 2:
+            return 0.0
+        stacked = np.stack(predictions)
+        return float(np.mean(np.var(stacked, axis=0)))
+
+    def select_action(
+        self,
+        state_spikes: NDArray[np.float32],
+        candidate_actions: list[int],
+        actor: D1D2Actor | None = None,
+        ne_level: float = 0.3,
+    ) -> int:
+        """Select action minimizing expected free energy G(a).
+
+        If actor is provided, uses D1/D2 rates as pragmatic/cost values.
+        """
+        epistemic = self.compute_epistemic_values(state_spikes, candidate_actions)
+        self.last_epistemic_values = epistemic
+
+        # NE-modulated epistemic weight
+        beta = (
+            self.config.epistemic_weight
+            + ne_level * self.config.ne_epistemic_boost
+        )
+
+        # Build G(a) per action
+        total: dict[int, float] = {}
+        prag_dict: dict[int, float] = {}
+        for action in candidate_actions:
+            if actor is not None and action < actor.motor_dim:
+                pragmatic = float(actor.pragmatic_values[action])
+                cost = float(actor.cost_values[action])
+            else:
+                pragmatic = 0.0
+                cost = 0.0
+            epist = epistemic.get(action, 0.0)
+            g = expected_free_energy(
+                pragmatic_value=pragmatic - cost,
+                epistemic_value=epist,
+                epistemic_weight=beta,
+            )
+            total[action] = -g  # Higher = better (negate for selection)
+            prag_dict[action] = pragmatic - cost
+
+        self.last_pragmatic_values = prag_dict
+        self.last_total_values = total
+
+        # Softmax selection
+        actions = list(total.keys())
+        values = np.array([total[a] for a in actions], dtype=np.float32)
+        shifted = values - np.max(values)
+        temp = max(self.config.pragmatic_temperature, 1e-6)
+        exp_vals = np.exp(shifted / temp)
+        probs = exp_vals / (np.sum(exp_vals) + 1e-8)
+
+        selected = int(np.random.choice(actions, p=probs))
+        self.last_selected_action = selected
+        return selected
+
+    def select_action_greedy(
+        self,
+        state_spikes: NDArray[np.float32],
+        candidate_actions: list[int],
+        actor: D1D2Actor | None = None,
+        ne_level: float = 0.3,
+    ) -> int:
+        """Greedy (argmax) variant for evaluation."""
+        epistemic = self.compute_epistemic_values(state_spikes, candidate_actions)
+        beta = (
+            self.config.epistemic_weight
+            + ne_level * self.config.ne_epistemic_boost
+        )
+        total: dict[int, float] = {}
+        for action in candidate_actions:
+            if actor is not None and action < actor.motor_dim:
+                pragmatic = float(actor.pragmatic_values[action])
+                cost = float(actor.cost_values[action])
+            else:
+                pragmatic = 0.0
+                cost = 0.0
+            g = expected_free_energy(
+                pragmatic_value=pragmatic - cost,
+                epistemic_value=epistemic.get(action, 0.0),
+                epistemic_weight=beta,
+            )
+            total[action] = -g
+        self.last_total_values = total
+        self.last_selected_action = max(total, key=lambda k: total[k])
+        return self.last_selected_action
+
+
+# =====================================================================
+# Integrated BG System
+# =====================================================================
 
 class BasalGangliaAGISystem:
-    def __init__(self, state_size: int, motor_dim: int, internal_dim: int = 1,
-                 config: ContinuousBGConfig | None = None):
-        self.config = config or ContinuousBGConfig()
+    """Integrated BG: D1/D2 Actor + LIF Critic + Active Inference.
+
+    Exploration via LIF membrane noise + DA modulation of D1/D2 balance.
+    """
+
+    def __init__(
+        self,
+        state_size: int,
+        motor_dim: int,
+        internal_dim: int = 1,
+        config: BasalGangliaConfig | None = None,
+    ) -> None:
+        self.config = config or BasalGangliaConfig()
         self.critic = SNNDeepCritic(state_size, self.config)
-        self.actor = SNNContinuousActor(state_size, motor_dim, internal_dim, self.config)
-        self.last_v = 0.0
+        self.actor = D1D2Actor(state_size, motor_dim, internal_dim, self.config)
+        self.last_v: float = 0.0
 
-        # Adaptive DA gain (Tobler, Fiorillo & Schultz 2005):
-        # VTA dopamine neurons adapt their response gain to the variance
-        # of recent rewards — larger variance → lower gain per unit RPE.
-        # This prevents weight explosions during high-variance phases
-        # and amplifies learning during low-variance consolidation.
-        # Implemented as running RMS of TD error, used to normalize
-        # the plasticity signal (td / rms(td)).
-        self._td_rms: float = 1.0  # Start at 1.0 to avoid division by near-zero
-
-    def normalize_td(self, td_error: float) -> float:
-        """Adaptive DA gain normalization (Tobler et al. 2005).
-
-        VTA dopamine neurons adapt their gain to the range of recent
-        reward prediction errors, but preserve proportional responses
-        within that range.
-
-        Key: we normalize by max(rms, 1.0) — NOT by rms alone.
-        - When RMS < 1 (early learning, small errors): signal passes unchanged
-        - When RMS > 1 (large errors, instability): signal is damped
-        This preserves the learning signal during normal operation
-        and only kicks in as a stabilizer during high-variance phases.
-        """
-        decay = self.config.td_rms_decay
-        self._td_rms = float(np.sqrt(
-            decay * self._td_rms ** 2 + (1 - decay) * td_error ** 2
-        ))
-        # Only damp when RMS exceeds baseline (1.0)
-        rms = max(self._td_rms, 1.0)
-        return float(np.clip(td_error / rms, -5.0, 5.0))
-
-    def step(self, state_spikes: np.ndarray, reward: float, is_terminal: bool = False) -> Tuple[
-        np.ndarray, np.ndarray, float]:
+    def step(
+        self,
+        state_spikes: NDArray[np.float32],
+        reward: float,
+        is_terminal: bool = False,
+        da_level: float = 0.5,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32], float]:
+        """One BG step: critic → TD → update → actor forward."""
         current_v = self.critic.forward(state_spikes)
 
-        # TD Error
         if is_terminal:
             td_error = reward - self.last_v
         else:
             td_error = reward + self.config.gamma * current_v - self.last_v
 
-        # Adaptive normalization before plasticity
-        norm_td = self.normalize_td(td_error)
+        td_error = float(np.clip(td_error, -50.0, 50.0))
 
-        # Aktualizacja
-        self.critic.update(norm_td)
-        self.actor.update(norm_td)
+        self.actor.set_da_level(da_level)
+        self.critic.update(td_error)
+        self.actor.update(td_error)
 
-        # Akcja na kolejny krok
         motor_action, internal_action = self.actor.forward(state_spikes)
         self.last_v = 0.0 if is_terminal else current_v
 
         return motor_action, internal_action, td_error
 
     def reset_state(self) -> None:
-        """Reset all transient state between episodes. Learned weights are preserved.
-        NOTE: _td_rms is NOT reset — it's a slow statistic across episodes.
-        """
+        """Reset transient state between episodes."""
         self.last_v = 0.0
         self.critic.reset_state()
         self.actor.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
-        """
-        Propaguje poziom NE do Krytyka i Aktora — zamknięta pętla:
-          TD-error → NeuromodulatorSystem → NE → set_plasticity_timescales()
-        Pozwala BG samodzielnie dostosować tempo uczenia do zmienności środowiska.
-        """
         self.critic.set_plasticity_timescales(ne)
         self.actor.set_plasticity_timescales(ne)
 
-    def compute_exploration_noise(self, serotonin: float, tonic_da: float) -> float:
-        """Compute exploration noise from neuromodulatory signals.
+    def snapshot_traces(self) -> BGSnapshot:
+        """Capture current eligibility traces for replay."""
+        return BGSnapshot(
+            critic_e_h=self.critic.e_h,
+            critic_e_v=self.critic.e_v,
+            critic_e_bv=self.critic.e_bv,
+            d1_e=self.actor.e_d1,
+            d2_e=self.actor.e_d2,
+        )
 
-        Three-signal exploration control:
-          1. Serotonin: (1-sero)² — global prediction uncertainty (dorsal raphe)
-          2. Tonic DA floor: keep exploring when unrewarded (VTA)
-          3. Action entropy: exposed as diagnostic but not yet used for
-             exploration gating (risk of premature collapse before reward)
+    def restore_traces(self, snap: BGSnapshot) -> None:
+        """Restore eligibility traces from replay snapshot."""
+        self.critic.e_h[:] = snap.critic_e_h
+        self.critic.e_v[:] = snap.critic_e_v
+        self.critic.e_bv = snap.critic_e_bv
+        self.actor.e_d1[:] = snap.d1_e
+        self.actor.e_d2[:] = snap.d2_e
 
-        Biological basis (Niv et al. 2007): low tonic DA in VTA signals
-        that the agent has not found consistent reward. Exploration must
-        remain high regardless of cortical prediction stability (serotonin)
-        or striatal competition patterns (action entropy).
-        """
-        MIN_EXPLORATION = 0.01
-        sero_noise = (1.0 - serotonin) ** 2
-        da_floor = 0.5 * ((1.0 - tonic_da) ** 2)
-        return max(MIN_EXPLORATION, sero_noise, da_floor)
+    def compute_exploration_noise(
+        self,
+        serotonin: float,
+        tonic_da: float,
+    ) -> float:
+        """Exploration noise from DA × 5-HT (Doya 2002)."""
+        min_exploration = 0.15
+        da_noise = max(0.3, 1.0 - tonic_da)
+        sero_noise = max(0.3, 1.0 - serotonin)
+        return max(min_exploration, da_noise * sero_noise)

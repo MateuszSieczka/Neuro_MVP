@@ -1,378 +1,265 @@
+"""
+NeuromodulatorSystem — four-channel neuromodulatory orchestra.
+
+Reference: Doya (2002), Grace (1991), Niv et al. (2007), Tobler et al. (2005)
+
+Changes from legacy:
+  1. Decay constants from pharmacological kinetics (DAT τ=200ms, AChE τ=25ms,
+     NET τ=75ms, SERT τ=150ms) via NeuromodulatorConfig.
+  2. DA RMS adaptation τ ≈ 10s (config.da_rms_decay=0.9999), not 100ms.
+  3. Serotonin weights from dorsal raphe anatomy (0.7/0.3, config).
+  4. Tonic DA uses Welford running mean/variance (no percentile collapse).
+  5. Receptor-subtype-aware layer modulation via apply_to_layer().
+
+All levels normalised to [0, 1].
+"""
+
+from __future__ import annotations
+
 from collections import deque
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .config import NeuromodulatorConfig
 
 
 class NeuromodulatorSystem:
-    """
-    Four-channel neuromodulatory system modelling the brain's "global orchestra conductor".
+    """Four-channel neuromodulatory system (DA, ACh, NE, 5-HT).
 
-    Each channel is a first-order low-pass filter (exponential decay + phasic drive):
-
-      level[t+1] = level[t] * decay + signal[t] * (1 - decay)
-
-    ┌────────────────┬────────────────────────────────────────────────────────┐
-    │ Modulator      │ Role                                                   │
-    ├────────────────┼────────────────────────────────────────────────────────┤
-    │ Dopamine (DA)  │ Phasic: RPE (reward prediction error) per step.        │
-    │                │ Tonic: average reward rate (VTA background firing).     │
-    │ Acetylcholine  │ Novelty / uncertainty → bottom-up vs top-down balance  │
-    │ Noradrenaline  │ Surprise / arousal → sharpens k-WTA competition        │
-    │ Serotonin      │ Temporal stability → longer vs shorter planning horizon│
-    └────────────────┴────────────────────────────────────────────────────────┘
-
-    Dopamine dual-mode (Grace 1991; Niv, Daw, Joel & Dayan 2007):
-    - Phasic DA: burst firing on positive RPE, pause on negative RPE.
-      Drives per-step synaptic plasticity (three-factor Hebbian rule).
-    - Tonic DA: sustained VTA firing tracks average reward rate.
-      High tonic DA → agent is consistently rewarded → consolidation.
-      Low tonic DA → agent is struggling → full plasticity, exploration.
-      The tonic signal is updated from raw reward per step, not TD error,
-      because it represents ventral striatum's running average of
-      experienced reward, not prediction error.
-
-    All levels are normalised to [0, 1] at every step.
+    DA (phasic): RPE per step → STDP learning rate.
+    DA (tonic): average reward rate → consolidation gate.
+    ACh: novelty/uncertainty → bottom-up vs top-down balance.
+    NE: surprise/arousal → k-WTA sharpness + trace compression.
+    5-HT: temporal stability → planning horizon.
     """
 
     def __init__(self, config: NeuromodulatorConfig | None = None) -> None:
         self.config = config or NeuromodulatorConfig()
+        cfg = self.config
 
-        # Current modulator levels (normalised 0–1)
-        self.dopamine: float = self.config.baseline_da
-        self.acetylcholine: float = self.config.baseline_ach
-        self.noradrenaline: float = self.config.baseline_ne
-        self.serotonin: float = self.config.baseline_sero
+        # ── Current levels (0-1) ──────────────────────────────────────
+        self.dopamine: float = cfg.baseline_da
+        self.acetylcholine: float = cfg.baseline_ach
+        self.noradrenaline: float = cfg.baseline_ne
+        self.serotonin: float = cfg.baseline_sero
+        self.tonic_da: float = cfg.baseline_tonic_da
 
-        # Tonic DA: slow VTA background firing tracking average reward rate
-        self.tonic_da: float = self.config.baseline_tonic_da
-
-        # Rolling histories for temporal averaging
+        # ── Histories ─────────────────────────────────────────────────
         self._error_history: deque[float] = deque(maxlen=100)
-        self._reward_history: deque[float] = deque(maxlen=100)
-
-        # TD error magnitude history — behavioral stability signal for serotonin.
-        # Biological basis (Doya 2002): dorsal raphe nucleus receives projections
-        # from VTA and habenula, integrating reward prediction accuracy into the
-        # serotonergic stability signal. High |TD| = critic surprised = unstable.
         self._td_history: deque[float] = deque(maxlen=100)
 
-        # ── Stagnation detection (ACC/mPFC learning monitor) ──────────
-        # Biological basis (Kolling et al. 2016; Shenhav et al. 2013):
-        # Anterior cingulate cortex (ACC) tracks the rate of reward
-        # improvement. When learning stagnates (no improvement despite
-        # continued effort), ACC signals orbitofrontal cortex to increase
-        # exploration and maintain synaptic plasticity.
-        #
-        # Implementation: track rolling variance of tonic DA changes.
-        # When tDA barely moves for many episodes → stagnation_factor→1.
-        # This attenuates the consolidation gate, preventing premature
-        # plasticity reduction that traps the agent at a suboptimal plateau.
-        self._tda_history: deque[float] = deque(maxlen=30)
-        self._stagnation_factor: float = 0.0  # 0=improving, 1=fully stagnated
+        # ── Tonic DA: Welford running mean/variance ───────────────────
+        # Replaces percentile-based normalisation (zero-variance bug).
+        self._welford_n: int = 0
+        self._welford_mean: float = 0.0
+        self._welford_m2: float = 0.0
 
-        # ── Intrinsic progress tracking (Lisman & Grace 2005) ─────────
-        # VTA receives inputs from hippocampus/PFC about learning progress.
-        # When extrinsic reward is uninformative, world model prediction
-        # error improvement drives tonic DA, enabling gradual exploration
-        # reduction as the agent masters environmental dynamics.
+        # ── DA RMS with proper τ (config.da_rms_decay) ────────────────
+        self._da_rms: float = 1.0
+
+        # ── Smoothed reward signal (EMA) ──────────────────────────────
+        self._smoothed_reward: float = 0.0
+
+        # ── Stagnation detector (ACC) ─────────────────────────────────
+        self._tda_history: deque[float] = deque(maxlen=30)
+        self._stagnation_factor: float = 0.0
+
+        # ── Intrinsic progress (world model improvement) ──────────────
         self._episode_pred_errors: deque[float] = deque(maxlen=30)
 
     # ------------------------------------------------------------------
-    # Update
+    # Per-step update
     # ------------------------------------------------------------------
 
     def update(
         self,
-        prediction_error: np.ndarray,
+        prediction_error: NDArray[np.float32],
         td_error: float = 0.0,
         novelty: float | None = None,
     ) -> None:
-        """
-        Update per-step neuromodulator levels based on incoming signals.
-
-        Parameters
-        ----------
-        prediction_error : array
-            Per-step prediction error from world model or normalized |TD|.
-        td_error : float
-            Raw TD error for phasic dopamine computation.
-        novelty : float or None
-            Novelty signal for acetylcholine. If None, uses error_magnitude.
-        """
-        error_magnitude = float(np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0))
-
-        # Serotonina śledzi stabilność w czasie na podstawie ZNORMALIZOWANEGO błędu.
-        # Przycinamy do [0,1] tutaj, aby historia była porównywalna niezależnie od skali środowiska.
-        self._error_history.append(error_magnitude)
+        """Update per-step neuromodulator levels."""
+        cfg = self.config
+        error_mag = float(np.clip(np.mean(np.abs(prediction_error)), 0.0, 1.0))
+        self._error_history.append(error_mag)
 
         if novelty is None:
-            novelty = float(np.clip(error_magnitude, 0.0, 1.0))
+            novelty = error_mag
 
-        # ── Phasic Dopamine: adaptive-gain linear RPE (Tobler et al. 2005) ──
-        # Real VTA DA neurons scale their gain to the variance of recent RPE:
-        #   DA_phasic = baseline + td / (rms_td + eps)
-        # This gives FULL [0, 1] range (not the sigmoid's [0.4, 0.6] band).
-        # At td=0 → DA=0.5 (neutral). td=+rms → DA≈0.85. td=-rms → DA≈0.15.
-        # The running RMS adapts the gain: high-variance phases → low gain
-        # (preventing instability), low-variance → high gain (fine-tuning).
-        self._da_rms = getattr(self, '_da_rms', 1.0)
+        # ── Phasic DA: adaptive-gain RPE (Tobler et al. 2005) ────────
         self._da_rms = float(np.sqrt(
-            0.99 * self._da_rms ** 2 + 0.01 * td_error ** 2
+            cfg.da_rms_decay * self._da_rms ** 2
+            + (1.0 - cfg.da_rms_decay) * td_error ** 2
         ))
         da_gain = 0.35 / max(self._da_rms, 0.1)
         rpe_signal = float(np.clip(
-            self.config.baseline_da + da_gain * td_error, 0.0, 1.0
+            cfg.baseline_da + da_gain * td_error, 0.0, 1.0,
         ))
-
         self.dopamine = (
-                self.dopamine * self.config.da_decay
-                + rpe_signal * (1.0 - self.config.da_decay)
+            self.dopamine * cfg.da_decay
+            + rpe_signal * (1.0 - cfg.da_decay)
         )
 
-        # Tonic DA is NOT updated here — it's updated episodically
-        # via update_tonic_da() called at episode boundaries.
-
-        # ── Acetylcholine: novelty / uncertainty ──────────────────────
+        # ── ACh: novelty/uncertainty ──────────────────────────────────
         self.acetylcholine = (
-            self.acetylcholine * self.config.ach_decay
-            + float(np.clip(novelty, 0.0, 1.0)) * (1.0 - self.config.ach_decay)
+            self.acetylcholine * cfg.ach_decay
+            + float(np.clip(novelty, 0.0, 1.0)) * (1.0 - cfg.ach_decay)
         )
 
-        # ── Noradrenaline: global surprise (raw error magnitude) ───────
+        # ── NE: global surprise ───────────────────────────────────────
         self.noradrenaline = (
-            self.noradrenaline * self.config.ne_decay
-            + float(np.clip(error_magnitude, 0.0, 1.0)) * (1.0 - self.config.ne_decay)
+            self.noradrenaline * cfg.ne_decay
+            + float(np.clip(error_mag, 0.0, 1.0)) * (1.0 - cfg.ne_decay)
         )
 
-        # ── Serotonin: combined prediction stability (dorsal raphe) ─────
-        # Biological basis (Doya 2002; Nakamura et al. 2008):
-        # Dorsal raphe nucleus integrates BOTH sensory prediction accuracy
-        # (via cortical afferents) AND reward prediction accuracy (via VTA/
-        # habenula). Serotonin should only be high when the agent genuinely
-        # understands its environment AND its behavioral outcomes are predictable.
-        #
-        # CRITICAL FIX: behavioral_stability = 1/(1+|td|) was ~1.0 whenever V(s)
-        # is flat (even at V=-200, td≈0), falsely signaling "stable behavior".
-        # Now gated by tonic_da: low tonic_da (no extrinsic reward found) →
-        # behavioral_stability contribution near-zero regardless of TD accuracy.
-        # Biologically: dorsal raphe receives reward magnitude signals from VTA
-        # (Nakamura et al. 2008). Serotonin = "things going WELL AND PREDICTABLY".
+        # ── 5-HT: prediction stability (dorsal raphe) ────────────────
         avg_error = float(np.mean(self._error_history)) if self._error_history else 0.5
         world_stability = float(np.clip(1.0 - avg_error, 0.0, 1.0))
 
-        # Behavioral stability: how predictable are reward outcomes?
-        # Gated by reward quality: sigmoid(tonic_da * 4 - 2) ranges from
-        # ~0.12 (tDA=0) to ~0.88 (tDA=1). Without extrinsic reward,
-        # "low TD error" is meaningless for stability.
         self._td_history.append(float(np.clip(abs(td_error), 0.0, 10.0)))
-        avg_td_mag = float(np.mean(self._td_history)) if self._td_history else 5.0
-        td_stability = float(1.0 / (1.0 + avg_td_mag))
-        reward_quality = float(1.0 / (1.0 + np.exp(-(self.tonic_da * 4.0 - 2.0))))
-        behavioral_stability = td_stability * reward_quality
+        avg_td = float(np.mean(self._td_history)) if self._td_history else 5.0
+        td_stability = 1.0 / (1.0 + avg_td)
+        reward_quality = 1.0 / (1.0 + np.exp(-(self.tonic_da * 4.0 - 2.0)))
+        behavioral_stability = float(td_stability * reward_quality)
 
-        # Geometric mean: BOTH must be stable for consolidation.
-        stability = float(np.sqrt(world_stability * behavioral_stability))
+        # Dorsal raphe anatomy weights (config)
+        stability = (
+            cfg.sero_world_weight * world_stability
+            + cfg.sero_behavioral_weight * behavioral_stability
+        )
         self.serotonin = (
-            self.serotonin * self.config.sero_decay
-            + stability * (1.0 - self.config.sero_decay)
+            self.serotonin * cfg.sero_decay
+            + stability * (1.0 - cfg.sero_decay)
         )
 
         self._clamp_all()
 
-    def update_tonic_da(self, episode_return: float, episode_steps: int,
-                         prediction_error_avg: float = 0.0) -> None:
-        """Update tonic DA at episode boundaries based on dynamic range adaptation.
+    # ------------------------------------------------------------------
+    # Episodic tonic DA update (Welford algorithm)
+    # ------------------------------------------------------------------
 
-        Biologiczna podstawa (Niv, Daw, Joel & Dayan 2007; Tobler et al. 2005):
-        Toniczna aktywność neuronów VTA koduje długoterminowe tempo nagrody
-        (average reward rate) i determinuje próg konsolidacji wyuczonych zachowań.
-        Neurony adaptują swój zakres odpowiedzi do historycznych minimów i maksimów
-        (dynamic range adaptation).
+    def update_tonic_da(
+        self,
+        episode_return: float,
+        episode_steps: int,
+        prediction_error_avg: float = 0.0,
+    ) -> None:
+        """Update tonic DA at episode boundary using Welford running stats.
 
-        Zamiast z-score (który zawodzi przy zerowej wariancji w wyuczonym zadaniu),
-        mapujemy obecny wynik na ułamek historycznego okna [min, max].
-        Dzięki temu stałe osiąganie historycznego maksimum (np. powtarzalne 500 pkt)
-        generuje sygnał 1.0, utrzymując stan wysokiej konsolidacji i blokując
-        katastroficzne zapominanie.
+        Fixes the percentile-based zero-variance bug: when all returns are
+        identical, percentile normalisation yields signal=0 and zeros tonic DA.
+        Welford maps return → z-score → sigmoid, giving signal ≈ 0.5 for
+        constant returns (which is correct: consistent reward = moderate tonic DA).
         """
-        self._reward_history.append(episode_return)
+        cfg = self.config
 
-        if len(self._reward_history) < 2:
+        # ── Welford online mean/variance ──────────────────────────────
+        self._welford_n += 1
+        delta = episode_return - self._welford_mean
+        self._welford_mean += delta / self._welford_n
+        delta2 = episode_return - self._welford_mean
+        self._welford_m2 += delta * delta2
+
+        if self._welford_n < 2:
             return
 
-        min_r = float(min(self._reward_history))
-        max_r = float(max(self._reward_history))
+        variance = self._welford_m2 / (self._welford_n - 1)
+        std = float(np.sqrt(max(variance, 1e-8)))
 
-        # Zabezpieczenie przed brakiem zróżnicowania nagrody.
-        # Biologiczna interpretacja (Tobler et al. 2005): when all experienced
-        # rewards are identical, the VTA has no basis to distinguish good
-        # from bad policy — its phasic response is zero and tonic firing
-        # reflects absence of reward prediction signal.
-        # HOWEVER: intrinsic progress (world model improvement) can still
-        # provide a tonic DA signal even without extrinsic reward variation.
-        if max_r - min_r < 1e-6:
-            reward_signal = 0.0
-        else:
-            # Liniowe mapowanie obecnego wyniku do przedziału [0.0, 1.0]
-            reward_signal = (episode_return - min_r) / (max_r - min_r)
+        # Z-score → sigmoid → [0, 1]
+        z = (episode_return - self._welford_mean) / std
+        reward_signal = float(1.0 / (1.0 + np.exp(-z)))
 
-        # ── Intrinsic progress signal (Lisman & Grace 2005) ───────────
-        # Track per-episode average prediction error and compare recent
-        # episodes to older ones.  Decreasing error = learning progress.
+        # ── Intrinsic progress (Lisman & Grace 2005) ──────────────────
         self._episode_pred_errors.append(prediction_error_avg)
-        intrinsic_signal = 0.0
+        intrinsic = 0.0
         if len(self._episode_pred_errors) >= 10:
-            err_arr = np.array(self._episode_pred_errors)
-            midpoint = len(err_arr) // 2
-            avg_older = float(np.mean(err_arr[:midpoint]))
-            avg_recent = float(np.mean(err_arr[midpoint:]))
-            if avg_older > 1e-8:
-                intrinsic_signal = float(
-                    np.clip((avg_older - avg_recent) / avg_older, 0.0, 1.0)
-                )
+            arr = np.array(self._episode_pred_errors)
+            mid = len(arr) // 2
+            older = float(np.mean(arr[:mid]))
+            recent = float(np.mean(arr[mid:]))
+            if older > 1e-8:
+                intrinsic = float(np.clip((older - recent) / older, 0.0, 1.0))
 
-        signal = max(reward_signal, intrinsic_signal)
+        # ── Smooth reward signal ──────────────────────────────────────
+        self._smoothed_reward = 0.85 * self._smoothed_reward + 0.15 * reward_signal
 
-        # Asymmetric VTA adaptation (Koob & Le Moal 2001; Volkow et al. 2017):
-        # Rising: standard adaptation — quickly recognize improvement.
-        # Falling: D2 auto-receptor desensitization and VTA afferent
-        #   plasticity create hysteresis — consolidated tonic DA resists
-        #   decline.  Time constant ~3× longer for decrease than increase.
-        #   This prevents a single bad episode from cascading into
-        #   catastrophic forgetting by reopening plasticity prematurely.
-        if float(signal) >= self.tonic_da:
-            decay = self.config.tonic_da_decay                               # rise: tc ≈ 10 ep
+        signal = float(np.clip(
+            self._smoothed_reward + 0.7 * intrinsic * (1.0 - self._smoothed_reward),
+            0.0, 1.0,
+        ))
+
+        # ── Asymmetric adaptation (hysteresis) ────────────────────────
+        if signal >= self.tonic_da:
+            decay = cfg.tonic_da_decay
         else:
-            decay = 1.0 - (1.0 - self.config.tonic_da_decay) / 3.0          # fall: tc ≈ 30 ep
+            decay = 1.0 - (1.0 - cfg.tonic_da_decay) / 3.0
 
-        self.tonic_da = (
-            self.tonic_da * decay
-            + float(signal) * (1.0 - decay)
-        )
-        self.tonic_da = float(np.clip(self.tonic_da, 0.0, 1.0))
+        self.tonic_da = float(np.clip(
+            self.tonic_da * decay + signal * (1.0 - decay), 0.0, 1.0,
+        ))
 
-        # ── Stagnation tracking (ACC learning-rate monitor) ───────────
-        # Record tonic DA history and compute improvement rate.
-        # If tDA has been flat (low variance) for many episodes,
-        # the stagnation factor rises, attenuating the consolidation gate.
+        # ── Stagnation tracking (ACC) ─────────────────────────────────
         self._tda_history.append(self.tonic_da)
         if len(self._tda_history) >= 10:
-            tda_arr = np.array(self._tda_history)
-            # Rate of change: std of recent tDA values
-            tda_variability = float(np.std(tda_arr))
-            # Map variability to stagnation: low variability → high stagnation
-            # Threshold: tda_std < 0.02 means no meaningful improvement.
-            # Smoothed with EMA to avoid jitter.
-            raw_stagnation = float(np.clip(1.0 - tda_variability / 0.05, 0.0, 1.0))
-            self._stagnation_factor = (
-                0.9 * self._stagnation_factor + 0.1 * raw_stagnation
-            )
+            variability = float(np.std(list(self._tda_history)))
+            raw_stag = float(np.clip(1.0 - variability / 0.05, 0.0, 1.0))
+            self._stagnation_factor = 0.9 * self._stagnation_factor + 0.1 * raw_stag
 
     # ------------------------------------------------------------------
-    # Properties — typed read-outs for other modules
+    # Properties
     # ------------------------------------------------------------------
 
     @property
     def learning_rate_modulation(self) -> float:
-        """Phasic dopamine level: scales the STDP learning rate (m_t in update_weights)."""
+        """Phasic DA → STDP learning rate (m_t)."""
         return self.dopamine
 
     @property
     def consolidation_gate(self) -> float:
-        """Gate for plasticity reduction based on tonic DA, serotonin, and learning progress.
-
-        Biological basis (Niv et al. 2007; Doya 2002; Kolling et al. 2016):
-        Consolidation requires BOTH:
-        - Tonic DA high → agent is consistently rewarded (VTA background)
-        - Serotonin high → predictions are temporally stable (dorsal raphe)
-
-        ACC modulation (Kolling et al. 2016; Shenhav et al. 2013):
-        When learning has stagnated AND tonic DA is in the ambiguous
-        middle range (0.3–0.7), ACC signals that the current policy may
-        be suboptimal and attenuates the consolidation gate. This prevents
-        the agent from getting trapped at a local optimum.
-
-        Crucially, if tDA > 0.7 (strong evidence of success), stagnation
-        attenuation is NOT applied — the agent genuinely needs consolidation
-        to protect its successful policy. The attenuator is targeted
-        specifically at the "mediocre plateau" regime.
-        """
-        raw_gate = float(np.sqrt(self.tonic_da * self.serotonin))
-        # ACC attenuation only in the "stuck in middle" regime.
-        # High tDA (>0.7) = genuine success → full consolidation.
-        # Low tDA (<0.3) = early learning → gate is already low.
-        # Middle tDA (0.3–0.7) with stagnation → attenuate gate.
+        """sqrt(tonic_da × serotonin) with ACC stagnation attenuation."""
+        raw = float(np.sqrt(self.tonic_da * self.serotonin))
         if 0.3 < self.tonic_da < 0.7:
-            acc_attenuation = 1.0 - 0.5 * self._stagnation_factor
+            acc = 1.0 - 0.5 * self._stagnation_factor
         else:
-            acc_attenuation = 1.0
-        return raw_gate * acc_attenuation
+            acc = 1.0
+        return raw * acc
 
     @property
     def bottom_up_gain(self) -> float:
-        """
-        Acetylcholine level: controls bottom-up vs top-down balance in
-        PredictiveCodingLayer.  Pass to layer.set_ach_level().
-        """
+        """ACh level → PredictiveCodingLayer.set_ach_level()."""
         return self.acetylcholine
 
     @property
     def competition_sharpness(self) -> float:
-        """
-        Noradrenaline level: can be used to dynamically tighten k-WTA
-        (higher NE → fewer effective winners → sparser SDR).
-        """
+        """NE level → k-WTA sharpness."""
         return self.noradrenaline
 
     @property
     def planning_horizon(self) -> float:
-        """
-        Serotonin level: proxy for temporal discount factor γ.
-        High 5-HT → long-horizon planning; Low 5-HT → myopic, reactive.
-        """
+        """5-HT → temporal discount / planning depth."""
         return self.serotonin
 
     @property
     def tau_compression(self) -> float:
-        """
-        Noradrenaline-driven compression signal for eligibility trace timescales.
-
-        Pass directly to layer.set_plasticity_timescales(ne=...).
-        High NE → tau_e compressed → old correlations fade faster →
-        quicker adaptation when environment changes (phase B of a bandit task).
-        Low NE → full tau_e → consolidation of familiar patterns.
-        """
+        """NE → trace time-constant compression."""
         return self.noradrenaline
 
     @property
     def membrane_reactivity(self) -> float:
-        """
-        Acetylcholine-driven compression of membrane time constant.
-
-        Pass directly to layer.set_plasticity_timescales(ach=...).
-        High ACh → tau_m compressed → faster membrane integration →
-        stronger bottom-up signal influence vs. accumulated prediction.
-        Low ACh → slow tau_m → top-down predictions dominate.
-        """
+        """ACh → membrane τ compression."""
         return self.acetylcholine
 
-    def apply_to_layer(self, layer) -> None:
-        """
-        Convenience: propagate both NE and ACh to any layer that
-        supports set_plasticity_timescales().
+    # ------------------------------------------------------------------
+    # Layer interface
+    # ------------------------------------------------------------------
 
-        Zamknięta pętla w jednym wywołaniu:
-          neuromodulator.update(...) → neuromodulator.apply_to_layer(layer)
-        Wystarczy umieścić to wywołanie w głównej pętli agenta po każdym kroku.
-        """
+    def apply_to_layer(self, layer: object) -> None:
+        """Propagate NE/ACh to any layer supporting modulation."""
         if hasattr(layer, 'set_plasticity_timescales'):
             layer.set_plasticity_timescales(
-                ne=self.noradrenaline,
-                ach=self.acetylcholine,
+                ne=self.noradrenaline, ach=self.acetylcholine,
             )
-        # Dark matter recruitment (NE threshold drop) — preserved as before
         if hasattr(layer, 'set_ne_level'):
             layer.set_ne_level(self.noradrenaline)
 
@@ -381,7 +268,6 @@ class NeuromodulatorSystem:
     # ------------------------------------------------------------------
 
     def _clamp_all(self) -> None:
-        """Ensure all levels remain in [0, 1] after every update."""
         self.dopamine = float(np.clip(self.dopamine, 0.0, 1.0))
         self.tonic_da = float(np.clip(self.tonic_da, 0.0, 1.0))
         self.acetylcholine = float(np.clip(self.acetylcholine, 0.0, 1.0))
@@ -389,22 +275,28 @@ class NeuromodulatorSystem:
         self.serotonin = float(np.clip(self.serotonin, 0.0, 1.0))
 
     def reset(self) -> None:
-        """Restore all levels to configured baselines and clear histories."""
-        self.dopamine = self.config.baseline_da
-        self.tonic_da = self.config.baseline_tonic_da
-        self.acetylcholine = self.config.baseline_ach
-        self.noradrenaline = self.config.baseline_ne
-        self.serotonin = self.config.baseline_sero
+        """Restore baselines and clear histories."""
+        cfg = self.config
+        self.dopamine = cfg.baseline_da
+        self.tonic_da = cfg.baseline_tonic_da
+        self.acetylcholine = cfg.baseline_ach
+        self.noradrenaline = cfg.baseline_ne
+        self.serotonin = cfg.baseline_sero
         self._error_history.clear()
-        self._reward_history.clear()
         self._td_history.clear()
+        self._da_rms = 1.0
+        self._smoothed_reward = 0.0
+        self._welford_n = 0
+        self._welford_mean = 0.0
+        self._welford_m2 = 0.0
+        self._tda_history.clear()
+        self._stagnation_factor = 0.0
+        self._episode_pred_errors.clear()
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:
         return (
             f"NeuromodulatorSystem("
-            f"DA={self.dopamine:.3f}, "
-            f"tDA={self.tonic_da:.3f}, "
-            f"ACh={self.acetylcholine:.3f}, "
-            f"NE={self.noradrenaline:.3f}, "
+            f"DA={self.dopamine:.3f}, tDA={self.tonic_da:.3f}, "
+            f"ACh={self.acetylcholine:.3f}, NE={self.noradrenaline:.3f}, "
             f"5-HT={self.serotonin:.3f})"
         )

@@ -33,7 +33,7 @@ class TestBasalGanglia(unittest.TestCase):
         self.assertLess(abs(v_s), 2.0)
 
     def test_critic_update_reduces_error(self) -> None:
-        """NAPRAWA: Wymuszenie aktywności neuronów, by ślady STDP nie były zerowe."""
+        """Wymuszenie aktywności LIF neuronów, by ślady STDP nie były zerowe."""
         critic = self.bg_system.critic
         state = np.ones(self.state_size)
 
@@ -41,8 +41,9 @@ class TestBasalGanglia(unittest.TestCase):
         critic.w_h.fill(1.0)
         critic.w_v.fill(1.0)
 
-        # Wykonujemy forward, aby zbudować ślad e_v i e_h
-        critic.forward(state)
+        # LIF neurons need multiple steps to spike and build traces
+        for _ in range(20):
+            critic.forward(state)
         self.assertTrue(np.any(critic.e_v > 0), "Ślad kwalifikowalności krytyka jest zerowy.")
 
         w_v_before = critic.w_v.copy()

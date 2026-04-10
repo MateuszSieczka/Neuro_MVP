@@ -1,54 +1,33 @@
 """
-Spatial Attention System — top-down gain control for columnar architectures.
+Spatial Attention — top-down + bottom-up saliency with IOR.
 
-Biological grounding:
-  Attentional modulation in the cortex operates through acetylcholine (ACh)
-  released from basal forebrain projections.  Unlike the global tonic ACh
-  level tracked by NeuromodulatorSystem, *spatial* attention is column-specific:
-  higher cortical areas (e.g. prefrontal, parietal) project back to sensory
-  columns and selectively amplify those whose receptive fields overlap with
-  the attended location/object.
+Reference:
+  Reynolds & Heeger (2009)  Normalization model of attention
+  Posner & Cohen (1984)     Inhibition of return
+  Usher & Damasio (2000)    NE inverse-U / locus coeruleus
 
-  Mechanistically, attention acts as multiplicative gain:
-    effective_drive = base_drive × (1 + gain × attention_weight)
-  This does not change feature selectivity (tuning curves shift vertically,
-  not horizontally — Reynolds & Heeger, 2009).
-
-Architecture:
-  SpatialAttentionController sits between an association layer (top-down
-  source) and a set of columnar layers (gain targets).  Each timestep:
-    1. Read the association layer's spike pattern (or firing rate proxy).
-    2. Project through learned attention weights → raw saliency per column.
-    3. Apply softmax normalization → attention distribution sums to 1.
-    4. Scale by global ACh → final per-column gain values.
-
-  The attention weights are updated with a simple Hebbian rule:
-  columns that fire strongly when attended get reinforced, creating a
-  self-sharpening loop (winner-take-more across columns).
+Changes from legacy:
+  1. Bottom-up saliency (prediction error magnitude per column)
+  2. Inhibition of Return (IOR): τ_IOR ≈ 400ms inhibitory trace
+  3. Adaptive temperature modulated by NE (inverse-U)
+  4. Uses AttentionConfig from config.py (derived IOR decay)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
+from numpy.typing import NDArray
 
 from .config import AttentionConfig
 
 
 class SpatialAttentionController:
-    """
-    Computes per-column attention gains from a top-down association signal.
+    """Per-column attention gains from top-down + bottom-up signals.
 
-    Usage::
-
-        attn = SpatialAttentionController(
-            assoc_neurons=32,
-            n_columns=4,
-        )
-        # Each network step:
-        gains = attn.compute(assoc_spikes, global_ach=0.6)
-        # gains is a dict: {"col_0": 1.45, "col_1": 0.88, ...}
+    Total saliency = α × bottom_up + (1-α) × top_down
+    α modulated by task engagement (tonic DA).
+    Temperature modulated by NE (inverse-U).
+    IOR suppresses previously attended columns.
     """
 
     def __init__(
@@ -62,18 +41,30 @@ class SpatialAttentionController:
         self.assoc_neurons = assoc_neurons
         self.n_columns = n_columns
         self.column_names = list(column_names)
+        cfg = self.config
 
-        # Learned projection: association activity → per-column saliency
-        self.w_attn: np.ndarray = np.random.uniform(
-            -0.1, 0.1, (assoc_neurons, n_columns)
+        # ── Top-down projection weights ───────────────────────────────
+        self.w_attn: NDArray[np.float32] = np.random.uniform(
+            -0.1, 0.1, (assoc_neurons, n_columns),
         ).astype(np.float32)
 
-        # Smoothed attention distribution (temporal persistence)
-        self._attn_weights: np.ndarray = np.full(
-            n_columns, 1.0 / n_columns, dtype=np.float32
+        # ── Smoothed attention distribution ───────────────────────────
+        self._attn_weights: NDArray[np.float32] = np.full(
+            n_columns, 1.0 / n_columns, dtype=np.float32,
         )
 
-        # Per-column gain outputs from last compute() call
+        # ── IOR trace per column (Posner & Cohen 1984) ────────────────
+        self._ior_trace: NDArray[np.float32] = np.zeros(
+            n_columns, dtype=np.float32,
+        )
+        self._ior_decay: float = cfg.ior_decay
+
+        # ── Bottom-up saliency (prediction error per column) ──────────
+        self._bu_saliency: NDArray[np.float32] = np.zeros(
+            n_columns, dtype=np.float32,
+        )
+
+        # ── Per-column gain outputs ───────────────────────────────────
         self.column_gains: dict[str, float] = {
             name: 1.0 for name in column_names
         }
@@ -84,46 +75,68 @@ class SpatialAttentionController:
 
     def compute(
         self,
-        assoc_activity: np.ndarray,
+        assoc_activity: NDArray[np.float32],
         global_ach: float = 0.5,
+        ne_level: float = 0.5,
+        bottom_up_errors: NDArray[np.float32] | None = None,
     ) -> dict[str, float]:
-        """
-        Compute per-column attention gains.
+        """Compute per-column attention gains.
 
         Args:
-            assoc_activity:  Spike/rate vector from the association layer
-                             (shape: assoc_neurons).
-            global_ach:      Global acetylcholine level [0, 1].
-                             Scales the overall attention effect.
-
-        Returns:
-            Dict mapping column_name → gain (float ≥ 1.0 for attended,
-            < 1.0 for suppressed).
+            assoc_activity:    Association layer activity (assoc_neurons,).
+            global_ach:        ACh level scales overall attention effect.
+            ne_level:          NE level modulates softmax temperature.
+            bottom_up_errors:  Per-column prediction error magnitude (n_columns,).
         """
         act = assoc_activity.astype(np.float32)
+        cfg = self.config
 
-        # Raw saliency per column
-        raw = act @ self.w_attn  # (n_columns,)
+        # ── Top-down saliency ─────────────────────────────────────────
+        td_raw = act @ self.w_attn  # (n_columns,)
 
-        # Softmax with temperature
-        shifted = raw - np.max(raw)  # numerical stability
-        exp_vals = np.exp(shifted / max(self.config.temperature, 1e-6))
-        softmax = exp_vals / (np.sum(exp_vals) + 1e-8)
+        # ── Bottom-up saliency (surprise) ─────────────────────────────
+        if bottom_up_errors is not None:
+            self._bu_saliency = np.abs(bottom_up_errors).astype(np.float32)
+            bu_norm = self._bu_saliency / (np.sum(self._bu_saliency) + 1e-8)
+        else:
+            bu_norm = np.zeros(self.n_columns, dtype=np.float32)
 
-        # Temporal smoothing
+        # ── Mix: α × bottom_up + (1 - α) × top_down ──────────────────
+        alpha = cfg.bottom_up_weight
+        td_shifted = td_raw - np.max(td_raw)
+        temperature = cfg.ne_modulated_temperature(ne_level)
+        td_exp = np.exp(td_shifted / max(temperature, 1e-6))
+        td_norm = td_exp / (np.sum(td_exp) + 1e-8)
+
+        combined = alpha * bu_norm + (1.0 - alpha) * td_norm
+
+        # ── Apply IOR suppression ─────────────────────────────────────
+        combined = combined * (1.0 - cfg.ior_strength * self._ior_trace)
+        combined = np.maximum(combined, 0.0)
+
+        # Re-normalize
+        total = np.sum(combined) + 1e-8
+        combined = combined / total
+
+        # ── Temporal smoothing ────────────────────────────────────────
         self._attn_weights = (
-            self._attn_weights * self.config.decay
-            + softmax * (1.0 - self.config.decay)
+            self._attn_weights * cfg.decay
+            + combined.astype(np.float32) * (1.0 - cfg.decay)
         )
 
-        # Gain: uniform baseline (1.0) + ACh-scaled attention boost
-        # Columns above average get boosted; below average get suppressed
-        mean_w = np.mean(self._attn_weights)
-        gain_modulation = (self._attn_weights - mean_w) * self.config.gain_strength
-        gains = 1.0 + global_ach * gain_modulation
+        # ── IOR update: attended columns accumulate inhibitory trace ──
+        self._ior_trace *= self._ior_decay
+        # Columns above mean attention → accumulate IOR
+        mean_w = float(np.mean(self._attn_weights))
+        ior_input = np.maximum(self._attn_weights - mean_w, 0.0)
+        self._ior_trace += ior_input * (1.0 - self._ior_decay)
+        np.clip(self._ior_trace, 0.0, 1.0, out=self._ior_trace)
 
-        # Ensure gains don't go negative
-        gains = np.maximum(gains, 0.1)
+        # ── Gain: baseline + ACh × attention modulation ───────────────
+        mean_a = float(np.mean(self._attn_weights))
+        gain_modulation = (self._attn_weights - mean_a) * cfg.gain_strength
+        gains = 1.0 + global_ach * gain_modulation
+        gains = np.maximum(gains, 0.1).astype(np.float32)
 
         self.column_gains = {
             name: float(gains[i]) for i, name in enumerate(self.column_names)
@@ -132,36 +145,29 @@ class SpatialAttentionController:
 
     def update(
         self,
-        assoc_activity: np.ndarray,
-        column_activities: dict[str, np.ndarray],
+        assoc_activity: NDArray[np.float32],
+        column_activities: dict[str, NDArray[np.float32]],
     ) -> None:
-        """
-        Hebbian update of attention projection weights.
-
-        Reinforces the connection between association patterns and columns
-        that were active when attended.
-
-        Args:
-            assoc_activity:     Association layer spikes (assoc_neurons,).
-            column_activities:  Dict mapping column_name → spike array.
-        """
+        """Hebbian update of top-down attention projection weights."""
         act = assoc_activity.astype(np.float32)
+        cfg = self.config
 
         for i, name in enumerate(self.column_names):
             if name in column_activities:
                 col_rate = float(np.mean(column_activities[name]))
                 gain = self.column_gains.get(name, 1.0)
-                # Reinforce: if column was attended (high gain) AND active → strengthen
                 signal = col_rate * (gain - 1.0)
-                self.w_attn[:, i] += self.config.learning_rate * act * signal
+                self.w_attn[:, i] += cfg.learning_rate * act * signal
         np.clip(self.w_attn, -2.0, 2.0, out=self.w_attn)
 
     def reset_state(self) -> None:
-        """Reset transient state. Learned weights are preserved."""
+        """Reset transient state. Learned weights preserved."""
         self._attn_weights.fill(1.0 / self.n_columns)
+        self._ior_trace.fill(0.0)
+        self._bu_saliency.fill(0.0)
         self.column_gains = {name: 1.0 for name in self.column_names}
 
     @property
-    def attention_distribution(self) -> np.ndarray:
+    def attention_distribution(self) -> NDArray[np.float32]:
         """Current smoothed attention weights (n_columns,)."""
         return self._attn_weights.copy()

@@ -1,82 +1,77 @@
 """
-Episodic Memory — hippocampal one-shot pattern binding.
+Episodic Memory — hippocampal one-shot binding with interference forgetting.
 
-Biological grounding:
-  Hippocampal area CA3 forms auto-associative memories in a single
-  exposure when noradrenaline (locus coeruleus) is high.  The dentate
-  gyrus provides pattern separation; CA3 recurrent collaterals provide
-  pattern completion.
+Reference:
+  Rolls (2013)  "Pattern completion and separation in the hippocampus"
+  O'Neill et al. (2010)  Hippocampal replay
+  McClelland, McNaughton & O'Reilly (1995)  Complementary learning systems
 
-  This module implements the computational essence:
-    - Store:  high NE → snapshot (state, action, reward, next_state)
-              with one-shot Hebbian binding (no eligibility trace needed).
-    - Recall: cosine-similarity pattern completion from a partial cue.
-    - Inject: stored episodes are fed into ReplayBuffer during sleep
-              consolidation, enabling offline STDP on rare events that
-              would otherwise be underrepresented in the replay buffer.
-
-Design:
-  Fixed-capacity ring buffer of (key, value) pairs.
-    key   = state spike pattern (num_state,)
-    value = full Experience-like tuple (state, action, reward, next_state)
-  Storage is gated by NE level ≥ ne_threshold AND novelty (cosine
-  distance from all existing keys > similarity_thresh).
+Changes from legacy:
+  1. Interference-based forgetting: new memories overwrite most similar
+     (not oldest FIFO). Consolidated memories resist overwrite.
+  2. DG-like sparse encoding: random projection + threshold for pattern
+     separation before storage.
+  3. Uses EpisodicMemoryConfig from config.py (dg_sparsity, consolidation).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
+from numpy.typing import NDArray
 
 from .config import EpisodicMemoryConfig
 
+if TYPE_CHECKING:
+    from .basal_ganglia import BGSnapshot
+
+
+# =====================================================================
+# Data container
+# =====================================================================
 
 @dataclass
 class Episode:
     """A single episodic memory trace."""
-    state: np.ndarray
-    action: int | np.ndarray
+    state: NDArray[np.float32]
+    action: int | NDArray[np.float32]
     reward: float
-    next_state: np.ndarray
+    next_state: NDArray[np.float32]
     salience: float = 1.0
-
-    # BG eligibility traces at time of encoding (Lansink et al. 2009).
-    # Enables proper credit assignment when replayed during sleep.
-    bg_traces: dict[str, np.ndarray] = field(default_factory=dict)
-    aug_state: np.ndarray | None = None
-    layer_traces: dict[str, np.ndarray] = field(default_factory=dict)
-    layer_outputs: dict[str, np.ndarray] = field(default_factory=dict)
-    prediction_error: np.ndarray | None = None
+    prediction_error: NDArray[np.float32] | None = None
+    encoder_e_bu: NDArray[np.float32] | None = None
+    encoder_spikes: NDArray[np.float32] | None = None
+    bg_snapshot: "BGSnapshot | None" = None
+    aug_state: NDArray[np.float32] | None = None
+    # Consolidation tracking
+    replay_count: int = 0
 
     def __post_init__(self) -> None:
         self.state = np.asarray(self.state, dtype=np.float32).copy()
         self.next_state = np.asarray(self.next_state, dtype=np.float32).copy()
-        self.bg_traces = {k: v.copy() for k, v in self.bg_traces.items()}
         if self.aug_state is not None:
-            self.aug_state = self.aug_state.copy()
-        self.layer_traces = {k: v.copy() for k, v in self.layer_traces.items()}
-        self.layer_outputs = {k: v.copy() for k, v in self.layer_outputs.items()}
+            self.aug_state = np.asarray(self.aug_state, dtype=np.float32).copy()
         if self.prediction_error is not None:
-            self.prediction_error = self.prediction_error.copy()
+            self.prediction_error = np.asarray(self.prediction_error, dtype=np.float32).copy()
+        if self.encoder_e_bu is not None:
+            self.encoder_e_bu = np.asarray(self.encoder_e_bu, dtype=np.float32).copy()
+        if self.encoder_spikes is not None:
+            self.encoder_spikes = np.asarray(self.encoder_spikes, dtype=np.float32).copy()
 
+
+# =====================================================================
+# Episodic Memory
+# =====================================================================
 
 class EpisodicMemory:
-    """
-    One-shot episodic memory with NE-gated storage and cosine recall.
+    """One-shot episodic memory with interference forgetting and DG sparse coding.
 
-    Usage in the agent loop::
-
-        em = EpisodicMemory(state_dim)
-        # ... during online step:
-        em.try_store(state, action, reward, next_state, ne_level)
-        # ... during sleep:
-        episodes = em.recall_all()
-        for ep in episodes:
-            replay_buffer.store(
-                state=ep.state, action=ep.action, reward=ep.reward,
-                next_state=ep.next_state, ..., salience=ep.salience,
-            )
+    Storage is gated by NE level ≥ threshold AND novelty.
+    Forgetting: new memory overwrites the most similar existing memory
+    (not the oldest). Consolidated memories (replay_count ≥ threshold)
+    resist overwrite.
     """
 
     def __init__(
@@ -86,41 +81,58 @@ class EpisodicMemory:
     ) -> None:
         self.config = config or EpisodicMemoryConfig()
         self.state_dim = state_dim
+        cfg = self.config
 
-        self._keys: list[np.ndarray] = []     # stored state patterns
-        self._episodes: list[Episode] = []     # full episode records
-        self._write_idx: int = 0               # ring buffer pointer
+        self._keys: list[NDArray[np.float32]] = []
+        self._episodes: list[Episode] = []
+
+        # ── DG-like sparse encoding (Rolls 2013) ─────────────────────
+        # Random projection: state → expanded sparse code
+        dg_dim = state_dim * cfg.dg_expansion_factor
+        self._dg_projection: NDArray[np.float32] = np.random.randn(
+            state_dim, dg_dim,
+        ).astype(np.float32) * (1.0 / np.sqrt(state_dim))
+        self._dg_dim = dg_dim
+        self._dg_sparsity = cfg.dg_sparsity
 
     # ------------------------------------------------------------------
-    # Storage (gated by NE)
+    # DG sparse encoding
+    # ------------------------------------------------------------------
+
+    def _dg_encode(self, state: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Pattern separation: state → sparse binary DG code."""
+        projected = state @ self._dg_projection
+        # Keep top-k% as active (competitive threshold)
+        k = max(1, int(self._dg_sparsity * self._dg_dim))
+        threshold = np.partition(projected, -k)[-k] if projected.size > k else 0.0
+        sparse = (projected >= threshold).astype(np.float32)
+        return sparse
+
+    # ------------------------------------------------------------------
+    # Storage (NE-gated, interference forgetting)
     # ------------------------------------------------------------------
 
     def try_store(
         self,
-        state: np.ndarray,
-        action: int | np.ndarray,
+        state: NDArray[np.float32],
+        action: int | NDArray[np.float32],
         reward: float,
-        next_state: np.ndarray,
+        next_state: NDArray[np.float32],
         ne_level: float,
-        bg_traces: dict[str, np.ndarray] | None = None,
-        aug_state: np.ndarray | None = None,
-        layer_traces: dict[str, np.ndarray] | None = None,
-        layer_outputs: dict[str, np.ndarray] | None = None,
-        prediction_error: np.ndarray | None = None,
+        prediction_error: NDArray[np.float32] | None = None,
+        encoder_e_bu: NDArray[np.float32] | None = None,
+        encoder_spikes: NDArray[np.float32] | None = None,
+        bg_snapshot: "BGSnapshot | None" = None,
+        aug_state: NDArray[np.float32] | None = None,
     ) -> bool:
-        """
-        Attempt to store an episode.  Returns True if stored.
-
-        Storage occurs only when:
-          1. ne_level ≥ config.ne_threshold  (arousal gate)
-          2. The state is sufficiently novel (cosine distance from all
-             existing keys exceeds config.similarity_thresh).
-        """
+        """Store an episode if NE-gated and novel. Returns True if stored."""
         if ne_level < self.config.ne_threshold:
             return False
 
         state_f32 = np.asarray(state, dtype=np.float32)
-        if not self._is_novel(state_f32):
+        dg_key = self._dg_encode(state_f32)
+
+        if not self._is_novel(dg_key):
             return False
 
         episode = Episode(
@@ -129,62 +141,95 @@ class EpisodicMemory:
             reward=reward,
             next_state=next_state,
             salience=float(np.clip(ne_level, 0.0, 1.0)),
-            bg_traces=bg_traces or {},
-            aug_state=aug_state,
-            layer_traces=layer_traces or {},
-            layer_outputs=layer_outputs or {},
             prediction_error=prediction_error,
+            encoder_e_bu=encoder_e_bu,
+            encoder_spikes=encoder_spikes,
+            bg_snapshot=bg_snapshot,
+            aug_state=aug_state,
         )
 
         if len(self._episodes) < self.config.capacity:
-            self._keys.append(state_f32.copy())
+            self._keys.append(dg_key.copy())
             self._episodes.append(episode)
         else:
-            # Ring buffer overwrite
-            self._keys[self._write_idx] = state_f32.copy()
-            self._episodes[self._write_idx] = episode
-        self._write_idx = (self._write_idx + 1) % self.config.capacity
+            # Interference-based forgetting: overwrite most similar
+            # non-consolidated memory
+            idx = self._find_interference_target(dg_key)
+            if idx is not None:
+                self._keys[idx] = dg_key.copy()
+                self._episodes[idx] = episode
+            else:
+                # All memories consolidated: overwrite least salient
+                sals = [ep.salience for ep in self._episodes]
+                idx_min = int(np.argmin(sals))
+                self._keys[idx_min] = dg_key.copy()
+                self._episodes[idx_min] = episode
 
         return True
 
+    def _find_interference_target(
+        self,
+        dg_key: NDArray[np.float32],
+    ) -> int | None:
+        """Find the most similar non-consolidated memory to overwrite."""
+        cfg = self.config
+        best_sim = -1.0
+        best_idx: int | None = None
+        key_norm = np.linalg.norm(dg_key)
+        if key_norm < 1e-8:
+            return None
+
+        for i, stored_key in enumerate(self._keys):
+            # Skip consolidated memories
+            if self._episodes[i].replay_count >= cfg.consolidation_threshold:
+                continue
+            stored_norm = np.linalg.norm(stored_key)
+            if stored_norm < 1e-8:
+                continue
+            sim = float(np.dot(dg_key, stored_key) / (key_norm * stored_norm))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = i
+
+        return best_idx
+
     # ------------------------------------------------------------------
-    # Recall
+    # Recall (CA3-like pattern completion)
     # ------------------------------------------------------------------
 
-    def recall(self, cue: np.ndarray, top_k: int = 1) -> list[Episode]:
-        """
-        Pattern-completion recall: find the top_k most similar episodes.
-
-        Args:
-            cue:   Partial or full state pattern (state_dim,).
-            top_k: Number of episodes to return.
-
-        Returns:
-            List of Episode objects, sorted by descending similarity.
-        """
+    def recall(
+        self,
+        cue: NDArray[np.float32],
+        top_k: int = 1,
+    ) -> list[Episode]:
+        """Pattern-completion recall: find top_k most similar episodes."""
         if not self._episodes:
             return []
 
-        cue_f32 = np.asarray(cue, dtype=np.float32)
-        cue_norm = np.linalg.norm(cue_f32)
+        cue_dg = self._dg_encode(np.asarray(cue, dtype=np.float32))
+        cue_norm = np.linalg.norm(cue_dg)
         if cue_norm < 1e-8:
             return []
 
-        similarities = []
+        similarities: list[float] = []
         for key in self._keys:
             key_norm = np.linalg.norm(key)
             if key_norm < 1e-8:
                 similarities.append(-1.0)
             else:
-                similarities.append(float(np.dot(cue_f32, key) / (cue_norm * key_norm)))
+                similarities.append(float(np.dot(cue_dg, key) / (cue_norm * key_norm)))
 
         sorted_idx = np.argsort(similarities)[::-1]
         top_k = min(top_k, len(self._episodes))
         return [self._episodes[i] for i in sorted_idx[:top_k]]
 
     def recall_all(self) -> list[Episode]:
-        """Return all stored episodes (for sleep-phase injection)."""
+        """Return all stored episodes (for sleep consolidation)."""
         return list(self._episodes)
+
+    def mark_replayed(self, episode: Episode) -> None:
+        """Increment replay count for consolidation tracking."""
+        episode.replay_count += 1
 
     # ------------------------------------------------------------------
     # Utility
@@ -197,26 +242,19 @@ class EpisodicMemory:
     def clear(self) -> None:
         self._keys.clear()
         self._episodes.clear()
-        self._write_idx = 0
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _is_novel(self, state: np.ndarray) -> bool:
-        """True if state is sufficiently different from all stored keys."""
+    def _is_novel(self, dg_key: NDArray[np.float32]) -> bool:
+        """True if DG key is sufficiently different from all stored keys."""
         if not self._keys:
             return True
-
-        state_norm = np.linalg.norm(state)
-        if state_norm < 1e-8:
+        key_norm = np.linalg.norm(dg_key)
+        if key_norm < 1e-8:
             return False
-
-        for key in self._keys:
-            key_norm = np.linalg.norm(key)
-            if key_norm < 1e-8:
+        for stored in self._keys:
+            stored_norm = np.linalg.norm(stored)
+            if stored_norm < 1e-8:
                 continue
-            cos_sim = float(np.dot(state, key) / (state_norm * key_norm))
+            cos_sim = float(np.dot(dg_key, stored) / (key_norm * stored_norm))
             if cos_sim >= self.config.similarity_thresh:
                 return False
         return True

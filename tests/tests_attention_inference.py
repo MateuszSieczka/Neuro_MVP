@@ -256,8 +256,6 @@ class TestActiveInference(unittest.TestCase):
         self.action_size = 3
         self.wm_config = SNNWorldModelConfig(
             hidden_size=32,
-            k_winners=5,
-            rehearsal_steps=15,
         )
         self.ai_config = ActiveInferenceConfig(
             epistemic_weight=1.0,
@@ -397,13 +395,13 @@ class TestActiveInference(unittest.TestCase):
         for _ in range(10):
             self.wm.predict(state, 0)
 
-        enc = self.wm._encoder
-        v_before = enc.v.copy()
+        enc = self.wm.encoder
+        v_before = enc.v_state.copy()
 
         # Compute epistemic values (triggers mental_rehearsal internally)
         self.ai.compute_epistemic_values(state, [0, 1, 2])
 
-        np.testing.assert_array_equal(enc.v, v_before,
+        np.testing.assert_array_equal(enc.v_state, v_before,
                                       err_msg="Epistemic computation modified encoder state.")
 
 

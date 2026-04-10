@@ -1,295 +1,819 @@
-from dataclasses import dataclass
+"""
+Configuration — self-tuning dataclass configs deriving dependent parameters
+from a minimal set of biological priors.
 
+Design principles:
+  1. Every magic number is either:
+     (a) a biological constant with a literature reference, or
+     (b) derived from other biological constants via a named equation.
+  2. Frozen dataclasses prevent runtime mutation.
+  3. ``__post_init__`` computes dependent values so they are available
+     immediately and consistently.
+  4. All time constants in ms, potentials in mV, rates in spikes/timestep.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Tuple
+
+import numpy as np
+
+from .simulation_context import SimulationContext, DEFAULT_CONTEXT
+
+
+# =====================================================================
+# Enums
+# =====================================================================
+
+class ReceptorType(Enum):
+    """Neurotransmitter receptor subtypes."""
+    # Dopamine
+    D1 = auto()   # Excitatory, cAMP↑, Go pathway (Surmeier et al. 2007)
+    D2 = auto()   # Inhibitory, cAMP↓, NoGo pathway
+
+    # Acetylcholine
+    M1 = auto()   # Cortical excitatory (muscarinic)
+    M4 = auto()   # Striatal inhibitory (muscarinic)
+    NACHR = auto() # Fast nicotinic (thalamic input gating)
+
+    # Noradrenaline
+    ALPHA1 = auto()  # Excitatory (cortical arousal)
+    ALPHA2 = auto()  # Presynaptic inhibition (autoreceptor)
+    BETA = auto()    # Slow modulatory (β-adrenergic)
+
+    # Serotonin
+    HT1A = auto()  # Inhibitory (raphe autoreceptor, hippocampal)
+    HT2A = auto()  # Excitatory (cortical, hallucinogenic at excess)
+
+    # GABA
+    GABA_A = auto()  # Fast inhibitory (Cl⁻ channel)
+    GABA_B = auto()  # Slow inhibitory (G-protein coupled)
+
+    # Glutamate
+    AMPA = auto()   # Fast excitatory
+    NMDA = auto()   # Slow, voltage-dependent (Mg²⁺ block)
+
+
+class SynapseType(Enum):
+    """Synapse conductance models."""
+    AMPA = auto()
+    NMDA = auto()
+    GABA_A = auto()
+    GABA_B = auto()
+
+
+# =====================================================================
+# SimulationContext-aware base
+# =====================================================================
 
 @dataclass(frozen=True, kw_only=True)
-class LIFConfig:
-    """
-    Hyperparameters for the Leaky Integrate-and-Fire (LIF) neuron.
-    Uses frozen dataclass to prevent unintended runtime mutations.
+class BaseConfig:
+    """Base for all configs — carries a reference to the simulation context."""
+    ctx: SimulationContext = field(default_factory=lambda: DEFAULT_CONTEXT)
+
+
+# =====================================================================
+# Phase 0: Neuron & Synapse Configs (derived from biophysics)
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class NeuronConfig(BaseConfig):
+    """Leaky Integrate-and-Fire parameters.
+
+    Biological reference values:
+      v_rest  = -70 mV  (cortical pyramidal resting potential)
+      v_thresh = -55 mV  (Na⁺ spike threshold, McCormick et al. 1985)
+      v_reset = -75 mV   (post-spike AHP)
+      tau_m   = 20 ms    (cortical pyramidal, Destexhe & Paré 1999)
+      refrac  = 2 ms     (absolute refractory, Bean 2007)
     """
     v_rest: float = -70.0
     v_thresh: float = -55.0
     v_reset: float = -75.0
     tau_m: float = 20.0
-    tau_e: float = 500.0
-    tau_pre: float = 20.0    # Presynaptic trace decay
-    tau_post: float = 20.0   # Postsynaptic trace decay
-    refrac_period: int = 2   # Absolute refractory period in timesteps (dt)
-    dt: float = 1.0
-    learning_rate: float = 0.01
+    refrac_period: int = 2  # steps (= ms at dt=1)
 
-    # ── Dynamic timescale modulation ──────────────────────────────────
-    # NE compresses eligibility trace windows (tau_e, tau_pre, tau_post).
-    # At NE=1.0 the effective tau is divided by tau_ne_compression,
-    # making old correlations fade faster → quicker context switching.
-    # At NE=0.0 no compression is applied (full tau_e retained).
-    tau_ne_compression: float = 4.0
+    # ── Derived (computed in __post_init__) ───────────────────────────
+    # Membrane decay factor per timestep
+    mem_decay: float = field(init=False, default=0.0)
+    # Membrane gain complement (1 - decay)
+    mem_gain: float = field(init=False, default=0.0)
+    # Threshold gap: v_thresh - v_rest (mV) — used for weight scaling
+    gap: float = field(init=False, default=0.0)
+    # Minimum current to reach threshold from rest in one tau_m
+    i_thresh: float = field(init=False, default=0.0)
 
-    # ACh compresses the membrane time constant.
-    # High ACh → faster integration → stronger bottom-up signal influence.
-    # At ACh=1.0 effective tau_m is divided by tau_ach_compression.
-    tau_ach_compression: float = 2.0
-
-
-@dataclass(frozen=True, kw_only=True)
-class HomeostaticLIFConfig(LIFConfig):
-    """
-    Extends LIFConfig with homeostatic plasticity — synaptic scaling.
-
-    Dark Matter Neurons
-    -------------------
-    dark_matter_ratio controls the fraction of neurons initialized with an
-    inflated threshold (dark_matter_thresh_offset mV above v_thresh).  These
-    neurons are silent under normal conditions but can be recruited when
-    global noradrenaline spikes, which temporarily lowers ALL thresholds
-    by up to ne_thresh_drop mV.  This achieves capacity expansion for
-    continual learning without dynamic matrix allocation (neurogenesis).
-
-    homeostatic_tau:  Time constant for the sliding average of firing rate (ms).
-                      Intentionally long (>>tau_m) so threshold adapts slowly.
-    target_rate:      Desired spikes-per-timestep. 0.05 → 5% firing probability
-                      per step, consistent with cortical sparse coding.
-    thresh_adapt_lr:  Step size of threshold correction per timestep.
-    thresh_min/max:   Hard physiological bounds on adaptive threshold.
-    """
-    target_rate: float = 0.05        # Target spikes / timestep
-    homeostatic_tau: float = 1000.0  # Slow time constant (ms)
-    thresh_adapt_lr: float = 0.01    # Threshold adaptation step
-    thresh_min: float = -68.0        # Minimum allowed threshold (mV)
-    thresh_max: float = -45.0        # Maximum allowed threshold (mV)
-
-    # Dark Matter Neurons
-    dark_matter_ratio: float = 0.0        # Fraction of neurons born as dark matter (0–1)
-    dark_matter_thresh_offset: float = 20.0  # Extra mV added to threshold for dark neurons
-    ne_thresh_drop: float = 15.0          # Max mV threshold drop at NE=1.0
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
+        object.__setattr__(self, 'mem_gain', self.ctx.complement(self.tau_m))
+        gap = abs(self.v_thresh - self.v_rest)
+        object.__setattr__(self, 'gap', gap)
+        # I_thresh: current that brings v from rest to thresh in one tau_m
+        # v_thresh = v_rest + I × (1 - decay) => I = gap / (1 - decay)
+        object.__setattr__(self, 'i_thresh', gap * (1.0 - self.mem_decay))
 
 
 @dataclass(frozen=True, kw_only=True)
-class KWTAConfig(LIFConfig):
+class STDPConfig(BaseConfig):
+    """Spike-Timing-Dependent Plasticity kernel parameters.
+
+    Reference: Bi & Poo (2001) "Synaptic modification by correlated
+    activity: Hebb's postulate revisited"
+
+    Asymmetric window:
+      Δw = +A_plus  × exp(-|Δt| / τ_plus)   if pre before post (LTP)
+      Δw = -A_minus × exp(-|Δt| / τ_minus)   if post before pre (LTD)
+
+    Bi & Poo values: A_minus/A_plus ≈ 1.05, τ_plus ≈ 17ms, τ_minus ≈ 34ms
+    This slight LTD bias ensures long-term weight stability.
     """
-    Hyperparameters for k-Winners-Take-All lateral inhibition.
-    """
-    k_winners: int = 3       # Liczba zwycięzców w populacji
-    i_inh: float = 50.0      # Siła sygnału hamującego (mV odejmowane od V)
-    window_ms: int = 100     # Okno czasowe integracji przed ewaluacją k-WTA
+    tau_plus: float = 17.0    # LTP trace time constant (ms)
+    tau_minus: float = 34.0   # LTD trace time constant (ms)
+    a_plus: float = 0.01      # LTP amplitude
+    a_minus: float = 0.0105   # LTD amplitude (1.05× A_plus, Bi & Poo)
+    tau_eligibility: float = 20.0  # Third-factor eligibility trace (ms)
+
+    # ── Derived ───────────────────────────────────────────────────────
+    pre_decay: float = field(init=False, default=0.0)
+    post_decay: float = field(init=False, default=0.0)
+    elig_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'pre_decay', self.ctx.decay(self.tau_plus))
+        object.__setattr__(self, 'post_decay', self.ctx.decay(self.tau_minus))
+        object.__setattr__(self, 'elig_decay', self.ctx.decay(self.tau_eligibility))
 
 
 @dataclass(frozen=True, kw_only=True)
-class HomeostaticKWTAConfig(HomeostaticLIFConfig):
+class HomeostaticConfig(BaseConfig):
+    """BCM-derived homeostatic threshold adaptation.
+
+    Reference: Bienenstock, Cooper & Munro (1982), Turrigiano (2008)
+
+    The adaptation learning rate is derived from BCM theory:
+      lr = 1 / (homeostatic_tau × target_rate)
+
+    This ensures the threshold correction magnitude is independent of
+    the absolute target rate — a neuron targeting 1% or 10% converges
+    at the same relative speed.
     """
-    KWTAConfig with homeostatic plasticity.
-    Adds k-WTA fields on top of HomeostaticLIFConfig.
-    """
-    k_winners: int = 3
-    i_inh: float = 50.0
-    window_ms: int = 100
+    target_rate: float = 0.05        # Spikes per timestep (5%)
+    homeostatic_tau: float = 1000.0  # Slow averaging window (ms)
+    thresh_min: float = -68.0        # Physiological threshold floor (mV)
+    thresh_max: float = -45.0        # Physiological threshold ceiling (mV)
+
+    # Dark Matter Neurons (reserve capacity for continual learning)
+    dark_matter_ratio: float = 0.0
+    dark_matter_thresh_offset: float = 20.0  # Extra mV for dark neurons
+    ne_thresh_drop: float = 15.0             # Max NE-driven threshold reduction
+
+    # ── Derived ───────────────────────────────────────────────────────
+    homeo_decay: float = field(init=False, default=0.0)
+    thresh_adapt_lr: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'homeo_decay', self.ctx.decay(self.homeostatic_tau))
+        # BCM-derived: lr = 1 / (tau × target_rate)
+        lr = 1.0 / (self.homeostatic_tau * max(self.target_rate, 1e-6))
+        object.__setattr__(self, 'thresh_adapt_lr', lr)
 
 
 @dataclass(frozen=True, kw_only=True)
-class PredictiveCodingConfig(HomeostaticKWTAConfig):
-    """
-    Hyperparameters for Predictive Coding layer.
-    Extends KWTAConfig with feedback (top-down) dynamics.
+class SynapseConfig(BaseConfig):
+    """Conductance-based synapse parameters.
 
-    feedback_strength:       Skala, z jaką top-down prediction moduluje wejście.
-    feedback_learning_rate:  Szybkość uczenia się wag feedback (oddzielna od STDP).
+    Reference: Jahr & Stevens (1990), Destexhe et al. (1998)
+
+    Four channel types with biophysical kinetics:
+      AMPA:   τ_rise ≈ 0.2ms, τ_decay ≈ 2ms   (fast excitatory)
+      NMDA:   τ_rise ≈ 2ms,   τ_decay ≈ 100ms  (slow, voltage-gated)
+      GABA-A: τ_rise ≈ 0.5ms, τ_decay ≈ 5ms    (fast inhibitory)
+      GABA-B: τ_rise ≈ 30ms,  τ_decay ≈ 100ms   (slow inhibitory)
+
+    NMDA voltage-dependent Mg²⁺ block (Jahr & Stevens 1990):
+      B(V) = 1 / (1 + [Mg²⁺]/3.57 × exp(-0.062 × V))
+      At V_rest=-70mV: B ≈ 0.02 (blocked)
+      At V_thresh=-55mV: B ≈ 0.12 (partially open)
+      At 0mV: B ≈ 1.0 (fully open)
+    """
+    # AMPA
+    tau_ampa: float = 2.0
+    # NMDA
+    tau_nmda: float = 100.0
+    mg_concentration: float = 1.0  # mM (extracellular [Mg²⁺])
+    # GABA-A
+    tau_gaba_a: float = 5.0
+    # GABA-B
+    tau_gaba_b: float = 100.0
+    # Reversal potentials
+    e_exc: float = 0.0       # Excitatory reversal (mV)
+    e_inh: float = -75.0     # Inhibitory reversal (mV)
+    # AMPA/NMDA ratio (Myme et al. 2003: ~2:1 to 4:1 in cortex)
+    ampa_nmda_ratio: float = 3.0
+
+    # ── Derived ───────────────────────────────────────────────────────
+    ampa_decay: float = field(init=False, default=0.0)
+    nmda_decay: float = field(init=False, default=0.0)
+    gaba_a_decay: float = field(init=False, default=0.0)
+    gaba_b_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'ampa_decay', self.ctx.decay(self.tau_ampa))
+        object.__setattr__(self, 'nmda_decay', self.ctx.decay(self.tau_nmda))
+        object.__setattr__(self, 'gaba_a_decay', self.ctx.decay(self.tau_gaba_a))
+        object.__setattr__(self, 'gaba_b_decay', self.ctx.decay(self.tau_gaba_b))
+
+    @staticmethod
+    def nmda_mg_block(v: float | np.ndarray) -> float | np.ndarray:
+        """NMDA voltage-dependent Mg²⁺ block factor B(V).
+
+        B(V) = 1 / (1 + [Mg²⁺]/3.57 × exp(-0.062 × V))
+
+        Reference: Jahr & Stevens (1990)
+        """
+        return 1.0 / (1.0 + (1.0 / 3.57) * np.exp(-0.062 * v))
+
+
+@dataclass(frozen=True, kw_only=True)
+class CompetitiveConfig(BaseConfig):
+    """k-WTA parameters derived from target sparsity and population size.
+
+    Key derivation:
+      k_winners = ceil(target_sparsity × num_neurons)
+      i_inh = (v_thresh - v_rest) × num_neurons / k_winners × inhibition_strength
+
+    The inhibition strength ensures losers are pushed below rest.
+    """
+    target_sparsity: float = 0.15  # Fraction of neurons active per window
+    inhibition_strength: float = 1.5  # Multiplier on i_inh (1.0 = just-sufficient)
+    window_ms: float = 100.0  # k-WTA evaluation window (ms)
+
+    @staticmethod
+    def derive_k(target_sparsity: float, num_neurons: int) -> int:
+        """Compute k_winners from target sparsity and population size."""
+        return max(1, math.ceil(target_sparsity * num_neurons))
+
+    @staticmethod
+    def derive_i_inh(
+        gap: float,
+        num_neurons: int,
+        k_winners: int,
+        strength: float = 1.5,
+    ) -> float:
+        """Derive inhibition magnitude from biophysics.
+
+        i_inh must push losers below V_rest with margin. Scaled by
+        the ratio N/k to ensure k-WTA dynamics are maintained regardless
+        of population size.
+        """
+        return gap * (num_neurons / max(k_winners, 1)) * strength
+
+
+# =====================================================================
+# Predictive Coding & Pyramidal
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class PredictiveCodingConfig(BaseConfig):
+    """Predictive Coding layer parameters.
+
+    Reference: Friston (2010), Rao & Ballard (1999)
+
+    relaxation_steps and relaxation_rate replaced by convergence criterion:
+      Iterate until ||gradient|| < ε or max 20 steps, with adaptive step size
+      bounded by Lipschitz constant of the generative model gradient.
     """
     feedback_strength: float = 0.5
     feedback_learning_rate: float = 0.005
-    relaxation_steps: int = 10
-    relaxation_rate: float = 0.1
-    relaxation_threshold: float = 0.01  # Wcześniejsze wyjście z pętli relaksacji (oszczędność CPU)
-    feedback_norm: bool = True  # Czy normalizować wagi wsteczne
-
-@dataclass(frozen=True, kw_only=True)
-class PyramidalConfig(PredictiveCodingConfig):
-    """
-    Hyperparameters for multi-compartment pyramidal neuron layer.
-
-    Biological grounding:
-      Cortical pyramidal neurons have two anatomically distinct integration zones:
-        - Basal dendrites (~100–200 µm from soma): receive thalamic/feedforward input.
-        - Apical dendrites (~400–1000 µm from soma): receive feedback from
-          higher cortical areas and other long-range projections.
-      The apical compartment is electrically passive at low input levels but
-      triggers a dendritic calcium spike (BAC firing) when strongly activated,
-      which dramatically lowers the threshold for somatic spiking.
-
-      Burst-dependent plasticity (Payeur et al., 2021):
-        A spike that coincides with apical activation (burst) drives 3–5× stronger
-        STDP than a singleton spike. This provides a top-down teaching signal that
-        is separate from the feedforward credit-assignment pathway.
-
-    Compartment parameters:
-      tau_apical:        Time constant of apical membrane (ms). Must be >> tau_m
-                         because apical dendrites are electrotonically remote.
-      apical_threshold:  Normalised apical potential level above which apical
-                         priming activates (triggers BAC-like gain modulation).
-      apical_boost:      mV subtracted from somatic threshold when apical is primed.
-                         Calibrate so that apical-alone never fires soma
-                         (boost < |v_thresh − v_rest|) but meaningfully reduces
-                         the required basal drive.
-      burst_stdp_factor: Multiplier applied to eligibility traces when is_burst=True.
-                         Biologically 3–5× based on Payeur et al.
-      apical_lr:         Learning rate for Hebbian update of apical weights.
-    """
-    # Apical compartment
-    tau_apical: float = 50.0          # Apical membrane time constant (ms)
-    apical_threshold: float = 0.3     # Normalised apical potential for priming
-    apical_boost: float = 10.0        # Somatic threshold reduction (mV) when primed
-    burst_stdp_factor: float = 3.0    # STDP multiplier during burst
-    apical_lr: float = 0.005          # Apical weight Hebbian learning rate
-    plateau_duration_ms: int = 50   # Czas trwania nieliniowego plateau
-    background_noise_std: float = 2.0  # DODANE: Odchylenie standardowe szumu błonowego (mV)
+    max_relaxation_steps: int = 20    # Upper bound (convergence checked)
+    relaxation_threshold: float = 0.01  # Gradient norm convergence criterion
+    feedback_norm: bool = True
+    # Adaptive step size: initial rate, bounded by 1/L (Lipschitz)
+    initial_relaxation_rate: float = 0.1
 
 
 @dataclass(frozen=True, kw_only=True)
-class WorkingMemoryConfig(LIFConfig):
+class PyramidalConfig(BaseConfig):
+    """Multi-compartment pyramidal neuron parameters.
+
+    Reference: Larkum, Zhu & Bhatt (1999), Payeur et al. (2021)
+
+    Apical trunk: passive cable with Ca²⁺ spike mechanism.
+      tau_apical = 100-200ms (electrotonically remote from soma)
+      Ca²⁺ activation: m_Ca = sigmoid((V_apical - V_half) / k_ca)
+      BAC firing: soma spike + apical Ca²⁺ spike within temporal window → burst
+
+    Burst-dependent plasticity (Payeur et al. 2021):
+      burst → 3-5× STDP eligibility boost
     """
-    Hyperparameters for Working Memory Module.
-    Overrides tau_m to ~300 ms for sustained attractor dynamics.
-    """
-    tau_m: float = 300.0
-    gate_threshold: float = 0.5
-    lateral_strength: float = 0.5
-    lateral_lr: float = 0.01
+    tau_apical: float = 150.0       # Apical membrane τ (ms) — was 50, should be 100-200
+    apical_threshold: float = 0.3   # Normalized Ca²⁺ spike threshold
+    apical_boost: float = 10.0      # Somatic threshold reduction (mV) during plateau
+    burst_stdp_factor: float = 3.0  # Payeur et al.: 3-5× boost
+    apical_lr: float = 0.005        # Apical weight Hebbian learning rate
+    plateau_duration_ms: int = 50   # Ca²⁺ plateau duration (ms)
+    background_noise_std: float = 2.0  # Membrane noise σ (mV)
+    # Ca²⁺ spike voltage-dependent activation (Larkum 2013)
+    ca_v_half: float = 0.4  # Half-activation of apical Ca²⁺ channel
+    ca_k: float = 0.1       # Activation steepness
+
+    # ── Derived ───────────────────────────────────────────────────────
+    apical_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'apical_decay', self.ctx.decay(self.tau_apical))
 
 
 @dataclass(frozen=True, kw_only=True)
-class NeuromodulatorConfig:
+class ErrorNeuronConfig(BaseConfig):
+    """Error/State neuron layer for continuous predictive coding.
+
+    Reference: Bogacz (2017), Bastos et al. (2012)
+
+    State neurons (pyramidal L2/3): slow τ ~20ms, maintain belief μ
+    Error neurons (stellate L4): fast τ ~4ms, compute ε = input - g(μ)
     """
-    Hyperparameters for the four-channel neuromodulatory system.
+    n_state: int = 64
+    n_error: int = 30
+    tau_state: float = 20.0
+    tau_error: float = 4.0
+    w_bu_lr: float = 0.005   # Error→State (Hebbian)
+    w_td_lr: float = 0.005   # State→Error (Anti-Hebbian, Rao & Ballard)
+    refrac_period: int = 2
+    # ACh gain range from Hill equation dose-response
+    ach_gain_min: float = 0.7
+    ach_gain_max: float = 1.5
+    ach_ec50: float = 0.4     # Half-max ACh concentration
+    ach_hill_n: float = 1.5   # Hill coefficient
 
-    Each modulator may operate in two modes:
+    # ── Derived ───────────────────────────────────────────────────────
+    state_decay: float = field(init=False, default=0.0)
+    error_decay: float = field(init=False, default=0.0)
 
-    - **Phasic**: fast, per-step response to momentary signals (burst firing).
-    - **Tonic**: slow, sustained baseline tracking average conditions.
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'state_decay', self.ctx.decay(self.tau_state))
+        object.__setattr__(self, 'error_decay', self.ctx.decay(self.tau_error))
 
-    Dopamine is the primary example of this dual mode (Grace 1991):
-    phasic DA encodes reward-prediction-error (RPE), while tonic DA from
-    VTA tracks average reward rate and gates consolidation (Niv et al. 2007).
+
+# =====================================================================
+# Inhibitory Pool (Interneurons)
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class InhibitoryPoolConfig(BaseConfig):
+    """GABAergic inhibitory pool parameters.
+
+    Reference: Brunel & Wang (2003), Markram et al. (2004)
+
+    PV+ basket cells: τ_m ~8-10ms (fast-spiking), lower spike threshold.
+    Target sparsity controls initial E/I weight calibration.
+    Dual GABA channels: GABA-A (fast, ~70-80%) + GABA-B (slow, ~20-30%).
     """
-    # Phasic channel time-constants (per-step low-pass filters)
-    da_decay: float = 0.95
-    ach_decay: float = 0.90
-    ne_decay: float = 0.93
-    sero_decay: float = 0.97
+    n_interneurons: int = 16
+    tau_m_inh: float = 8.0
+    v_rest: float = -70.0
+    v_thresh: float = -58.0  # Lower than excitatory (fast-spiking PV+)
+    v_reset: float = -75.0
+    w_ei_mean: float = 0.8
+    w_ie_mean: float = 0.6
+    gaba_b_ratio: float = 0.25  # Isaacson & Scanziani (2011): ~20-30%
+    target_sparsity: float = 0.15
+    # Inhibitory STDP (Woodin et al. 2003)
+    inh_stdp_lr: float = 0.001
+    # E/I balance homeostatic rate
+    ei_balance_lr: float = 0.0005
 
-    # Tonic DA (VTA background firing): tracks relative performance.
-    # Updated episodically (not per-step). Decay of 0.9 means
-    # time constant ≈ 10 episodes — slow enough for stability,
-    # fast enough to respond to sustained improvement.
-    tonic_da_decay: float = 0.9
+    # ── Derived ───────────────────────────────────────────────────────
+    inh_decay: float = field(init=False, default=0.0)
 
-    # Baselines: resting-state levels before any experience
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'inh_decay', self.ctx.decay(self.tau_m_inh))
+
+
+# =====================================================================
+# Neuromodulation & Receptor
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class NeuromodulatorConfig(BaseConfig):
+    """Four-channel neuromodulatory system.
+
+    Decay time constants derived from reuptake/degradation kinetics:
+      DA:  τ ≈ 200ms  — DAT reuptake in striatum (Cragg & Rice 2004)
+      ACh: τ ≈ 25ms   — AChE hydrolysis (Sarter et al. 2009)
+      NE:  τ ≈ 75ms   — NET reuptake (Morilak et al. 2005)
+      5-HT: τ ≈ 150ms — SERT reuptake (volume transmission slower)
+
+    Tonic DA: episodic decay ≈ 10 episodes (slow VTA background)
+    """
+    # Phasic time constants (ms)
+    tau_da: float = 200.0
+    tau_ach: float = 25.0
+    tau_ne: float = 75.0
+    tau_sero: float = 150.0
+
+    # Tonic DA episodic decay (not per-step)
+    tonic_da_decay: float = 0.9  # τ ≈ 10 episodes
+
+    # Baselines
     baseline_da: float = 0.5
     baseline_ach: float = 0.5
     baseline_ne: float = 0.3
     baseline_sero: float = 0.6
-    baseline_tonic_da: float = 0.0   # No tonic reward signal before any episodes
+    baseline_tonic_da: float = 0.0
+
+    # Dynamic timescale modulation
+    tau_ne_compression: float = 4.0
+    tau_ach_compression: float = 2.0
+
+    # Serotonin input weights (dorsal raphe anatomy)
+    # DRN receives ~70% cortical (sensory/world model), ~30% amygdala/VTA
+    sero_world_weight: float = 0.7
+    sero_behavioral_weight: float = 0.3
+
+    # DA RMS adaptation time constant (VTA gain adaptation)
+    # Biological: minutes scale; sim: τ ≈ 10s = 10000 steps
+    da_rms_decay: float = 0.9999
+
+    # ── Derived ───────────────────────────────────────────────────────
+    da_decay: float = field(init=False, default=0.0)
+    ach_decay: float = field(init=False, default=0.0)
+    ne_decay: float = field(init=False, default=0.0)
+    sero_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'da_decay', self.ctx.decay(self.tau_da))
+        object.__setattr__(self, 'ach_decay', self.ctx.decay(self.tau_ach))
+        object.__setattr__(self, 'ne_decay', self.ctx.decay(self.tau_ne))
+        object.__setattr__(self, 'sero_decay', self.ctx.decay(self.tau_sero))
 
 
 @dataclass(frozen=True, kw_only=True)
-class SequenceMemoryConfig:
-    """Hyperparameters for temporal sequence learning."""
+class ReceptorProfile(BaseConfig):
+    """Per-layer receptor expression profile.
+
+    Each layer declares which receptor subtypes it expresses and at what
+    density (0-1). The NeuromodulatorSystem distributes global transmitter
+    levels; each layer computes local effects via:
+
+      effect = transmitter_level × density × dose_response(transmitter_level)
+
+    Reference: Doya (2002), Seamans & Yang (2004)
+    """
+    # Dopamine receptors
+    d1_density: float = 0.0
+    d2_density: float = 0.0
+    # Acetylcholine receptors
+    m1_density: float = 0.0
+    m4_density: float = 0.0
+    nachr_density: float = 0.0
+    # Noradrenaline receptors
+    alpha1_density: float = 0.0
+    alpha2_density: float = 0.0
+    beta_density: float = 0.0
+    # Serotonin receptors
+    ht1a_density: float = 0.0
+    ht2a_density: float = 0.0
+
+
+# Predefined receptor profiles for different brain regions
+CORTICAL_L4_RECEPTORS = ReceptorProfile(
+    nachr_density=0.8, m1_density=0.3, alpha1_density=0.5, beta_density=0.3,
+)
+CORTICAL_L5_RECEPTORS = ReceptorProfile(
+    d1_density=0.6, m1_density=0.4, alpha1_density=0.4, ht2a_density=0.3,
+)
+PFC_RECEPTORS = ReceptorProfile(
+    d1_density=0.7, m1_density=0.5, alpha1_density=0.3, ht2a_density=0.2,
+)
+STRIATUM_D1_RECEPTORS = ReceptorProfile(
+    d1_density=0.9, m4_density=0.3, alpha1_density=0.2,
+)
+STRIATUM_D2_RECEPTORS = ReceptorProfile(
+    d2_density=0.9, m4_density=0.3, alpha1_density=0.2,
+)
+
+
+# =====================================================================
+# Oscillator
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class OscillatorConfig(BaseConfig):
+    """Theta-gamma nested oscillation parameters.
+
+    Reference: Lisman & Jensen (2013) "The theta-gamma neural code"
+
+    Theta (4-8 Hz): Drives episodic encoding, gates memory storage/retrieval.
+      Period ≈ 125-250ms.
+    Gamma (30-100 Hz): Local binding within theta phase, paces k-WTA.
+      Period ≈ 10-33ms.
+
+    Phase-amplitude coupling (PAC):
+      gamma_amplitude = base + modulation_depth × cos(theta_phase)
+    """
+    # Theta rhythm
+    theta_freq_hz: float = 6.0   # Center frequency (Hz)
+    theta_min_hz: float = 4.0
+    theta_max_hz: float = 8.0
+    # Gamma rhythm
+    gamma_freq_hz: float = 40.0  # Center frequency (Hz)
+    gamma_min_hz: float = 30.0
+    gamma_max_hz: float = 100.0
+    # Phase-amplitude coupling depth (0 = no coupling, 1 = full modulation)
+    pac_depth: float = 0.6
+    # NE/5-HT modulation of theta frequency
+    ne_theta_shift: float = 2.0   # Hz added at NE=1
+    sero_theta_shift: float = -1.0  # Hz subtracted at 5-HT=1 (longer cycles)
+
+
+# =====================================================================
+# Astrocyte & Glial
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class AstrocyteConfig(BaseConfig):
+    """Astrocyte field for local precision estimation via Ca²⁺ dynamics.
+
+    Reference: De Pittà, Volman, Berry & Ben-Jacob (2011)
+
+    tau_ca = 5000ms (5 seconds) — biological astrocyte Ca²⁺ τ = 2-10s.
+    D-Serine release: sigmoid, not step function.
+    Gap junction diffusion between zones.
+    """
+    n_zones: int = 16
+    tau_ca: float = 5000.0      # Ca²⁺ time constant (ms) — was 500, now biological
+    ca_accumulation: float = 0.1
+    ca_threshold: float = 0.5   # Only used as sigmoid midpoint now
+    ca_release_k: float = 0.15  # Sigmoid steepness for D-Serine release
+    d_serine_max: float = 0.3   # Max release per step
+    gain_baseline: float = 1.0
+    gain_max: float = 2.0
+    metabolic_scale: float = 0.5
+    # Gap junction diffusion coefficient (De Pittà et al. 2011)
+    gap_junction_D: float = 0.01  # Diffusion coefficient between zones
+
+    # ── Derived ───────────────────────────────────────────────────────
+    ca_decay: float = field(init=False, default=0.0)
+    d_serine_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'ca_decay', self.ctx.decay(self.tau_ca))
+        # D-Serine decays with τ ≈ 200ms (gliotransmitter clearance)
+        object.__setattr__(self, 'd_serine_decay', self.ctx.decay(200.0))
+
+
+# =====================================================================
+# Attention
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class AttentionConfig(BaseConfig):
+    """Spatial attention system with bottom-up saliency and IOR.
+
+    Reference: Reynolds & Heeger (2009), Posner & Cohen (1984)
+
+    Temperature modulated by NE (inverse-U, Usher & Damasio):
+      T = T_base × (1 + |NE - NE_optimal|²)
+    """
+    gain_strength: float = 2.0
+    base_temperature: float = 1.0
+    ne_optimal: float = 0.5      # Optimal NE for focused attention
+    learning_rate: float = 0.005
+    decay: float = 0.9           # Temporal smoothing
+    # Bottom-up saliency weight (vs top-down)
+    bottom_up_weight: float = 0.4  # α for saliency mix
+    # Inhibition of Return (Posner & Cohen 1984)
+    ior_tau: float = 400.0         # IOR decay τ (ms)
+    ior_strength: float = 0.3      # IOR inhibition magnitude
+
+    # ── Derived ───────────────────────────────────────────────────────
+    ior_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'ior_decay', self.ctx.decay(self.ior_tau))
+
+    def ne_modulated_temperature(self, ne: float) -> float:
+        """Inverse-U relationship: NE at optimal → low T (focused)."""
+        return self.base_temperature * (1.0 + (ne - self.ne_optimal) ** 2)
+
+
+# =====================================================================
+# Memory Systems
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class WorkingMemoryConfig(BaseConfig):
+    """Working Memory prefrontal attractor dynamics.
+
+    Reference: Goldman-Rakic (1995), O'Reilly & Frank (2006)
+
+    tau_m = 300ms for slow sustained dynamics.
+    Dual gating: ACh (sensory) AND DA (update signal).
+    """
+    tau_m: float = 300.0
+    v_rest: float = -70.0
+    v_thresh: float = -55.0
+    v_reset: float = -75.0
+    refrac_period: int = 2
+    # Gating thresholds (O'Reilly & Frank 2006: conjunction gate)
+    ach_gate_threshold: float = 0.5
+    da_gate_threshold: float = 0.4
+    # Lateral attractor
+    lateral_strength: float = 0.5
+    lateral_lr: float = 0.01
+    learning_rate: float = 0.01
+    # STDP traces
+    tau_e: float = 20.0
+    tau_pre: float = 20.0
+    tau_post: float = 20.0
+
+    # ── Derived ───────────────────────────────────────────────────────
+    mem_decay: float = field(init=False, default=0.0)
+    content_decay: float = field(init=False, default=0.0)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
+        object.__setattr__(self, 'content_decay', self.ctx.decay(self.tau_m))
+
+
+@dataclass(frozen=True, kw_only=True)
+class EpisodicMemoryConfig(BaseConfig):
+    """Hippocampal one-shot episodic memory.
+
+    Reference: Rolls (2013), O'Neill et al. (2010)
+
+    Interference-based forgetting: new memories overwrite most similar
+    (not oldest). Consolidated memories resist overwrite.
+    """
+    ne_threshold: float = 0.3
+    similarity_thresh: float = 0.85
+    capacity: int = 500
+    # Pattern separation (DG-like sparse coding)
+    dg_sparsity: float = 0.05       # Target sparsity for dentate gyrus encoding
+    dg_expansion_factor: int = 5    # DG has ~5× more neurons than CA3
+    # Consolidation resistance
+    consolidation_threshold: int = 3  # Replay count to become resistant
+
+
+@dataclass(frozen=True, kw_only=True)
+class SequenceMemoryConfig(BaseConfig):
+    """Temporal sequence learning parameters."""
     learning_rate: float = 0.01
     decay: float = 0.999
     max_weight: float = 1.0
 
 
+@dataclass(frozen=True, kw_only=True)
+class ReplayBufferConfig(BaseConfig):
+    """Sleep consolidation parameters.
 
+    Reference: Walker & Stickgold (2006), Diekelmann & Born (2010)
+
+    Two-phase sleep:
+      SWS: Reverse replay (sharp-wave ripples), cortical consolidation
+      REM: Forward replay (theta sequences), world model refinement
+    """
+    capacity: int = 1000
+    sws_replay_fraction: float = 0.7  # Fraction of sleep budget for SWS
+    rem_replay_fraction: float = 0.3  # Fraction for REM
+    gamma: float = 0.99
+
+
+# =====================================================================
+# World Model
+# =====================================================================
 
 @dataclass(frozen=True, kw_only=True)
-class SNNWorldModelConfig:
-    """
-    Hyperparameters for the SNN-native world model.
+class WorldModelConfig(BaseConfig):
+    """SNN World Model (ErrorNeuronLayer encoder + Hebbian decoder).
 
-    rehearsal_steps:        Number of encoder forward passes per candidate
-                            action during mental_rehearsal().  Multiple steps
-                            let the membrane accumulate action-specific signal
-                            so k-WTA can differentiate subtly different inputs.
-    n_neurons_per_dim:      Population coding density for continuous state
-                            dimensions. Each dimension is encoded by this many
-                            Gaussian receptive fields (place cells). Higher
-                            values give finer spatial resolution but increase
-                            encoder input size. 0 = disable population coding
-                            (pass raw values). Ref: Pouget et al. 2000.
+    Reference: Friston et al. (2015)
     """
     hidden_size: int = 64
-    decode_lr: float = 0.005
-    feedback_strength: float = 0.5
-    feedback_learning_rate: float = 0.005
-    k_winners: int = 5
-    window_ms: int = 50
-    i_inh: float = 50.0
-    rehearsal_steps: int = 5
-    n_neurons_per_dim: int = 15
+    decode_lr: float = 0.02
+    encoder_lr: float = 0.005
+    n_neurons_per_dim: int = 15   # Population coding density (Pouget et al. 2000)
+    # Multi-step rehearsal (Friston et al. 2015)
+    max_rehearsal_depth: int = 3  # Planning depth (modulated by 5-HT)
+    # Ensemble uncertainty (posterior variance)
+    n_ensemble: int = 3           # Number of decoder weight sets
 
 
 @dataclass(frozen=True, kw_only=True)
-class EpisodicMemoryConfig:
-    """
-    Hyperparameters for one-shot episodic memory (hippocampal fast binding).
+class ActiveInferenceConfig(BaseConfig):
+    """Active Inference action selection parameters.
 
-    Biological grounding:
-      Hippocampal CA3 performs rapid pattern completion via auto-associative
-      Hebbian learning with a very short eligibility trace (tau_e ≈ 0).
-      A single exposure at high noradrenaline is sufficient to form a
-      retrievable memory trace.
-
-    ne_threshold:       Minimum noradrenaline level to trigger storage.
-    similarity_thresh:  Cosine similarity above which a new pattern is
-                        considered a duplicate (not stored again).
-    capacity:           Maximum number of stored episodes.
-    """
-    ne_threshold: float = 0.3
-    similarity_thresh: float = 0.85
-    capacity: int = 500
-
-
-@dataclass(frozen=True, kw_only=True)
-class AttentionConfig:
-    """
-    Hyperparameters for spatial / object-based attention.
-
-    Biological grounding:
-      Attentional modulation in cortex operates through cholinergic
-      projections from basal forebrain.  Unlike global tonic ACh,
-      spatial attention is column-specific: higher areas project back
-      and selectively amplify columns whose receptive fields overlap
-      the attended location (Reynolds & Heeger, 2009).
-
-    gain_strength:   Maximum multiplicative boost for the most-attended column.
-    temperature:     Softmax temperature for attention distribution.
-    learning_rate:   Hebbian update rate for attention projection weights.
-    decay:           Temporal smoothing of attention weights.
-    """
-    gain_strength: float = 2.0
-    temperature: float = 1.0
-    learning_rate: float = 0.01
-    decay: float = 0.9
-
-
-@dataclass(frozen=True, kw_only=True)
-class ActiveInferenceConfig:
-    """
-    Hyperparameters for Active Inference / Epistemic Foraging.
-
-    Biological grounding:
-      Under Active Inference (Friston, 2010), agents minimize expected
-      free energy which combines pragmatic value (reward) and epistemic
-      value (information gain).  The anterior cingulate cortex encodes
-      expected uncertainty; locus coeruleus NE modulates the
-      explore/exploit tradeoff.
-
-    epistemic_weight:      Base weight for epistemic relative to pragmatic value.
-    ne_epistemic_boost:    NE-driven amplification of epistemic drive.
-    uncertainty_method:    'novelty' or 'variance'.
-    n_candidates:          Candidate actions to evaluate (discrete spaces).
-    pragmatic_temperature: Softmax temperature for action selection.
+    Reference: Friston (2010), Bromberg-Martin et al. (2010)
     """
     epistemic_weight: float = 0.5
-    ne_epistemic_boost: float = 1.0
+    ne_epistemic_boost: float = 0.5
+    pragmatic_temperature: float = 1.0
     uncertainty_method: str = "novelty"
-    n_candidates: int = 8
-    pragmatic_temperature: float = 0.3
+
+
+# =====================================================================
+# Basal Ganglia
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class BasalGangliaConfig(BaseConfig):
+    """Integrated BG system with D1/D2 pathway separation.
+
+    Reference: Frank (2005), Gurney et al. (2001), Wilson & Kawaguchi (1996)
+
+    MSN dynamics:
+      Down state: τ_m ≈ 80ms, high threshold (quiescent)
+      Up state: τ_m ≈ 25ms, low threshold (ready to fire)
+    """
+    gamma: float = 0.99
+    critic_lr: float = 7e-3
+    actor_lr: float = 5e-3
+    # Eligibility trace time constants
+    tau_e_actor: float = 20.0
+    tau_e_critic: float = 50.0
+    # NE compression (Aston-Jones & Cohen 2005)
+    tau_ne_compression: float = 4.0
+    # LIF parameters for BG populations
+    # MSN Up-state parameters (Wilson & Kawaguchi 1996)
+    tau_m_msn_up: float = 25.0     # Up-state τ (fast-spiking, ready)
+    tau_m_msn_down: float = 80.0   # Down-state τ (quiescent)
+    tau_m_critic: float = 15.0     # Ventral striatal neuron τ
+    v_rest: float = -70.0
+    v_thresh: float = -55.0
+    v_reset: float = -75.0
+    refrac_period: int = 2
+    membrane_noise_std: float = 2.0  # mV background cortical noise
+    hidden_size: int = 128
+    integration_steps: int = 10
+    w_clip: float = 3.0
+    w_clip_critic: float = 5.0
+    # D1/D2 pathway balance (Frank 2005)
+    d1_bias: float = 0.6    # D1 pathway relative strength at DA=0.5
+    d2_bias: float = 0.4    # D2 pathway relative strength at DA=0.5
+    # Exploration
+    exploration_noise: float = 0.3
+
+
+# =====================================================================
+# Weight Initialization Utilities
+# =====================================================================
+
+def compute_weight_std(
+    fan_in: int,
+    fan_out: int,
+    psp_target: float = 2.0,
+    target_rate: float = 0.05,
+) -> float:
+    """Derive weight initialization std from desired PSP amplitude.
+
+    σ² = PSP_target² / (fan_in × p_fire)
+
+    Ensures that under expected input (fan_in × target_rate active inputs),
+    the total PSP approximates psp_target mV.
+
+    Args:
+        fan_in:      Number of input connections.
+        fan_out:     Number of output neurons (unused, kept for API).
+        psp_target:  Desired total PSP amplitude (mV).
+        target_rate: Expected fraction of active inputs.
+
+    Returns:
+        Standard deviation for weight initialization.
+    """
+    expected_active = max(1.0, fan_in * target_rate)
+    return psp_target / np.sqrt(expected_active)
+
+
+def init_weights(
+    fan_in: int,
+    fan_out: int,
+    psp_target: float = 2.0,
+    target_rate: float = 0.05,
+    excitatory: bool = True,
+) -> np.ndarray:
+    """Initialize weights with principled scaling.
+
+    Feedforward: w ~ |N(0, σ²)| if excitatory (Dale's law)
+    Inhibitory:  w ~ -|N(0, σ²)| (Dale's law: w ≤ 0)
+
+    Args:
+        fan_in:      Input dimension.
+        fan_out:     Output dimension.
+        psp_target:  Desired PSP (mV).
+        target_rate: Expected input activity.
+        excitatory:  If True, weights ≥ 0 (Dale's law).
+
+    Returns:
+        Weight matrix (fan_in, fan_out), dtype float32.
+    """
+    std = compute_weight_std(fan_in, fan_out, psp_target, target_rate)
+    w = np.random.normal(0.0, std, (fan_in, fan_out)).astype(np.float32)
+    if excitatory:
+        w = np.abs(w)
+    else:
+        w = -np.abs(w)
+    return w

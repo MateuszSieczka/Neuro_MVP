@@ -620,11 +620,10 @@ USUNĄĆ z `core/world_model.py`: stałe `_vesicle_p = 0.8` i `_decode_with_vesi
 3. **Axonal delays:** Long-range (rewired) edges mają delay > local edges. `max(delays) < gamma_period` (inaczej spike "przeskakuje" cały cykl)
 4. **Pamięć SDM:** Zapisać 100 wzorców, recall z 50% cue → >80% overlap z oryginałem
 5. **SDM decay:** Po 10 000 zapisów bez recall: `norm(W_content)` stabilizuje się (nie rośnie liniowo)
-6. **EWC:** Uczyć Task A (CartPole) → sleep → uczyć Task B (MountainCar) → test Task A: score > 80% oryginalnego (uwaga: na ten moment cartpole nie działa)
-7. **VRP STD:** Pre spike train 100Hz przez 500ms → effective weight spada do <30% po 200ms, recovery w ~1s
-8. **Structural plasticity:** Po 10 000 kroków: ≥ 5 nowych synaps powstało, ≥ 3 martwe usunięte
-9. **G_max enforcement:** Nigdy `sum(|w_incoming|) > G_max` dla żadnego neuronu (invariant test)
-10. **Regresja pamięci:** Test na O(N×k) pamięci zamiast O(N²)
+6. **VRP STD:** Pre spike train 100Hz przez 500ms → effective weight spada do <30% po 200ms, recovery w ~1s
+7. **Structural plasticity:** Po 10 000 kroków: ≥ 5 nowych synaps powstało, ≥ 3 martwe usunięte
+8. **G_max enforcement:** Nigdy `sum(|w_incoming|) > G_max` dla żadnego neuronu (invariant test)
+9. **Regresja pamięci:** Test na O(N×k) pamięci zamiast O(N²)
 
 ---
 

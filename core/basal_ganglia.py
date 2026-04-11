@@ -81,23 +81,28 @@ def _msn_decay(
 
 def _derive_input_gain(
     fan_in: int,
-    tau_m: float,
-    cfg: BasalGangliaConfig,
+    ncfg: NeuronConfig,
     target_rate: float = 0.05,
 ) -> float:
-    """Derive synaptic gain from biophysics — no arbitrary multiplier.
+    """Derive synaptic gain from AdEx rheobase — proper pA-scale current.
 
-    I_thresh = gap × (1 - decay): current needed to reach threshold in one dt.
-    Expected active inputs = fan_in × target_rate.
-    Gain = I_thresh / (expected_active × w_mean), where w_mean ≈ PSP_target init.
+    The AdEx membrane equation (Brette & Gerstner 2005) is:
+      C_m dV/dt = -g_L(V - E_L) + g_L Δ_T exp((V - V_T)/Δ_T) + I_syn - w
 
-    This replaces the old `3.0 × gap × sqrt(fan_in)` formula.
+    At the saddle-node bifurcation, the minimum constant current for
+    spiking (rheobase) is:
+      I_rheo = g_L × (V_T - E_L - Δ_T) = g_L × (gap - delta_t)
+
+    Gain scales I_syn so that expected_active inputs produce ~I_rheo,
+    putting neurons in the responsive regime where input variations
+    translate to firing rate differences.
+
+    Returns gain in pA per unit input, matching the AdEx current scale.
     """
-    decay = np.exp(-cfg.ctx.dt / tau_m)
-    gap = abs(cfg.v_thresh - cfg.v_rest)
-    i_thresh = gap * (1.0 - decay)
+    gap = abs(ncfg.v_thresh - ncfg.v_rest)
+    i_rheo = ncfg.g_L * (gap - ncfg.delta_t)  # pA (Brette & Gerstner 2005)
     expected_active = max(1.0, fan_in * target_rate)
-    return float(i_thresh / expected_active)
+    return float(i_rheo / expected_active)
 
 
 def _adex_step_bg(
@@ -186,9 +191,9 @@ class SNNDeepCritic:
         # ── Precomputed membrane decay ────────────────────────────────
         self._mem_decay: float = config.ctx.decay(config.tau_m_critic)
 
-        # ── Input gain from biophysics ────────────────────────────────
+        # ── Input gain from biophysics (AdEx rheobase) ─────────────────
         self._input_gain: float = _derive_input_gain(
-            state_size, config.tau_m_critic, config,
+            state_size, self._ncfg,
         )
 
         # ── Weights via principled init ───────────────────────────────
@@ -295,8 +300,10 @@ class SNNDeepCritic:
         in_refrac = self.refrac_hidden > 0
         self.refrac_hidden[in_refrac] -= 1
 
+        # Noise in pA: g_L × noise_std_mV gives physiological current noise
+        noise_std_pA = self._ncfg.g_L * cfg.membrane_noise_std
         noise = np.random.normal(
-            0, cfg.membrane_noise_std, h,
+            0, noise_std_pA, h,
         ).astype(np.float32)
         I_total = current + noise
 
@@ -465,11 +472,6 @@ class D1D2Actor:
             state_size, self.action_dim, excitatory=True,
         )
 
-        # ── Input gain from biophysics ────────────────────────────────
-        self._input_gain: float = _derive_input_gain(
-            state_size, config.tau_m_msn_up, config,
-        )
-
         # ── AdEx NeuronConfig for MSN (Up-state defaults) ────────────
         self._ncfg = NeuronConfig(
             ctx=config.ctx,
@@ -477,6 +479,11 @@ class D1D2Actor:
             v_thresh=config.v_thresh,
             v_reset=config.v_reset,
             tau_m=config.tau_m_msn_up,
+        )
+
+        # ── Input gain from biophysics (AdEx rheobase) ─────────────────
+        self._input_gain: float = _derive_input_gain(
+            state_size, self._ncfg,
         )
 
         # ── D1-MSN membrane state ────────────────────────────────────
@@ -656,7 +663,8 @@ class D1D2Actor:
         # ── AdEx step: D1 ─────────────────────────────────────────────
         in_refrac_d1 = self.refrac_d1 > 0
         self.refrac_d1[in_refrac_d1] -= 1
-        noise_d1 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
+        # Noise in pA: g_L_eff × noise_std_mV (biophysical current noise)
+        noise_d1 = np.random.normal(0, g_L_eff * cfg.membrane_noise_std, ad).astype(np.float32)
 
         exp_term_d1 = np.exp(np.clip((self.v_d1 - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0))
         F_d1 = inv_Cm * (
@@ -683,7 +691,8 @@ class D1D2Actor:
         # ── AdEx step: D2 ─────────────────────────────────────────────
         in_refrac_d2 = self.refrac_d2 > 0
         self.refrac_d2[in_refrac_d2] -= 1
-        noise_d2 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
+        # Noise in pA: g_L_eff × noise_std_mV (biophysical current noise)
+        noise_d2 = np.random.normal(0, g_L_eff * cfg.membrane_noise_std, ad).astype(np.float32)
 
         exp_term_d2 = np.exp(np.clip((self.v_d2 - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0))
         F_d2 = inv_Cm * (

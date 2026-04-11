@@ -44,7 +44,7 @@ from core.episodic_memory import EpisodicMemory
 from core.neuromodulator import NeuromodulatorSystem
 from core.network import NetworkGraph
 from core.replay_buffer import Experience, ReplayBuffer
-from core.spike_encoder import PoissonEncoder
+from core.spike_encoder import GaussianPopulationEncoder, PoissonEncoder
 from core.working_memory import WorkingMemoryModule
 from core.world_model import SNNWorldModel
 
@@ -93,6 +93,20 @@ class SNNAgent(Agent):
         self._bg_config = bg_config or BasalGangliaConfig()
         self._poisson = PoissonEncoder()
 
+        # ── Population encoding (Pouget et al. 2000) ──────────────────
+        # Gaussian receptive fields provide rich distributed
+        # representation: each continuous state dimension is encoded by
+        # n_neurons_per_dim tuning curves, giving the downstream BG
+        # enough input diversity to form meaningful spike patterns.
+        wm_cfg = wm_config or WorldModelConfig()
+        self._pop_encoder = GaussianPopulationEncoder(
+            n_dims=state_size,
+            n_neurons_per_dim=wm_cfg.n_neurons_per_dim,
+            value_min=-1.0,  # GymEnv fixed_bounds normalizes to ~[-1, 1]
+            value_max=1.0,
+        )
+        self._encoded_size: int = self._pop_encoder.output_size
+
         # ── Columnar-mode derived dimensions ──────────────────────────
         if self._use_columnar:
             self._rf_size = receptive_field_size or 4
@@ -103,7 +117,7 @@ class SNNAgent(Agent):
             self._rf_size = 0
             self._neurons_per_col = 0
             self._assoc_neurons = 0
-            bg_base_size = state_size
+            bg_base_size = self._encoded_size
 
         # ── Compute layer sizes ───────────────────────────────────────
         self._wm_num_neurons = max(8, state_size)
@@ -249,7 +263,7 @@ class SNNAgent(Agent):
             if self._use_working_memory:
                 sensory["working_memory"] = encoded
                 padded = np.zeros(
-                    self.state_size + self._wm_num_neurons, dtype=np.float32,
+                    self._encoded_size + self._wm_num_neurons, dtype=np.float32,
                 )
                 padded[self._wm_num_neurons:] = encoded
                 sensory["critic"] = padded
@@ -271,7 +285,8 @@ class SNNAgent(Agent):
 
     def act(self, state: np.ndarray) -> int:
         state_f32 = state.astype(np.float32)
-        encoded = self._poisson.encode_value(state_f32)
+        pop_rates = self._pop_encoder.encode(state_f32)
+        encoded = self._poisson.encode(pop_rates)
         self._last_encoded_state = encoded.copy()
 
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
@@ -328,7 +343,8 @@ class SNNAgent(Agent):
     ) -> None:
         state_f32 = state.astype(np.float32)
         next_f32 = next_state.astype(np.float32)
-        next_encoded = self._poisson.encode_value(next_f32)
+        next_pop_rates = self._pop_encoder.encode(next_f32)
+        next_encoded = self._poisson.encode(next_pop_rates)
 
         is_truncated = info.get("truncated", False) if info else False
         is_terminal = done and not is_truncated

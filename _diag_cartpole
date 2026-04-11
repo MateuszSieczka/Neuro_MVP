@@ -1,0 +1,110 @@
+"""
+Diagnostic script — instruments one CartPole episode to trace data flow.
+Prints per-step: membrane voltages, spike counts, currents, TD error, weight norms.
+"""
+import numpy as np
+np.random.seed(42)
+
+from arena.gym_env import GymEnv
+from arena.agent_factory import make_agent
+from arena.task_config import get as get_task
+
+task = get_task("CartPole-v1")
+env = GymEnv(task.env_id, normalize=True, fixed_bounds=task.obs_bounds, reward_scale=task.reward_scale)
+state = env.reset(seed=42)
+agent = make_agent(task, env)
+
+# Run 1 episode with diagnostics
+print("=" * 80)
+print("DIAGNOSTIC: CartPole-v1 single episode (seed=42)")
+print("=" * 80)
+
+# Print network structure
+print(f"\nNetwork layers: {list(agent.network._layers.keys())}")
+print(f"Critic input size: {agent.critic.num_inputs}, hidden: {agent.critic.num_neurons}")
+print(f"Actor  input size: {agent.actor.num_inputs}, actions: {agent.actor.motor_dim}")
+print(f"Actor input gain: {agent.actor._input_gain:.4f}")
+print(f"Critic input gain: {agent.critic._input_gain:.4f}")
+print(f"Actor w_d1 shape: {agent.actor.w_d1.shape}, mean={agent.actor.w_d1.mean():.4f}, std={agent.actor.w_d1.std():.4f}")
+print(f"Critic w_h shape: {agent.critic.w_h.shape}, mean={agent.critic.w_h.mean():.4f}, std={agent.critic.w_h.std():.4f}")
+
+# NeuronConfig info
+ncfg = agent.actor._ncfg
+print(f"\nAdEx params: C_m={ncfg.C_m}, g_L={ncfg.g_L}, delta_t={ncfg.delta_t}")
+print(f"  v_rest={ncfg.v_rest}, v_thresh={ncfg.v_thresh}, v_spike_cutoff={ncfg.v_spike_cutoff}")
+print(f"  a={ncfg.a}, b={ncfg.b}, tau_w={ncfg.tau_w}")
+
+total_reward = 0.0
+for step in range(50):  # First 50 steps only
+    # Capture pre-act state
+
+
+    action = agent.act(state)
+    next_state, reward, done, info = env.step(action)
+
+    # Actor diagnostics
+    a = agent.actor
+    c = agent.critic
+
+    # Membrane stats
+    v_d1_mean = float(np.mean(a.v_d1))
+    v_d1_max = float(np.max(a.v_d1))
+    v_d2_mean = float(np.mean(a.v_d2))
+    spikes_d1_n = int(np.sum(a.spikes_d1))
+    spikes_d2_n = int(np.sum(a.spikes_d2))
+    rate_d1_sum = float(np.sum(a.rate_d1))
+    rate_d2_sum = float(np.sum(a.rate_d2))
+
+    # Critic
+    v_hid_mean = float(np.mean(c.v_hidden))
+    v_hid_max = float(np.max(c.v_hidden))
+    spikes_hid_n = int(np.sum(c.spikes_hidden))
+    critic_val = c.last_value
+    v_trace = c.v_trace
+
+    # Check for NaN/Inf
+    has_nan = (np.any(np.isnan(a.v_d1)) or np.any(np.isnan(c.v_hidden)) or
+               np.any(np.isinf(a.v_d1)) or np.any(np.isinf(c.v_hidden)))
+
+    agent.observe(state, action, reward, next_state, done, info)
+
+    td_err = agent._last_td_error
+    total_reward += reward
+
+    # Weight norms
+    w_d1_norm = float(np.linalg.norm(agent.actor.w_d1))
+    w_d2_norm = float(np.linalg.norm(agent.actor.w_d2))
+    w_h_norm = float(np.linalg.norm(agent.critic.w_h))
+    e_d1_norm = float(np.linalg.norm(agent.actor.e_d1))
+    e_h_norm = float(np.linalg.norm(agent.critic.e_h))
+
+    # DA level
+    da = agent.neuromod.learning_rate_modulation
+
+    if step < 10 or step % 5 == 0:
+        print(f"\nStep {step:3d} | act={action} | rew={reward:.1f} | td={td_err:+.4f} | DA={da:.3f}")
+        print(f"  Critic:  v_mean={v_hid_mean:.2f} v_max={v_hid_max:.2f} spikes={spikes_hid_n} V(s)={critic_val:.4f} V_trace={v_trace:.4f}")
+        print(f"  Actor D1: v_mean={v_d1_mean:.2f} v_max={v_d1_max:.2f} spikes={spikes_d1_n} rate_sum={rate_d1_sum:.4f}")
+        print(f"  Actor D2: v_mean={v_d2_mean:.2f} spikes={spikes_d2_n} rate_sum={rate_d2_sum:.4f}")
+        print(f"  Probs: {a._last_probs}  net_evidence: {a._d1_rates[:a.motor_dim] - a._d2_rates[:a.motor_dim]}")
+        print(f"  Eligib: e_d1={e_d1_norm:.6f} e_h={e_h_norm:.6f}")
+        print(f"  Weights: |w_d1|={w_d1_norm:.4f} |w_d2|={w_d2_norm:.4f} |w_h|={w_h_norm:.4f}")
+        if has_nan:
+            print(f"  *** NaN/Inf detected! ***")
+
+    state = next_state
+    if done:
+        print(f"\n--- Episode ended at step {step+1}, total_reward={total_reward:.1f} ---")
+        break
+
+
+# Summary after episode
+print("\n" + "=" * 80)
+print("POST-EPISODE SUMMARY")
+print("=" * 80)
+print(f"Final weights D1: mean={agent.actor.w_d1.mean():.6f}, std={agent.actor.w_d1.std():.6f}")
+print(f"Final weights D2: mean={agent.actor.w_d2.mean():.6f}, std={agent.actor.w_d2.std():.6f}")
+print(f"Final weights Critic: mean={agent.critic.w_h.mean():.6f}, std={agent.critic.w_h.std():.6f}")
+print(f"w_adapt D1: mean={agent.actor.w_adapt_d1.mean():.4f}, max={agent.actor.w_adapt_d1.max():.4f}")
+print(f"w_adapt Critic: mean={agent.critic.w_adapt_hidden.mean():.4f}")
+env.close()

@@ -14,9 +14,9 @@ import numpy as np
 
 from core.neuron import LIFLayer
 from core.config import (
-    HomeostaticLIFConfig,
+    HomeostaticConfig,
     PredictiveCodingConfig,
-    SNNWorldModelConfig,
+    WorldModelConfig,
     EpisodicMemoryConfig,
 )
 from core.predictive_coding import PredictiveCodingLayer
@@ -51,7 +51,7 @@ class TestMentalRehearsalMicroImagination(unittest.TestCase):
     def setUp(self):
         self.state_size = 4
         self.action_size = 3
-        self.config = SNNWorldModelConfig(
+        self.config = WorldModelConfig(
             hidden_size=32,
         )
         np.random.seed(42)
@@ -123,8 +123,8 @@ class TestMentalRehearsalMicroImagination(unittest.TestCase):
         """
         state = _make_binary_pattern(self.state_size, [0, 1])
 
-        config_short = SNNWorldModelConfig(hidden_size=32)
-        config_long = SNNWorldModelConfig(hidden_size=32)
+        config_short = WorldModelConfig(hidden_size=32)
+        config_long = WorldModelConfig(hidden_size=32)
 
         np.random.seed(99)
         wm_short = SNNWorldModel(self.state_size, self.action_size, config_short)
@@ -288,7 +288,7 @@ class TestDarkMatterNeurons(unittest.TestCase):
     def setUp(self):
         self.num_inputs = 10
         self.num_neurons = 20
-        self.config = HomeostaticLIFConfig(
+        self.config = HomeostaticConfig(
             dark_matter_ratio=0.5,       # 50% dark matter
             dark_matter_thresh_offset=20.0,
             ne_thresh_drop=15.0,
@@ -413,7 +413,7 @@ class TestDarkMatterNeurons(unittest.TestCase):
 
     def test_zero_dark_matter_ratio_means_no_dark_neurons(self):
         """dark_matter_ratio=0 → all neurons are normal."""
-        config = HomeostaticLIFConfig(dark_matter_ratio=0.0)
+        config = HomeostaticConfig(dark_matter_ratio=0.0)
         layer = LIFLayer(5, 10, config)
         self.assertEqual(int(np.sum(layer._is_dark_matter)), 0)
 
@@ -433,20 +433,22 @@ class TestColumnarArchitecture(unittest.TestCase):
 
     def test_build_creates_correct_number_of_columns(self):
         """input_dim / receptive_field_size columns must be created."""
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, kwta_names, assoc_name, attn = build_columnar_network(
             input_dim=16,
             receptive_field_size=4,
             neurons_per_column=6,
             assoc_neurons=20,
         )
         self.assertEqual(len(col_names), 4)
+        self.assertEqual(len(kwta_names), 4)
         self.assertEqual(assoc_name, "assoc")
+        self.assertIsNotNone(attn)
 
     def test_association_layer_has_correct_input_size(self):
         """Association layer's num_inputs == sum of all column num_neurons."""
         neurons_per_col = 8
         n_cols = 3
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, _kwta, assoc_name, _attn = build_columnar_network(
             input_dim=12,
             receptive_field_size=4,
             neurons_per_column=neurons_per_col,
@@ -469,7 +471,7 @@ class TestColumnarArchitecture(unittest.TestCase):
 
     def test_network_step_produces_outputs_for_all_layers(self):
         """A full step() should produce spike outputs for every column + association."""
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, kwta_names, assoc_name, _attn = build_columnar_network(
             input_dim=8,
             receptive_field_size=4,
             neurons_per_column=4,
@@ -480,8 +482,8 @@ class TestColumnarArchitecture(unittest.TestCase):
 
         outputs = net.step(sensory)
 
-        # All layers should have output
-        for name in col_names + [assoc_name]:
+        # All layers should have output (columns, kWTA, and assoc)
+        for name in col_names + kwta_names + [assoc_name]:
             self.assertIn(name, outputs)
             self.assertEqual(len(outputs[name]) > 0, True)
 
@@ -495,7 +497,7 @@ class TestColumnarArchitecture(unittest.TestCase):
 
     def test_columnar_topology_is_topologically_sorted(self):
         """Columns should appear before the association layer in processing order."""
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, _kwta, assoc_name, _attn = build_columnar_network(
             input_dim=8,
             receptive_field_size=4,
             neurons_per_column=4,
@@ -510,7 +512,7 @@ class TestColumnarArchitecture(unittest.TestCase):
 
     def test_multiple_steps_accumulate_activity(self):
         """Running multiple steps should produce changing activity over time."""
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, _kwta, assoc_name, _attn = build_columnar_network(
             input_dim=16,
             receptive_field_size=4,
             neurons_per_column=8,
@@ -541,7 +543,7 @@ class TestColumnarArchitecture(unittest.TestCase):
         standalone = PredictiveCodingLayer(4, 4, PredictiveCodingConfig(k_winners=2))
         existing_net.add_layer("standalone", standalone)
 
-        net, col_names, assoc_name = build_columnar_network(
+        net, col_names, _kwta, assoc_name, _attn = build_columnar_network(
             input_dim=8,
             receptive_field_size=4,
             neurons_per_column=4,

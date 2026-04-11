@@ -96,6 +96,13 @@ class NeuronConfig(BaseConfig):
     tau_m: float = 20.0
     refrac_period: int = 2  # steps (= ms at dt=1)
 
+    # Synaptic scaling (Turrigiano 2008)
+    scaling_interval: int = 1000  # steps between homeostatic scaling events
+
+    # Neuromodulatory compression factors
+    ne_trace_compression: float = 3.0   # NE → up to (1 + factor)× trace compression
+    ach_membrane_compression: float = 1.0  # ACh → up to (1 + factor)× τ_m compression
+
     # ── Derived (computed in __post_init__) ───────────────────────────
     # Membrane decay factor per timestep
     mem_decay: float = field(init=False, default=0.0)
@@ -474,6 +481,21 @@ class ReceptorProfile(BaseConfig):
     ht1a_density: float = 0.0
     ht2a_density: float = 0.0
 
+    def to_density_dict(self) -> dict["ReceptorType", float]:
+        """Convert to {ReceptorType: density} mapping for receptor.py."""
+        return {
+            ReceptorType.D1: self.d1_density,
+            ReceptorType.D2: self.d2_density,
+            ReceptorType.M1: self.m1_density,
+            ReceptorType.M4: self.m4_density,
+            ReceptorType.NACHR: self.nachr_density,
+            ReceptorType.ALPHA1: self.alpha1_density,
+            ReceptorType.ALPHA2: self.alpha2_density,
+            ReceptorType.BETA: self.beta_density,
+            ReceptorType.HT1A: self.ht1a_density,
+            ReceptorType.HT2A: self.ht2a_density,
+        }
+
 
 # Predefined receptor profiles for different brain regions
 CORTICAL_L4_RECEPTORS = ReceptorProfile(
@@ -661,6 +683,9 @@ class SequenceMemoryConfig(BaseConfig):
     learning_rate: float = 0.01
     decay: float = 0.999
     max_weight: float = 1.0
+    # DG-like pattern separation (D5)
+    expansion_factor: int = 4     # DG expansion ratio (Rolls 2013)
+    sparsity_k: float = 0.1       # Fraction of active neurons after k-WTA
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -695,8 +720,6 @@ class WorldModelConfig(BaseConfig):
     n_neurons_per_dim: int = 15   # Population coding density (Pouget et al. 2000)
     # Multi-step rehearsal (Friston et al. 2015)
     max_rehearsal_depth: int = 3  # Planning depth (modulated by 5-HT)
-    # Ensemble uncertainty (posterior variance)
-    n_ensemble: int = 3           # Number of decoder weight sets
 
 
 @dataclass(frozen=True, kw_only=True)

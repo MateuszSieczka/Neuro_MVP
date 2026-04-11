@@ -134,6 +134,18 @@ class InhibitoryPool:
         """DA D2 modulation on PV+ interneurons (Seamans & Yang 2004)."""
         self._ie_gain = float(0.7 + 0.8 * np.clip(da_level, 0.0, 1.0))
 
+    def enter_sws(self, gain_multiplier: float = 2.5) -> None:
+        """Elevate I→E gain during SWS (GABA surge).
+
+        During slow-wave sleep, GABAergic inhibition is globally elevated
+        (2-3× baseline) to enforce Down state hyperpolarization.
+        """
+        self._ie_gain *= gain_multiplier
+
+    def exit_sws(self) -> None:
+        """Restore normal I→E gain after SWS."""
+        self._ie_gain = 1.0
+
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
         self.v_inh.fill(self.config.v_rest)

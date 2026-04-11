@@ -63,30 +63,35 @@ class AstrocyteField:
         self._ca_decay: float = cfg.ca_decay
         self._d_serine_decay: float = cfg.d_serine_decay
 
-    def update(self, local_errors: NDArray[np.float32]) -> None:
-        """Update Ca²⁺ from local prediction error energy.
+    def update(self, spike_rates: NDArray[np.float32]) -> None:
+        """Update Ca²⁺ from local spike rates (not PE vectors).
+
+        Ca²⁺ accumulates proportionally to spike rate² — energy proxy
+        (De Pittà et al. 2011). This is the SLOW channel only;
+        fast epistemic signalling uses error_neuron.error_rate → D1
+        directly (no astrocyte involvement).
 
         Args:
-            local_errors: (n_zones,) or (n_synapses,) error vector.
+            spike_rates: (n_zones,) or (n_synapses,) firing rate vector.
         """
-        errors = self._to_zones(local_errors)
+        rates = self._to_zones(spike_rates)
         cfg = self.config
 
-        # ── Ca²⁺ dynamics ─────────────────────────────────────────────
+        # ── Ca²⁺ dynamics: accumulation ∝ rate² ───────────────────────
         self.calcium = (
             self.calcium * self._ca_decay
-            + cfg.ca_accumulation * errors * (1.0 - self._ca_decay)
+            + cfg.ca_accumulation * rates * (1.0 - self._ca_decay)
         )
 
-        # ── Gap junction diffusion ────────────────────────────────────
+        # ── Gap junction diffusion (ghost-point Neumann BC) ───────────
         if self.n_zones > 2 and cfg.gap_junction_D > 0:
             laplacian = np.zeros_like(self.calcium)
             laplacian[1:-1] = (
                 self.calcium[:-2] + self.calcium[2:] - 2.0 * self.calcium[1:-1]
             )
-            # Boundary: zero-flux (Neumann)
-            laplacian[0] = self.calcium[1] - self.calcium[0]
-            laplacian[-1] = self.calcium[-2] - self.calcium[-1]
+            # Ghost-point Neumann BC (zero-flux, no edge accumulation)
+            laplacian[0] = 2.0 * (self.calcium[1] - self.calcium[0])
+            laplacian[-1] = 2.0 * (self.calcium[-2] - self.calcium[-1])
             self.calcium += cfg.gap_junction_D * laplacian
             np.maximum(self.calcium, 0.0, out=self.calcium)
 
@@ -98,17 +103,18 @@ class AstrocyteField:
         np.clip(self.d_serine, 0.0, 1.0, out=self.d_serine)
 
     def _to_zones(self, values: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Map arbitrary-length array to n_zones by averaging groups."""
-        if values.shape[0] == self.n_zones:
-            return np.abs(values).astype(np.float32) ** 2
-        n = values.shape[0]
+        """Map arbitrary-length spike rate array to n_zones (rate²)."""
+        rates = np.abs(values).astype(np.float32)
+        if rates.shape[0] == self.n_zones:
+            return rates ** 2
+        n = rates.shape[0]
         zone_size = max(1, n // self.n_zones)
         result = np.zeros(self.n_zones, dtype=np.float32)
         for i in range(self.n_zones):
             start = i * zone_size
             end = min(start + zone_size, n)
             if start < n:
-                result[i] = float(np.mean(np.abs(values[start:end]) ** 2))
+                result[i] = float(np.mean(rates[start:end] ** 2))
         return result
 
     # ------------------------------------------------------------------

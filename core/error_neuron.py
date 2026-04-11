@@ -114,7 +114,9 @@ class ErrorNeuronLayer:
 
         # ── ACh gain ──────────────────────────────────────────────────
         self._ach_gain: float = 1.0
-
+        # ── Receptor dose-response modulation (D2) ───────────────────
+        self._receptor_gain: float = 1.0
+        self._receptor_lr: float = 1.0
     def forward(
         self,
         input_spikes: NDArray[np.float32],
@@ -132,7 +134,7 @@ class ErrorNeuronLayer:
 
         # ── Error neuron drive: ACh-gated feedforward − prediction ────
         feedforward = inp @ self.w_in  # (n_error,)
-        error_input = self._ach_gain * feedforward - prediction
+        error_input = (self._ach_gain * feedforward - prediction) * self._receptor_gain
 
         # ── Error neuron LIF (fast τ) ─────────────────────────────────
         in_refrac_e = self.refrac_error > 0
@@ -218,7 +220,8 @@ class ErrorNeuronLayer:
         cfg = self.config
 
         # ── Bottom-up: Hebbian ────────────────────────────────────────
-        dw_bu = cfg.w_bu_lr * modulation * self.e_bu
+        effective_mod = modulation * self._receptor_lr
+        dw_bu = cfg.w_bu_lr * effective_mod * self.e_bu
         if precision is not None:
             prec = _broadcast_precision(precision, self.n_error)
             dw_bu *= prec[:, np.newaxis]
@@ -226,7 +229,7 @@ class ErrorNeuronLayer:
 
         # ── Top-down: Anti-Hebbian (Rao & Ballard 1999) ──────────────
         # Negative sign: reduce weights that generate over-prediction
-        dw_td = -cfg.w_td_lr * modulation * self.e_td
+        dw_td = -cfg.w_td_lr * effective_mod * self.e_td
         self.w_td += dw_td
 
     def set_ach_level(self, ach: float) -> None:
@@ -262,3 +265,10 @@ class ErrorNeuronLayer:
         self.e_bu.fill(0.0)
         self.e_td.fill(0.0)
         self._ach_gain = 1.0
+        self._receptor_gain = 1.0
+        self._receptor_lr = 1.0
+
+    def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
+        """Apply receptor dose-response modulation (Hill equation effects)."""
+        self._receptor_gain = float(gain_mod)
+        self._receptor_lr = float(lr_mod)

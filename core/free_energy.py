@@ -34,21 +34,8 @@ Expected Free Energy for action selection (Active Inference):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 from numpy.typing import NDArray
-
-
-@dataclass(frozen=True, kw_only=True)
-class FreeEnergyConfig:
-    """Hyperparameters for free energy computation."""
-    # Default precision (inverse variance) when astrocyte not available
-    default_precision: float = 1.0
-    # Minimum precision to avoid division by zero
-    min_precision: float = 0.01
-    # Regularization for log-determinant computation
-    log_det_eps: float = 1e-6
 
 
 def variational_free_energy(

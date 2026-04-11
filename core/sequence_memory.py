@@ -24,6 +24,10 @@ from .config import SequenceMemoryConfig
 class SequenceMemory:
     """Temporal sequence learning via spike-timing transition weights.
 
+    DG-like pattern separation (Rolls 2013): random projection into
+    expanded space + competitive k-WTA thresholding before Hebbian
+    outer product. Prevents attractor collapse from overlapping inputs.
+
     W[i, j] = how strongly neuron j at time t predicts neuron i at t+1.
     Learning rule: dW = lr × outer(post_t, pre_{t-1})
     """
@@ -36,11 +40,23 @@ class SequenceMemory:
         self.config = config or SequenceMemoryConfig()
         self.num_neurons = num_neurons
 
+        # DG-like expansion (D5 pattern separation)
+        cfg = self.config
+        self._expanded_size = num_neurons * cfg.expansion_factor
+        self._k = max(1, int(self._expanded_size * cfg.sparsity_k))
+
+        # Fixed random projection matrix (DG granule cells)
+        rng = np.random.RandomState(42)  # deterministic for reproducibility
+        self._w_dg: NDArray[np.float32] = (
+            rng.randn(num_neurons, self._expanded_size).astype(np.float32)
+            / np.sqrt(num_neurons)
+        )
+
         self.transition_w: NDArray[np.float32] = np.zeros(
-            (num_neurons, num_neurons), dtype=np.float32,
+            (self._expanded_size, self._expanded_size), dtype=np.float32,
         )
         self.prev_pattern: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
+            self._expanded_size, dtype=np.float32,
         )
         self.predicted_next: NDArray[np.float32] = np.zeros(
             num_neurons, dtype=np.float32,
@@ -49,14 +65,26 @@ class SequenceMemory:
             num_neurons, dtype=np.float32,
         )
 
+    def _pattern_separate(self, pattern: NDArray[np.float32]) -> NDArray[np.float32]:
+        """DG-like pattern separation: project + k-WTA competitive threshold."""
+        projected = np.maximum(pattern @ self._w_dg, 0.0)  # ReLU
+        if np.max(projected) < 1e-10:
+            return np.zeros(self._expanded_size, dtype=np.float32)
+        # k-WTA: keep top-k, zero rest
+        threshold = np.partition(projected, -self._k)[-self._k]
+        sparse = np.where(projected >= threshold, projected, 0.0)
+        return sparse.astype(np.float32)
+
     def observe(self, current_pattern: NDArray[np.float32]) -> NDArray[np.float32]:
         """Record pattern and learn transition from previous."""
         pattern = current_pattern.astype(np.float32)
+        separated = self._pattern_separate(pattern)
 
+        # Temporal prediction error (in original space)
         self.temporal_error = pattern - self.predicted_next
 
-        if np.any(self.prev_pattern > 0) and np.any(pattern > 0):
-            dw = self.config.learning_rate * np.outer(pattern, self.prev_pattern)
+        if np.any(self.prev_pattern > 0) and np.any(separated > 0):
+            dw = self.config.learning_rate * np.outer(separated, self.prev_pattern)
             self.transition_w += dw
             self.transition_w *= self.config.decay
             np.clip(
@@ -64,64 +92,26 @@ class SequenceMemory:
                 out=self.transition_w,
             )
 
-        self.prev_pattern = pattern.copy()
-        self.predicted_next = self._predict_from(self.prev_pattern)
+        self.prev_pattern = separated.copy()
+        self.predicted_next = self._predict_from(separated)
         return self.temporal_error
 
     def predict_next(self) -> NDArray[np.float32]:
         """Predict next activation pattern."""
         return self.predicted_next.copy()
 
-    def get_associated_neurons(
-        self,
-        neuron_index: int,
-        threshold: float = 0.1,
-    ) -> NDArray[np.int64]:
-        """Neurons whose future activation is predicted by neuron_index."""
-        weights_from = self.transition_w[:, neuron_index]
-        return np.where(weights_from > threshold)[0]
-
-    def get_temporal_clusters(
-        self,
-        threshold: float = 0.1,
-    ) -> list[set[int]]:
-        """Discover emergent concept clusters via bidirectional association."""
-        n = self.num_neurons
-        parent = list(range(n))
-
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        def union(a: int, b: int) -> None:
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        symmetric = np.minimum(self.transition_w, self.transition_w.T)
-        for i in range(n):
-            for j in range(i + 1, n):
-                if symmetric[i, j] > threshold:
-                    union(i, j)
-
-        clusters: dict[int, set[int]] = {}
-        for i in range(n):
-            root = find(i)
-            clusters.setdefault(root, set()).add(i)
-
-        return [c for c in clusters.values() if len(c) > 1]
-
     def novelty_signal(self) -> float:
         """Scalar novelty from temporal prediction error magnitude."""
         return float(np.clip(np.mean(np.abs(self.temporal_error)), 0.0, 1.0))
 
-    def _predict_from(self, pattern: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Project pattern through transition_w to predict successor."""
-        if not np.any(pattern > 0):
+    def _predict_from(self, separated: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Project separated pattern through transition_w, project back."""
+        if not np.any(separated > 0):
             return np.zeros(self.num_neurons, dtype=np.float32)
-        raw = pattern @ self.transition_w.T
+        # Forward in expanded space then project back via pseudo-inverse
+        raw_expanded = separated @ self.transition_w.T
+        # Approximate inverse projection: _w_dg.T maps expanded → original
+        raw = np.clip(raw_expanded, 0.0, 1.0) @ self._w_dg.T
         return np.clip(raw, 0.0, 1.0).astype(np.float32)
 
     def reset_state(self) -> None:
@@ -137,14 +127,15 @@ class SequenceMemory:
 
 
 class HierarchicalSequenceMemory:
-    """Multi-scale sequence memory with gamma/theta/episode timescales.
+    """Multi-scale sequence memory with oscillator-coupled timescales.
 
     Level 0 (gamma ~30ms): Raw spike transitions per timestep
     Level 1 (theta ~125ms): Phase-level pooled transitions
     Level 2 (episode ~seconds): Episode-level macro-transitions
 
-    Each level pools transitions from the level below. Higher levels
-    capture longer temporal structure. Salience-gated to avoid noise.
+    Theta-level learning gated by oscillator encoding phase
+    (π/2 < φ_theta < 3π/2, Lisman & Jensen 2013).
+    Pooling window computed dynamically from current theta frequency.
     """
 
     def __init__(
@@ -154,12 +145,14 @@ class HierarchicalSequenceMemory:
         salience_threshold: float = 0.5,
         theta_window: int = 8,
         episode_window: int = 50,
+        dt_ms: float = 1.0,
     ) -> None:
         cfg = config or SequenceMemoryConfig()
         self.num_neurons = num_neurons
         self.salience_threshold = salience_threshold
         self.theta_window = theta_window
         self.episode_window = episode_window
+        self._dt_ms = dt_ms
 
         # Level 0: gamma-scale raw transitions
         self.level0 = SequenceMemory(num_neurons, cfg)
@@ -174,12 +167,33 @@ class HierarchicalSequenceMemory:
 
         self._step_count: int = 0
 
+    def update_theta_window(self, theta_freq_hz: float) -> None:
+        """Dynamically update pooling window from oscillator theta frequency.
+
+        theta_ticks = round(1 / (f_theta × dt_s))
+        """
+        dt_s = self._dt_ms / 1000.0
+        if theta_freq_hz > 0.0 and dt_s > 0.0:
+            self.theta_window = max(1, round(1.0 / (theta_freq_hz * dt_s)))
+
     def observe(
         self,
         current_pattern: NDArray[np.float32],
         salience: float = 0.0,
+        theta_phase: float | None = None,
+        theta_reset: bool = False,
     ) -> NDArray[np.float32]:
-        """Multi-scale observation with salience gating."""
+        """Multi-scale observation with oscillator phase gating.
+
+        Args:
+            current_pattern: Spike activity from the attached layer.
+            salience: NE-driven salience signal for level-1 gating.
+            theta_phase: Current theta oscillator phase (radians).
+                If provided, theta-level learning is gated to encoding
+                window (π/2 < φ < 3π/2, Lisman & Jensen 2013).
+            theta_reset: True if theta cycle just completed.
+                Forces theta pooling flush regardless of buffer length.
+        """
         self._step_count += 1
         pattern = current_pattern.astype(np.float32)
 
@@ -188,14 +202,26 @@ class HierarchicalSequenceMemory:
 
         # Accumulate for theta pooling
         self._theta_buffer.append(pattern)
-        if len(self._theta_buffer) >= self.theta_window:
+
+        # Flush on theta_reset or when buffer reaches dynamic window
+        should_flush = theta_reset or (
+            len(self._theta_buffer) >= self.theta_window
+        )
+
+        if should_flush and len(self._theta_buffer) > 0:
             pooled_theta = np.mean(
                 np.stack(self._theta_buffer), axis=0,
             ).astype(np.float32)
             self._theta_buffer.clear()
 
-            # Level 1: theta boundary
-            if salience >= self.salience_threshold:
+            # Gate theta-level learning by encoding phase
+            in_encoding_phase = True
+            if theta_phase is not None:
+                in_encoding_phase = (
+                    np.pi / 2 < theta_phase < 3 * np.pi / 2
+                )
+
+            if in_encoding_phase and salience >= self.salience_threshold:
                 self.level1.observe(pooled_theta)
 
             # Accumulate for episode pooling

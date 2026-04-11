@@ -191,3 +191,48 @@ def compute_layer_modulation(
                 effects[rt] = receptor_effect(rt, level, density)
 
     return effects
+
+
+def aggregate_receptor_effects(
+    effects: dict[ReceptorType, float],
+) -> tuple[float, float]:
+    """Aggregate individual receptor effects into gain and plasticity modulation.
+
+    Returns:
+        (gain_mod, plasticity_mod) where 1.0 = no modulation.
+        gain_mod scales membrane excitability / input current.
+        plasticity_mod scales STDP learning rate.
+    """
+    # Gain weights: how strongly each receptor type affects excitability.
+    # Signs already encoded in the receptor effect values.
+    _GAIN_WEIGHTS: dict[ReceptorType, float] = {
+        ReceptorType.D1: 1.0,
+        ReceptorType.D2: 1.0,
+        ReceptorType.M1: 0.5,
+        ReceptorType.M4: 0.5,
+        ReceptorType.NACHR: 0.7,
+        ReceptorType.ALPHA1: 0.6,
+        ReceptorType.ALPHA2: 0.4,
+        ReceptorType.BETA: 0.3,
+        ReceptorType.HT1A: 0.4,
+        ReceptorType.HT2A: 0.5,
+    }
+    # Plasticity weights: D1+NMDA, Beta-NE, M1 enhance plasticity.
+    _PLASTICITY_WEIGHTS: dict[ReceptorType, float] = {
+        ReceptorType.D1: 0.8,
+        ReceptorType.BETA: 0.5,
+        ReceptorType.M1: 0.3,
+        ReceptorType.HT2A: 0.2,
+    }
+
+    gain_delta = sum(
+        _GAIN_WEIGHTS.get(rt, 0.0) * eff for rt, eff in effects.items()
+    )
+    gain_mod = max(1.0 + gain_delta * 0.3, 0.1)
+
+    plast_delta = sum(
+        _PLASTICITY_WEIGHTS.get(rt, 0.0) * eff for rt, eff in effects.items()
+    )
+    plasticity_mod = max(1.0 + plast_delta * 0.5, 0.1)
+
+    return gain_mod, plasticity_mod

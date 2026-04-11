@@ -20,10 +20,11 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import OscillatorConfig
+from .config import OscillatorConfig, ReceptorProfile
 from .oscillator import ThetaGammaOscillator
+from .receptor import compute_layer_modulation, aggregate_receptor_effects
 from .simulation_context import SimulationContext, DEFAULT_CONTEXT
-from .spike_encoder import PoissonEncoder
+
 
 if TYPE_CHECKING:
     from .attention import SpatialAttentionController
@@ -80,14 +81,17 @@ class NetworkGraph:
         self,
         osc_config: OscillatorConfig | None = None,
         ctx: SimulationContext | None = None,
+        precision_min: float = 0.1,
+        precision_max: float = 10.0,
     ) -> None:
         self.ctx = ctx or DEFAULT_CONTEXT
+        self.precision_min = precision_min
+        self.precision_max = precision_max
 
         self._layers: dict[str, Any] = {}
         self._order: list[str] = []
         self._order_dirty: bool = True
         self._connections: list[LayerConnection] = []
-        self._encoder = PoissonEncoder()
 
         self._sequence_memories: dict[
             str, SequenceMemory | HierarchicalSequenceMemory
@@ -95,6 +99,9 @@ class NetworkGraph:
 
         # Layers updated via TD error directly (skip in update_weights)
         self._td_updated_layers: set[str] = set()
+
+        # Receptor profiles per layer (D2 receptor dose-response)
+        self._receptor_profiles: dict[str, ReceptorProfile] = {}
 
         self.oscillator = ThetaGammaOscillator(
             config=osc_config or OscillatorConfig(), ctx=self.ctx,
@@ -113,7 +120,12 @@ class NetworkGraph:
     # Layer registration
     # ------------------------------------------------------------------
 
-    def add_layer(self, name: str, layer: Any) -> None:
+    def add_layer(
+        self,
+        name: str,
+        layer: Any,
+        receptor_profile: ReceptorProfile | None = None,
+    ) -> None:
         """Register a layer under a unique name.
 
         Layer must implement:
@@ -126,6 +138,8 @@ class NetworkGraph:
         self._layers[name] = layer
         self._order.append(name)
         self._order_dirty = True
+        if receptor_profile is not None:
+            self._receptor_profiles[name] = receptor_profile
 
     def mark_td_updated(self, *layer_names: str) -> None:
         """Mark layers that receive TD-based updates directly.
@@ -233,18 +247,44 @@ class NetworkGraph:
             sero_level=sero_level,
         )
 
-        # ── 3. Distribute neuromodulator signals ──────────────────────
+        # ── 3. Distribute neuromodulator signals (region-aware) ──────
         if neuromodulator is not None:
-            for layer in self._layers.values():
+            # Ensure all layers are registered as regions
+            for name in self._layers:
+                neuromodulator.register_region(name)
+
+            for name, layer in self._layers.items():
+                ne = neuromodulator.ne_for_region(name)
+                ach = neuromodulator.ach_for_region(name)
                 if hasattr(layer, "set_ach_level"):
-                    layer.set_ach_level(neuromodulator.bottom_up_gain)
+                    layer.set_ach_level(ach)
                 if hasattr(layer, "set_ne_level"):
-                    layer.set_ne_level(neuromodulator.competition_sharpness)
+                    layer.set_ne_level(ne)
                 if hasattr(layer, "set_neuromodulators"):
-                    layer.set_neuromodulators(
-                        ne=neuromodulator.competition_sharpness,
-                        sero=neuromodulator.planning_horizon,
-                    )
+                    layer.set_neuromodulators(ne=ne, sero=sero_level)
+
+            # ── 3b. Receptor dose-response modulation (Hill equation) ─
+            if self._receptor_profiles:
+                transmitter_levels = {
+                    "da": neuromodulator.dopamine,
+                    "ach": neuromodulator.acetylcholine,
+                    "ne": neuromodulator.noradrenaline,
+                    "sero": neuromodulator.serotonin,
+                }
+                for name, layer in self._layers.items():
+                    profile = self._receptor_profiles.get(name)
+                    if profile is None:
+                        continue
+                    regional = {
+                        **transmitter_levels,
+                        "ach": neuromodulator.ach_for_region(name),
+                        "ne": neuromodulator.ne_for_region(name),
+                    }
+                    densities = profile.to_density_dict()
+                    effects = compute_layer_modulation(regional, densities)
+                    gain_mod, lr_mod = aggregate_receptor_effects(effects)
+                    if hasattr(layer, "set_receptor_modulation"):
+                        layer.set_receptor_modulation(gain_mod, lr_mod)
 
         # ── 4. Spatial attention gains ────────────────────────────────
         if attention is not None:
@@ -279,8 +319,10 @@ class NetworkGraph:
             if hasattr(src, "prediction_error"):
                 pe = src.prediction_error
                 pe_var = float(np.var(pe)) + 1e-8
-                precision = min(1.0 / pe_var, 10.0)
-                prediction = prediction * np.float32(np.clip(precision, 0.1, 10.0))
+                precision = min(1.0 / pe_var, self.precision_max)
+                prediction = prediction * np.float32(
+                    np.clip(precision, self.precision_min, self.precision_max)
+                )
 
             # Size matching for concat targets
             if prediction.shape[0] == tgt.num_neurons:
@@ -313,10 +355,19 @@ class NetworkGraph:
                 pe_mag = float(np.mean(np.abs(layer.prediction_error)))
                 per_column_pe[name] = pe_mag
 
-            # 8. Sequence memory observation
+            # 8. Sequence memory observation (oscillator-coupled)
             if name in self._sequence_memories:
                 seq_mem = self._sequence_memories[name]
-                if hasattr(seq_mem, "salience_threshold"):
+                if hasattr(seq_mem, "update_theta_window"):
+                    # Dynamic pooling window from oscillator theta freq
+                    seq_mem.update_theta_window(self.oscillator.effective_theta_hz)
+                    seq_mem.observe(
+                        outputs[name],
+                        salience=salience_signal,
+                        theta_phase=self.oscillator.theta_phase,
+                        theta_reset=theta_reset,
+                    )
+                elif hasattr(seq_mem, "salience_threshold"):
                     seq_mem.observe(outputs[name], salience=salience_signal)
                 else:
                     seq_mem.observe(outputs[name])
@@ -331,15 +382,18 @@ class NetworkGraph:
 
         # ── 9. Attention update ───────────────────────────────────────
         if attention is not None:
-            # Find association layer output
+            # Find association layer output (prefer explicit assoc_name)
             assoc_out: NDArray[np.float32] | None = None
-            for conn in self._connections:
-                if (
-                    conn.connection_type == "feedforward"
-                    and conn.source in attention.column_names
-                ):
-                    assoc_out = outputs.get(conn.target)
-                    break
+            if hasattr(attention, 'assoc_name') and attention.assoc_name in outputs:
+                assoc_out = outputs[attention.assoc_name]
+            else:
+                for conn in self._connections:
+                    if (
+                        conn.connection_type == "feedforward"
+                        and conn.source in attention.column_names
+                    ):
+                        assoc_out = outputs.get(conn.target)
+                        break
 
             if assoc_out is None:
                 assoc_out = outputs.get(
@@ -371,7 +425,22 @@ class NetworkGraph:
             }
             attention.update(assoc_out, col_acts)
 
-        # ── 10. Advance timestep ──────────────────────────────────────
+        # ── 10. Update per-region NE/ACh from local PE ─────────────
+        if neuromodulator is not None and per_column_pe:
+            neuromodulator.update_regional(per_column_pe)
+
+        # ── 11. Theta-sweep planning (efference copy, E4) ────────────
+        if (
+            theta_reset
+            and "actor" in self._layers
+            and "encoder" in self._layers
+        ):
+            self.theta_sweep_plan()
+
+        # ── 12. Seizure brake (E3) ───────────────────────────────────
+        self.check_and_handle_seizure(outputs)
+
+        # ── 13. Advance timestep ──────────────────────────────────────
         self.timestep += 1
         return outputs
 
@@ -394,6 +463,122 @@ class NetworkGraph:
                     else np.zeros(1, dtype=np.float32)
                 )
                 layer.update_weights(m_t=plasticity_signal, pred_error=pe)
+
+    # ------------------------------------------------------------------
+    # Theta-sweep planning with efference copy (E4)
+    # ------------------------------------------------------------------
+
+    def theta_sweep_plan(
+        self,
+        actor_name: str = "actor",
+        encoder_name: str = "encoder",
+        n_gamma_cycles: int = 7,
+    ) -> dict[int, float]:
+        """Theta-sweep planning: multiplexed action evaluation.
+
+        At theta trough: encode current state (already done by step()).
+        At theta peak: for each gamma cycle, evaluate a different action
+        via efference copy → world model encoder → error neurons → D1/D2.
+
+        ~6-7 gamma cycles per theta → temporal multiplexing of competing
+        actions (Lisman & Jensen 2013).
+
+        Returns:
+            dict mapping action index → epistemic error signal (lower = better predicted).
+        """
+        actor = self._layers.get(actor_name)
+        encoder = self._layers.get(encoder_name)
+
+        if actor is None or encoder is None:
+            return {}
+
+        if not hasattr(actor, "efference_copy"):
+            return {}
+
+        # Only plan during theta retrieval phase (peak, not trough)
+        if self.oscillator.theta_encoding_phase:
+            return {}
+
+        efference = actor.efference_copy()
+        motor_dim = getattr(actor, "motor_dim", len(efference))
+        n_actions = min(motor_dim, n_gamma_cycles)
+
+        action_errors: dict[int, float] = {}
+
+        # Save encoder state for side-effect-free imagination
+        saved_v_state = encoder.v_state.copy() if hasattr(encoder, 'v_state') else None
+        saved_v_error = encoder.v_error.copy() if hasattr(encoder, 'v_error') else None
+
+        for gamma_idx in range(n_actions):
+            action = gamma_idx
+
+            # Build action one-hot scaled by efference strength
+            action_signal = np.zeros(motor_dim, dtype=np.float32)
+            if action < len(efference):
+                action_signal[action] = max(abs(efference[action]), 0.1)
+
+            # Feed efference copy through encoder
+            # Encoder expects combined (state+action) input
+            if hasattr(encoder, 'n_input'):
+                efference_input = np.zeros(encoder.n_input, dtype=np.float32)
+                # Place action signal at the end (matching _build_input convention)
+                act_start = encoder.n_input - motor_dim
+                if act_start >= 0:
+                    efference_input[act_start:act_start + motor_dim] = action_signal
+                encoder.forward(efference_input)
+
+                # Error neuron response = prediction quality for this action
+                error_signal = float(np.mean(encoder.error_rate))
+                action_errors[action] = error_signal
+
+        # Restore encoder state
+        if saved_v_state is not None and hasattr(encoder, 'v_state'):
+            encoder.v_state[:] = saved_v_state
+        if saved_v_error is not None and hasattr(encoder, 'v_error'):
+            encoder.v_error[:] = saved_v_error
+
+        # Feed action errors back to actor as epistemic drive
+        if action_errors and hasattr(actor, 'set_epistemic_drive'):
+            error_arr = np.array(
+                [action_errors.get(a, 0.0) for a in range(n_actions)],
+                dtype=np.float32,
+            )
+            actor.set_epistemic_drive(error_arr)
+
+        return action_errors
+
+    # ------------------------------------------------------------------
+    # Seizure detection & forced Down state (E3)
+    # ------------------------------------------------------------------
+
+    def check_and_handle_seizure(
+        self,
+        outputs: dict[str, NDArray[np.float32]],
+        baseline_rate: float = 0.05,
+    ) -> bool:
+        """Check mean firing rate; if >3× baseline, force Down state.
+
+        Returns True if seizure was detected and Down state was forced.
+        """
+        if not outputs:
+            return False
+
+        all_rates = []
+        for spikes in outputs.values():
+            all_rates.append(float(np.mean(spikes)))
+        mean_rate = float(np.mean(all_rates))
+
+        if self.oscillator.check_seizure(mean_rate, baseline_rate):
+            # Force global hyperpolarization: zero all layer outputs
+            for name, layer in self._layers.items():
+                if hasattr(layer, 'v_hidden'):
+                    layer.v_hidden[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
+                if hasattr(layer, 'v_d1'):
+                    layer.v_d1[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
+                if hasattr(layer, 'v_d2'):
+                    layer.v_d2[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Delay buffer

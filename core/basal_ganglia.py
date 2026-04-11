@@ -192,6 +192,10 @@ class SNNDeepCritic:
         self._t_since_post: NDArray[np.int32] = np.full(h, 1000, dtype=np.int32)
         self._stdp_window: int = 20
 
+        # ── Receptor dose-response modulation (D2) ───────────────────
+        self._receptor_gain: float = 1.0
+        self._receptor_lr: float = 1.0
+
     def forward(self, state_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
         """Single LIF step: compute V(s), update V_trace and eligibility.
 
@@ -211,7 +215,7 @@ class SNNDeepCritic:
         self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic current ──────────────────────────────────────────
-        current = (state_f32 @ self.w_h) * self._input_gain
+        current = (state_f32 @ self.w_h) * self._input_gain * self._receptor_gain
 
         # ── Single LIF step (no integration loop) ─────────────────────
         in_refrac = self.refrac_hidden > 0
@@ -274,11 +278,18 @@ class SNNDeepCritic:
         """Three-factor STDP: Δw = lr × DA(td_error) × eligibility."""
         td = float(np.clip(td_error, -50.0, 50.0))
         cfg = self.config
+        effective_lr = cfg.critic_lr * self._receptor_lr
 
-        self.w_v += cfg.critic_lr * td * self.e_v
-        self.b_v += cfg.critic_lr * td * self.e_bv
+        dw_v = effective_lr * td * self.e_v
+        np.clip(dw_v, -0.1, 0.1, out=dw_v)
+        self.w_v += dw_v
 
-        self.w_h += cfg.critic_lr * td * self.e_h
+        db_v = effective_lr * td * self.e_bv
+        self.b_v += float(np.clip(db_v, -0.1, 0.1))
+
+        dw_h = effective_lr * td * self.e_h
+        np.clip(dw_h, -0.1, 0.1, out=dw_h)
+        self.w_h += dw_h
 
         # Homeostatic column normalisation
         wc = cfg.w_clip_critic
@@ -314,6 +325,11 @@ class SNNDeepCritic:
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
         eff_tau = self.config.tau_e_critic / ne_factor
         self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
+
+    def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
+        """Apply receptor dose-response modulation (Hill equation effects)."""
+        self._receptor_gain = float(gain_mod)
+        self._receptor_lr = float(lr_mod)
 
 
 # =====================================================================
@@ -450,6 +466,10 @@ class D1D2Actor:
         # ── Fast epistemic drive (error neuron → D1 excitability) ─────
         self._epistemic_drive: float = 0.0
 
+        # ── Receptor dose-response modulation (D2) ───────────────────
+        self._receptor_gain: float = 1.0
+        self._receptor_lr: float = 1.0
+
     def set_da_level(self, da: float) -> None:
         """Set DA modulation: high DA → D1 excitation, D2 suppression."""
         self._da_level = float(np.clip(da, 0.0, 1.0))
@@ -485,8 +505,8 @@ class D1D2Actor:
         self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic currents ─────────────────────────────────────────
-        current_d1 = (state_f32 @ self.w_d1) * self._input_gain
-        current_d2 = (state_f32 @ self.w_d2) * self._input_gain
+        current_d1 = (state_f32 @ self.w_d1) * self._input_gain * self._receptor_gain
+        current_d2 = (state_f32 @ self.w_d2) * self._input_gain * self._receptor_gain
 
         # ── DA modulation (Frank 2005) ────────────────────────────────
         da = self._da_level
@@ -604,14 +624,21 @@ class D1D2Actor:
         D2 (NoGo): negative TD → DA dip → strengthen active NoGo synapses (LTP)
 
         No REINFORCE grad_log_pi — purely Hebbian with dopaminergic gating.
+        Soft weight clipping: dw = clip(dw, -0.1, 0.1) per update.
         """
         td = float(np.clip(td_error, -50.0, 50.0))
         cfg = self.config
+        effective_lr = cfg.actor_lr * self._receptor_lr
 
         # D1: positive DA (reward) drives Go pathway LTP
-        self.w_d1 += cfg.actor_lr * max(td, 0.0) * self.e_d1
+        dw_d1 = effective_lr * max(td, 0.0) * self.e_d1
+        np.clip(dw_d1, -0.1, 0.1, out=dw_d1)
+        self.w_d1 += dw_d1
+
         # D2: negative DA (punishment) drives NoGo pathway LTP
-        self.w_d2 += cfg.actor_lr * max(-td, 0.0) * self.e_d2
+        dw_d2 = effective_lr * max(-td, 0.0) * self.e_d2
+        np.clip(dw_d2, -0.1, 0.1, out=dw_d2)
+        self.w_d2 += dw_d2
 
         # Homeostatic column normalisation + Dale's law
         for w in (self.w_d1, self.w_d2):
@@ -681,6 +708,32 @@ class D1D2Actor:
         eff_tau = self.config.tau_e_actor / ne_factor
         self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
 
+    def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
+        """Apply receptor dose-response modulation (Hill equation effects)."""
+        self._receptor_gain = float(gain_mod)
+        self._receptor_lr = float(lr_mod)
+
+    def efference_copy(self) -> NDArray[np.float32]:
+        """Generate sub-threshold efference copy of D1/D2 activity.
+
+        Returns the net D1−D2 sub-threshold activity for each motor action.
+        Used during theta-sweep planning: efference copy feeds into the
+        world model encoder to predict outcome of contemplated actions.
+        No spike threshold — captures graded intent (Cisek 2007).
+        """
+        # Sub-threshold voltages relative to rest, normalized
+        d1_sub = np.clip(
+            (self.v_d1[:self.motor_dim] - self.config.v_rest)
+            / (self.config.v_thresh - self.config.v_rest),
+            0.0, 1.0,
+        )
+        d2_sub = np.clip(
+            (self.v_d2[:self.motor_dim] - self.config.v_rest)
+            / (self.config.v_thresh - self.config.v_rest),
+            0.0, 1.0,
+        )
+        return (d1_sub - d2_sub).astype(np.float32)
+
 
 # =====================================================================
 # Active Inference integration
@@ -708,6 +761,7 @@ class ActiveInferenceModule:
         # Diagnostic outputs
         self.last_epistemic_values: dict[int, float] = {}
         self.last_pragmatic_values: dict[int, float] = {}
+        self.last_ambiguity_values: dict[int, float] = {}
         self.last_total_values: dict[int, float] = {}
         self.last_selected_action: int = 0
 
@@ -715,12 +769,18 @@ class ActiveInferenceModule:
         self,
         state_spikes: NDArray[np.float32],
         candidate_actions: list[int],
-    ) -> dict[int, float]:
-        """Epistemic value = prediction uncertainty per action."""
+    ) -> tuple[dict[int, float], dict[int, float]]:
+        """Epistemic value and ambiguity per action.
+
+        Returns:
+            (epistemic_dict, ambiguity_dict) per candidate action.
+            Ambiguity = ensemble variance = expected sensory entropy.
+        """
         results = self.world_model.mental_rehearsal(
             state_spikes, candidate_actions,
         )
         epistemic: dict[int, float] = {}
+        ambiguity: dict[int, float] = {}
         for action in candidate_actions:
             info = results[action]
             if self.config.uncertainty_method == "novelty":
@@ -729,7 +789,9 @@ class ActiveInferenceModule:
                 epistemic[action] = self._variance_uncertainty(
                     state_spikes, action,
                 )
-        return epistemic
+            # Ambiguity = ensemble variance (expected observation entropy)
+            ambiguity[action] = info.ensemble_variance
+        return epistemic, ambiguity
 
     def _variance_uncertainty(
         self,
@@ -762,8 +824,11 @@ class ActiveInferenceModule:
 
         If actor is provided, uses D1/D2 rates as pragmatic/cost values.
         """
-        epistemic = self.compute_epistemic_values(state_spikes, candidate_actions)
+        epistemic, ambiguity = self.compute_epistemic_values(
+            state_spikes, candidate_actions,
+        )
         self.last_epistemic_values = epistemic
+        self.last_ambiguity_values = ambiguity
 
         # NE-modulated epistemic weight
         beta = (
@@ -782,9 +847,11 @@ class ActiveInferenceModule:
                 pragmatic = 0.0
                 cost = 0.0
             epist = epistemic.get(action, 0.0)
+            amb = ambiguity.get(action, 0.0)
             g = expected_free_energy(
                 pragmatic_value=pragmatic - cost,
                 epistemic_value=epist,
+                ambiguity=amb,
                 epistemic_weight=beta,
             )
             total[action] = -g  # Higher = better (negate for selection)
@@ -813,7 +880,9 @@ class ActiveInferenceModule:
         ne_level: float = 0.3,
     ) -> int:
         """Greedy (argmax) variant for evaluation."""
-        epistemic = self.compute_epistemic_values(state_spikes, candidate_actions)
+        epistemic, ambiguity = self.compute_epistemic_values(
+            state_spikes, candidate_actions,
+        )
         beta = (
             self.config.epistemic_weight
             + ne_level * self.config.ne_epistemic_boost
@@ -829,6 +898,7 @@ class ActiveInferenceModule:
             g = expected_free_energy(
                 pragmatic_value=pragmatic - cost,
                 epistemic_value=epistemic.get(action, 0.0),
+                ambiguity=ambiguity.get(action, 0.0),
                 epistemic_weight=beta,
             )
             total[action] = -g

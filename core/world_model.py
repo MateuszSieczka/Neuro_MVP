@@ -1,5 +1,4 @@
-"""
-SNN World Model — ErrorNeuronLayer encoder + ensemble Hebbian decoder.
+"""SNN World Model -- ErrorNeuronLayer encoder + single Hebbian decoder + vesicle noise.
 
 Reference:
   Friston et al. (2015) "Active inference and epistemic value"
@@ -8,10 +7,12 @@ Reference:
 
 Changes from legacy:
   1. Multi-step mental rehearsal (depth D modulated by 5-HT)
-  2. Ensemble decoder (n_ensemble weight sets → posterior variance)
+  2. Single decoder with Bernoulli(0.8) vesicle masking → ambiguity
   3. Precision-weighted curiosity (no hardcoded 0.7/0.3)
-  4. Uses WorldModelConfig from config.py (not SNNWorldModelConfig)
+  4. Uses WorldModelConfig from config.py
   5. Uses new ErrorNeuronLayer API (.belief, .prediction_error_rate)
+  6. Astrocyte = SLOW channel only (spike rate → Ca²⁺ → D-Serine → NMDA gain)
+  7. Fast epistemic: error_neuron.error_rate → D1 directly (no astrocyte)
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ class RehearsalResult:
     predicted_state: NDArray[np.float32]
     novelty: float
     familiarity: float
-    ensemble_variance: float  # Posterior uncertainty from ensemble
+    ensemble_variance: float  # Ambiguity from vesicle-noise variance
 
 
 # =====================================================================
@@ -66,20 +67,22 @@ class RehearsalResult:
 # =====================================================================
 
 class SNNWorldModel:
-    """SNN world model: ErrorNeuronLayer encoder + ensemble Hebbian decoder.
+    """SNN world model: ErrorNeuronLayer encoder + single Hebbian decoder.
 
     Encoder (ErrorNeuronLayer):
       Input → Error Neurons (fast τ ~4ms, ε = input − g(μ))
               ↕ W_bu / W_td
            State Neurons (slow τ ~20ms, belief μ)
 
-    Decoder (ensemble of n_ensemble Hebbian readouts):
-      Each decoder: state_rates → w_decode[k] → predicted_next_state
-      Variance across ensemble → epistemic uncertainty
+    Decoder (single Hebbian readout + vesicle noise):
+      state_rates → w_decode → predicted_next_state
+      Bernoulli(0.8) masking simulates synaptic vesicle release probability.
+      Ambiguity from variance of multiple masked predictions.
       ΔW = lr × outer(belief, prediction_error). No backprop.
 
     AstrocyteField:
-      Monitors decoder error → Ca²⁺ → precision estimate.
+      Monitors encoder spike rates → Ca²⁺ → precision estimate.
+      SLOW channel only; fast epistemic via error_neuron.error_rate → D1.
     """
 
     def __init__(
@@ -125,14 +128,11 @@ class SNNWorldModel:
             config=AstrocyteConfig(tau_ca=500.0, ca_accumulation=0.15),
         )
 
-        # ── Ensemble decoder (posterior uncertainty) ──────────────────
-        self.n_ensemble: int = max(1, cfg.n_ensemble)
-        self.w_decode: list[NDArray[np.float32]] = [
-            np.random.normal(
-                0.0, 0.01, (self.hidden_size, state_size),
-            ).astype(np.float32)
-            for _ in range(self.n_ensemble)
-        ]
+        # ── Single decoder + vesicle noise (Bernoulli masking) ───────
+        self.w_decode: NDArray[np.float32] = np.random.normal(
+            0.0, 0.01, (self.hidden_size, state_size),
+        ).astype(np.float32)
+        self._vesicle_p: float = 0.8  # Release probability (Pr)
 
         # ── Running state ─────────────────────────────────────────────
         self.last_prediction: NDArray[np.float32] = np.zeros(
@@ -151,22 +151,47 @@ class SNNWorldModel:
         self._current_rehearsal_depth: int = cfg.max_rehearsal_depth
 
     # ------------------------------------------------------------------
-    # Ensemble helpers
+    # Decoder helpers
     # ------------------------------------------------------------------
 
-    def _ensemble_predict(
+    def _decode_with_vesicle_noise(
         self,
         belief: NDArray[np.float32],
+        use_noise: bool = True,
+    ) -> NDArray[np.float32]:
+        """Decode via single decoder with Bernoulli vesicle masking.
+
+        Simulates stochastic synaptic vesicle release (Pr ≈ 0.8).
+        """
+        if use_noise:
+            mask = np.random.binomial(
+                1, self._vesicle_p, size=self.w_decode.shape[0],
+            ).astype(np.float32)
+            masked_belief = belief * mask
+        else:
+            masked_belief = belief
+        return (masked_belief @ self.w_decode).astype(np.float32)
+
+    def _compute_ambiguity(
+        self,
+        belief: NDArray[np.float32],
+        n_samples: int = 5,
     ) -> tuple[NDArray[np.float32], float]:
-        """Predict via all ensemble members → mean + variance.
+        """Compute mean prediction and ambiguity via repeated vesicle masking.
+
+        Ambiguity = mean per-dim variance across masked predictions
+        = expected sensory entropy H[p(o|s,a)].
 
         Returns:
-            (mean_prediction, mean_variance_per_dim)
+            (mean_prediction, ambiguity_scalar)
         """
-        preds = np.stack([belief @ w for w in self.w_decode])  # (M, state_size)
+        preds = np.stack([
+            self._decode_with_vesicle_noise(belief, use_noise=True)
+            for _ in range(n_samples)
+        ])
         mean_pred = np.mean(preds, axis=0).astype(np.float32)
-        var_per_dim = np.mean(np.var(preds, axis=0))
-        return mean_pred, float(var_per_dim)
+        ambiguity = float(np.mean(np.var(preds, axis=0)))
+        return mean_pred, ambiguity
 
     # ------------------------------------------------------------------
     # Public interface
@@ -181,7 +206,7 @@ class SNNWorldModel:
         combined = self._build_input(state_spikes, action)
         self.encoder.forward(combined)
         belief = self.encoder.belief
-        mean_pred, _ = self._ensemble_predict(belief)
+        mean_pred = self._decode_with_vesicle_noise(belief, use_noise=False)
         self.last_prediction = mean_pred
         return mean_pred
 
@@ -198,14 +223,15 @@ class SNNWorldModel:
         belief = self.encoder.belief
         actual = actual_next_state.astype(np.float32)
 
-        # Ensemble mean prediction
-        mean_pred, _ = self._ensemble_predict(belief)
+        # Single decoder prediction (no vesicle noise during learning)
+        mean_pred = self._decode_with_vesicle_noise(belief, use_noise=False)
         self.prediction_error = actual - mean_pred
         self.prediction_error_scalar = float(np.mean(self.prediction_error ** 2))
         self.error_history.append(self.prediction_error_scalar)
 
-        # Astrocyte tracks decoder error → precision
-        self.astrocyte.update(self.prediction_error)
+        # Astrocyte tracks encoder spike rates → Ca²⁺ (SLOW channel)
+        # Fast epistemic: encoder.error_rate → D1 directly (no astrocyte)
+        self.astrocyte.update(self.encoder.error_rate)
 
         # Encoder: three-factor STDP × modulation × astrocyte precision
         self.encoder.update_weights(
@@ -213,16 +239,16 @@ class SNNWorldModel:
             precision=self.astrocyte.precision,
         )
 
-        # Decoder: Hebbian update per ensemble member (with slight noise)
+        # Decoder: Hebbian update (single decoder, with vesicle noise)
         max_belief = np.max(np.abs(belief))
         if max_belief > 0.01:
             belief_norm = belief / (max_belief + 1e-6)
-            for k in range(self.n_ensemble):
-                pred_k = belief @ self.w_decode[k]
-                error_k = actual - pred_k
-                dw = self.config.decode_lr * np.outer(belief_norm, error_k)
-                self.w_decode[k] += (dw * m_t).astype(np.float32)
-                np.clip(self.w_decode[k], -1.0, 1.0, out=self.w_decode[k])
+            pred = belief @ self.w_decode
+            error = actual - pred
+            dw = self.config.decode_lr * np.outer(belief_norm, error)
+            np.clip(dw, -0.1, 0.1, out=dw)  # Soft weight clipping
+            self.w_decode += (dw * m_t).astype(np.float32)
+            np.clip(self.w_decode, -1.0, 1.0, out=self.w_decode)
 
         return self.prediction_error
 
@@ -234,8 +260,8 @@ class SNNWorldModel:
         """Multi-step epistemic evaluation (Friston et al. 2015).
 
         For each action: simulate D forward steps through encoder,
-        accumulate discounted epistemic value (prediction error + ensemble
-        variance). Depth D = self._current_rehearsal_depth.
+        accumulate discounted epistemic value (prediction error +
+        vesicle-noise variance). Depth D = self._current_rehearsal_depth.
         """
         saved = self.snapshot_encoder()
         baseline_precision = self.astrocyte.mean_precision
@@ -249,7 +275,7 @@ class SNNWorldModel:
             combined = self._build_input(current_state_spikes, action)
 
             total_epistemic = 0.0
-            total_variance = 0.0
+            total_ambiguity = 0.0
             predicted_next = np.zeros(self.state_size, dtype=np.float32)
 
             for step in range(depth):
@@ -259,33 +285,33 @@ class SNNWorldModel:
                 # Encoder prediction error
                 encoder_pe = float(np.mean(self.encoder.prediction_error_rate))
 
-                # Ensemble variance → posterior uncertainty
-                mean_pred, ens_var = self._ensemble_predict(belief)
+                # Single decoder + vesicle noise → ambiguity
+                mean_pred, amb = self._compute_ambiguity(belief)
                 predicted_next = mean_pred
 
-                # Epistemic value: combined error + variance + (1 − precision)
-                step_epistemic = encoder_pe + ens_var + (1.0 - baseline_precision)
+                # Epistemic value: combined error + ambiguity + (1 − precision)
+                step_epistemic = encoder_pe + amb + (1.0 - baseline_precision)
                 total_epistemic += (gamma ** step) * step_epistemic
-                total_variance += (gamma ** step) * ens_var
+                total_ambiguity += (gamma ** step) * amb
 
                 # For multi-step: feed predicted state back as input
                 if step < depth - 1:
                     combined = self._build_input(mean_pred, action)
 
-            raw_results.append((action, total_epistemic, total_variance, predicted_next))
+            raw_results.append((action, total_epistemic, total_ambiguity, predicted_next))
 
         # Normalize across candidates
         max_epist = max((r[1] for r in raw_results), default=1e-8)
         max_epist = max(max_epist, 1e-6)
 
         results: dict[int, RehearsalResult] = {}
-        for action, raw_ep, raw_var, pred in raw_results:
+        for action, raw_ep, raw_amb, pred in raw_results:
             novelty = float(np.clip(raw_ep / max_epist, 0.0, 2.0))
             results[action] = RehearsalResult(
                 predicted_state=pred,
                 novelty=novelty,
                 familiarity=max(0.0, 1.0 - novelty),
-                ensemble_variance=raw_var,
+                ensemble_variance=raw_amb,
             )
 
         self.restore_encoder(saved)

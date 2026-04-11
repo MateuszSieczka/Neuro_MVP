@@ -139,7 +139,7 @@ class LIFLayer:
 
         # ── Synaptic scaling bookkeeping (Turrigiano 2008) ────────────
         self._scaling_counter: int = 0
-        self._scaling_interval: int = 1000  # steps between scaling events
+        self._scaling_interval: int = self.neuron_cfg.scaling_interval
 
     # ------------------------------------------------------------------
     # Core dynamics
@@ -321,13 +321,13 @@ class LIFLayer:
         ctx = self.neuron_cfg.ctx
 
         # NE compression on trace time constants
-        ne_factor = 1.0 + ne * 3.0  # up to 4× compression
+        ne_factor = 1.0 + ne * self.neuron_cfg.ne_trace_compression
         eff_tau_e = self.stdp_cfg.tau_eligibility / ne_factor
         eff_tau_pre = self.stdp_cfg.tau_plus / ne_factor
         eff_tau_post = self.stdp_cfg.tau_minus / ne_factor
 
         # ACh compression on membrane τ
-        ach_factor = 1.0 + ach * 1.0  # up to 2× compression
+        ach_factor = 1.0 + ach * self.neuron_cfg.ach_membrane_compression
         eff_tau_m = self.neuron_cfg.tau_m / ach_factor
 
         self._elig_decay = ctx.decay(eff_tau_e)

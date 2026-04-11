@@ -68,6 +68,13 @@ class NeuromodulatorSystem:
         # ── Intrinsic progress (world model improvement) ──────────────
         self._episode_pred_errors: deque[float] = deque(maxlen=30)
 
+        # ── Per-region NE/ACh (Schultz 1998: DA/5-HT global;
+        #    Berridge & Waterhouse 2003: NE regional;
+        #    Hasselmo 2006: ACh regional) ──────────────────────────────
+        self._ne_levels: dict[str, float] = {}
+        self._ach_levels: dict[str, float] = {}
+        self._region_names: list[str] = []
+
     # ------------------------------------------------------------------
     # Per-step update
     # ------------------------------------------------------------------
@@ -240,28 +247,68 @@ class NeuromodulatorSystem:
         """5-HT → temporal discount / planning depth."""
         return self.serotonin
 
-    @property
-    def tau_compression(self) -> float:
-        """NE → trace time-constant compression."""
-        return self.noradrenaline
+    # ------------------------------------------------------------------
+    # Per-region NE / ACh
+    # ------------------------------------------------------------------
 
-    @property
-    def membrane_reactivity(self) -> float:
-        """ACh → membrane τ compression."""
-        return self.acetylcholine
+    def register_region(self, name: str) -> None:
+        """Register a brain region for per-region NE/ACh modulation."""
+        if name not in self._ne_levels:
+            self._ne_levels[name] = self.noradrenaline
+            self._ach_levels[name] = self.acetylcholine
+            self._region_names.append(name)
+
+    def ne_for_region(self, name: str | None = None) -> float:
+        """Per-region NE. Falls back to global if region unknown."""
+        if name is None:
+            return self.noradrenaline
+        return self._ne_levels.get(name, self.noradrenaline)
+
+    def ach_for_region(self, name: str | None = None) -> float:
+        """Per-region ACh. Falls back to global if region unknown."""
+        if name is None:
+            return self.acetylcholine
+        return self._ach_levels.get(name, self.acetylcholine)
+
+    def update_regional(
+        self,
+        region_errors: dict[str, float] | None = None,
+    ) -> None:
+        """Update per-region NE/ACh from local prediction errors.
+
+        NE: locus coeruleus projects differentially — higher local PE → higher NE
+        (Berridge & Waterhouse 2003).
+        ACh: basal forebrain global with slight regional bias (Hasselmo 2006).
+        DA and 5-HT remain global (Schultz 1998, Doya 2002).
+        """
+        if region_errors is None:
+            region_errors = {}
+
+        for name in self._region_names:
+            local_pe = region_errors.get(name, 0.0)
+            # NE: global baseline + local PE boost (LC regional projection)
+            self._ne_levels[name] = float(np.clip(
+                self.noradrenaline + 0.3 * local_pe, 0.0, 1.0,
+            ))
+            # ACh: global level (basal forebrain uniform projection)
+            self._ach_levels[name] = self.acetylcholine
 
     # ------------------------------------------------------------------
     # Layer interface
     # ------------------------------------------------------------------
 
-    def apply_to_layer(self, layer: object) -> None:
+    def apply_to_layer(
+        self,
+        layer: object,
+        region: str | None = None,
+    ) -> None:
         """Propagate NE/ACh to any layer supporting modulation."""
+        ne = self.ne_for_region(region)
+        ach = self.ach_for_region(region)
         if hasattr(layer, 'set_plasticity_timescales'):
-            layer.set_plasticity_timescales(
-                ne=self.noradrenaline, ach=self.acetylcholine,
-            )
+            layer.set_plasticity_timescales(ne=ne, ach=ach)
         if hasattr(layer, 'set_ne_level'):
-            layer.set_ne_level(self.noradrenaline)
+            layer.set_ne_level(ne)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -292,6 +339,10 @@ class NeuromodulatorSystem:
         self._tda_history.clear()
         self._stagnation_factor = 0.0
         self._episode_pred_errors.clear()
+        # Reset per-region to baselines
+        for name in self._region_names:
+            self._ne_levels[name] = self.noradrenaline
+            self._ach_levels[name] = self.acetylcholine
 
     def __repr__(self) -> str:
         return (

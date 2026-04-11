@@ -37,14 +37,20 @@ if TYPE_CHECKING:
 
 @dataclass
 class Experience:
-    """Single (s, a, r, s') transition with biological context."""
+    """Single (s, a, r, s') transition with biological context.
+
+    Spike-time representation: spike_trains capture temporal spike
+    patterns (not raw float state vectors). Raw state/next_state
+    retained for world model compatibility.
+    """
     state: NDArray[np.float32]
     action: int
     reward: float
     next_state: NDArray[np.float32]
     prediction_error: NDArray[np.float32]
-    encoder_e_bu: NDArray[np.float32]
-    encoder_spikes: NDArray[np.float32]
+    # Spike-time representation
+    spike_trains: list[NDArray[np.float32]]  # Per-layer spike trains
+    synaptic_fingerprint: dict[str, NDArray[np.float32]]  # Per-layer eligibility snapshot
     aug_state: NDArray[np.float32] | None = None
     salience: float = 0.0
     recorded_da: float = 0.0
@@ -55,8 +61,10 @@ class Experience:
         self.state = self.state.copy()
         self.next_state = self.next_state.copy()
         self.prediction_error = self.prediction_error.copy()
-        self.encoder_e_bu = self.encoder_e_bu.copy()
-        self.encoder_spikes = self.encoder_spikes.copy()
+        self.spike_trains = [t.copy() for t in self.spike_trains]
+        self.synaptic_fingerprint = {
+            k: v.copy() for k, v in self.synaptic_fingerprint.items()
+        }
         if self.aug_state is not None:
             self.aug_state = self.aug_state.copy()
 
@@ -107,10 +115,15 @@ class ReplayBuffer:
         sequence_memories: dict[str, SequenceMemory] | None = None,
         gamma: float | None = None,
         sleep_gain: float = 1.0,
+        oscillator: object | None = None,
     ) -> list[float]:
-        """Two-phase sleep consolidation.
+        """Two-phase sleep consolidation with biological SWS oscillation.
 
         Phase 1 (SWS): Reverse replay → critic/actor consolidation.
+          Oscillator enters ~1 Hz slow oscillation mode.
+          InhibitoryPool gain elevated 2-3× (GABA surge).
+          Up phase: noise + SWR replay.
+          Down phase: global hyperpolarization.
         Phase 2 (REM): Forward replay → world model refinement.
 
         Returns per-experience world model MSE from SWS phase.
@@ -128,11 +141,34 @@ class ReplayBuffer:
         n_sws = max(1, int(total * cfg.sws_replay_fraction))
         n_rem = max(1, total - n_sws)
 
+        # Enter SWS mode on oscillator if available
+        if oscillator is not None and hasattr(oscillator, 'enter_sws'):
+            oscillator.enter_sws()
+
+        # Elevate inhibitory gain during SWS (GABA surge)
+        sws_pools: list[object] = []
+        for obj in (bg.critic, bg.actor):
+            if hasattr(obj, 'inh_pool'):
+                obj.inh_pool.enter_sws(gain_multiplier=2.5)
+                sws_pools.append(obj.inh_pool)
+            for attr_name in ('inh_pool_d1', 'inh_pool_d2'):
+                pool = getattr(obj, attr_name, None)
+                if pool is not None:
+                    pool.enter_sws(gain_multiplier=2.5)
+                    sws_pools.append(pool)
+
         # Phase 1: SWS — reverse replay (most recent first)
         sws_exps = experiences[-n_sws:]
         sws_errors = self._sws_phase(
             sws_exps, world_model, bg, gamma, sleep_gain,
+            oscillator=oscillator,
         )
+
+        # Exit SWS
+        for pool in sws_pools:
+            pool.exit_sws()
+        if oscillator is not None and hasattr(oscillator, 'exit_sws'):
+            oscillator.exit_sws()
 
         # Phase 2: REM — forward replay
         rem_exps = experiences[:n_rem]
@@ -153,8 +189,14 @@ class ReplayBuffer:
         bg: "BasalGangliaAGISystem",
         gamma: float,
         sleep_gain: float,
+        oscillator: object | None = None,
     ) -> list[float]:
         """Reverse-chronological replay for critic/actor consolidation.
+
+        Gated by slow oscillation Up/Down states (~1 Hz):
+          Up phase: SWR replay — world model + BG weight updates.
+          Down phase: global hyperpolarization — skip replay, reset LIF.
+        Seizure brake: if mean critic activation >3× baseline → force Down.
 
         Computes Monte Carlo returns backward, normalizes advantages,
         then updates BG and world model. Uses V_trace for baseline.
@@ -189,10 +231,34 @@ class ReplayBuffer:
         variance_scale = float(np.clip(adv_std / 0.5, 0.1, 1.0))
         adv_norm = (adv_arr / max_abs) * variance_scale
 
-        # Reverse replay
+        # Reverse replay — gated by slow oscillation Up/Down state
         errors: list[float] = []
         for i, exp in enumerate(reversed(experiences)):
-            world_model.encoder.e_bu[:] = exp.encoder_e_bu
+            # ── Advance slow oscillation ──────────────────────────────
+            if oscillator is not None and hasattr(oscillator, 'tick_sws'):
+                _up_onset, _down_onset = oscillator.tick_sws()
+
+                # Down state: global hyperpolarization — skip replay
+                if not oscillator.in_up_state:
+                    bg.critic.reset_state()
+                    bg.actor.reset_state()
+                    errors.append(0.0)
+                    continue
+
+                # Seizure brake during Up state
+                mean_act = float(np.mean(np.abs(bg.critic.activation)))
+                if hasattr(oscillator, 'check_seizure') and oscillator.check_seizure(mean_act):
+                    bg.critic.reset_state()
+                    bg.actor.reset_state()
+                    errors.append(0.0)
+                    continue
+
+            # ── Up state: SWR replay ──────────────────────────────────
+            # Restore synaptic fingerprint if available
+            if "encoder_e_bu" in exp.synaptic_fingerprint:
+                e_bu = exp.synaptic_fingerprint["encoder_e_bu"]
+                if e_bu.shape == world_model.encoder.e_bu.shape:
+                    world_model.encoder.e_bu[:] = e_bu
             world_model.reset_state()
 
             m_t = exp.recorded_da * max(abs(float(adv_norm[i])), 0.1)
@@ -237,10 +303,14 @@ class ReplayBuffer:
                 exp.state, exp.action, exp.next_state, m_t=0.5,
             )
 
-            # Sequence memory learning
+            # Sequence memory learning from spike trains
             if sequence_memories is not None:
                 for seq_mem in sequence_memories.values():
-                    seq_mem.observe(exp.encoder_spikes)
+                    # Use first spike train (encoder layer) if available
+                    if exp.spike_trains:
+                        seq_mem.observe(exp.spike_trains[0])
+                    else:
+                        seq_mem.observe(exp.state)
 
         # Reset sequence memories after REM
         if sequence_memories is not None:

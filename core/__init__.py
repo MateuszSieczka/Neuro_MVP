@@ -42,7 +42,7 @@ from .free_energy import (
 )
 
 # -- Receptor pharmacology --
-from .receptor import receptor_effect, compute_layer_modulation
+from .receptor import receptor_effect, compute_layer_modulation, aggregate_receptor_effects
 
 # -- Synapse models --
 from .synapse import SynapticChannels
@@ -82,7 +82,7 @@ from .basal_ganglia import (
 
 # -- Network orchestration --
 from .network import NetworkGraph, LayerConnection
-from .columnar import build_columnar_network, split_input
+from .columnar import build_columnar_network, split_input  # returns 5-tuple now
 
 # -- Encoding --
 from .spike_encoder import PoissonEncoder, GaussianPopulationEncoder

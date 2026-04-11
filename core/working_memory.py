@@ -95,6 +95,10 @@ class WorkingMemoryModule:
             num_neurons, dtype=np.float32,
         )
 
+        # ── Receptor dose-response modulation (D2) ───────────────────
+        self._receptor_gain: float = 1.0
+        self._receptor_lr: float = 1.0
+
     # ------------------------------------------------------------------
     # Dual gating (O'Reilly & Frank 2006)
     # ------------------------------------------------------------------
@@ -133,9 +137,9 @@ class WorkingMemoryModule:
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
 
-        # ── Input current (scaled by soft gate) ─────────────────────
+        # ── Input current (scaled by soft gate + receptor gain) ─────
         ext_f32 = external_input.astype(np.float32)
-        external_current = gate * (ext_f32 @ self.w_ff)
+        external_current = gate * self._receptor_gain * (ext_f32 @ self.w_ff)
         self.x_pre += np.clip(ext_f32, 0.0, 1.0) * gate
 
         # Recurrent contribution always active (attractor maintenance)
@@ -189,6 +193,11 @@ class WorkingMemoryModule:
         """NE level — no direct effect on WM dynamics."""
         pass
 
+    def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
+        """Apply receptor dose-response modulation (Hill equation effects)."""
+        self._receptor_gain = float(gain_mod)
+        self._receptor_lr = float(lr_mod)
+
     # ------------------------------------------------------------------
     # Lateral Hebbian learning
     # ------------------------------------------------------------------
@@ -217,7 +226,7 @@ class WorkingMemoryModule:
         """Three-factor STDP for feedforward weights."""
         if np.isclose(m_t, 0.0):
             return
-        dw = self.config.learning_rate * m_t * self.e * pred_error
+        dw = self.config.learning_rate * m_t * self._receptor_lr * self.e * pred_error
         self.w_ff += dw
 
     # ------------------------------------------------------------------

@@ -64,7 +64,7 @@ class TestSpatialAttention(unittest.TestCase):
         self.input_dim = self.n_columns * self.rf_size
 
         np.random.seed(42)
-        self.net, self.col_names, self.assoc_name = build_columnar_network(
+        self.net, self.col_names, self._kwta_names, self.assoc_name, self._attn_built = build_columnar_network(
             input_dim=self.input_dim,
             receptive_field_size=self.rf_size,
             neurons_per_column=self.neurons_per_col,

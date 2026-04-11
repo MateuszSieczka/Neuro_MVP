@@ -36,11 +36,13 @@ class SpatialAttentionController:
         n_columns: int,
         column_names: list[str],
         config: AttentionConfig | None = None,
+        assoc_name: str = "assoc",
     ) -> None:
         self.config = config or AttentionConfig()
         self.assoc_neurons = assoc_neurons
         self.n_columns = n_columns
         self.column_names = list(column_names)
+        self.assoc_name = assoc_name
         cfg = self.config
 
         # ── Top-down projection weights ───────────────────────────────

@@ -53,6 +53,12 @@ class ThetaGammaOscillator:
         # ── PAC amplitude (modulated by theta phase) ──────────────────
         self.gamma_amplitude: float = 1.0
 
+        # ── SWS slow oscillation mode (~1 Hz) ────────────────────────
+        self._sws_mode: bool = False
+        self._sws_freq_hz: float = 1.0  # ~1 Hz slow oscillation
+        self._sws_phase: float = 0.0  # Slow oscillation phase
+        self._in_up_state: bool = False  # Up vs Down state
+
     def tick(
         self,
         ne_level: float = 0.0,
@@ -129,3 +135,80 @@ class ThetaGammaOscillator:
         self.gamma_amplitude = 1.0
         self._theta_freq = self.config.theta_freq_hz
         self._gamma_freq = self.config.gamma_freq_hz
+        self._sws_mode = False
+        self._sws_phase = 0.0
+        self._in_up_state = False
+
+    # ------------------------------------------------------------------
+    # SWS slow oscillation mode
+    # ------------------------------------------------------------------
+
+    def enter_sws(self) -> None:
+        """Switch to Slow-Wave Sleep oscillation (~1 Hz Up/Down states).
+
+        Up phase: noise + SWR replay allowed.
+        Down phase: global hyperpolarization, no activity.
+        """
+        self._sws_mode = True
+        self._sws_phase = 0.0
+        self._in_up_state = False
+
+    def exit_sws(self) -> None:
+        """Return to normal theta-gamma oscillation."""
+        self._sws_mode = False
+        self._sws_phase = 0.0
+        self._in_up_state = False
+
+    def tick_sws(self) -> tuple[bool, bool]:
+        """Advance slow oscillation by one dt step.
+
+        Returns:
+            (up_onset, down_onset): True at Up/Down state transitions.
+        """
+        dt_s = self.ctx.dt / 1000.0
+        TWO_PI = 2.0 * np.pi
+
+        d_phase = TWO_PI * self._sws_freq_hz * dt_s
+        old_phase = self._sws_phase
+        self._sws_phase += d_phase
+
+        if self._sws_phase >= TWO_PI:
+            self._sws_phase -= TWO_PI
+
+        # Up state: 0 → π (first half of slow oscillation)
+        # Down state: π → 2π (second half)
+        was_up = old_phase < np.pi
+        is_up = self._sws_phase < np.pi
+
+        up_onset = is_up and not was_up
+        down_onset = not is_up and was_up
+
+        self._in_up_state = is_up
+        return up_onset, down_onset
+
+    @property
+    def sws_mode(self) -> bool:
+        return self._sws_mode
+
+    @property
+    def in_up_state(self) -> bool:
+        return self._in_up_state
+
+    # ------------------------------------------------------------------
+    # Seizure brake
+    # ------------------------------------------------------------------
+
+    _SEIZURE_THRESHOLD_MULT: float = 3.0
+    _SEIZURE_DOWN_MS: float = 200.0
+
+    def check_seizure(
+        self,
+        mean_rate: float,
+        baseline_rate: float = 0.05,
+    ) -> bool:
+        """Check if mean firing rate exceeds seizure threshold.
+
+        If rate > 3× baseline → signals forced Down state for 200ms.
+        """
+        threshold = self._SEIZURE_THRESHOLD_MULT * max(baseline_rate, 0.01)
+        return mean_rate > threshold

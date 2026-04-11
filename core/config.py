@@ -880,7 +880,7 @@ class AgentConfig(BaseConfig):
     and sleep scheduling — previously hardcoded in SNNAgent.observe().
     """
     intrinsic_reward_weight: float = 0.1       # curiosity weight in effective_reward
-    da_offset: float = 0.5                     # shift for DA → learning_rate_modulation
+    da_offset: float = 0.0                     # shift for DA → learning_rate_modulation
     td_clip: float = 50.0                      # gradient clipping on TD error
     consolidation_midpoint: float = 0.7        # sigmoid inflection for consolidation gate
     consolidation_steepness: float = 8.0       # sigmoid steepness
@@ -931,8 +931,25 @@ class BasalGangliaConfig(BaseConfig):
     # D1/D2 pathway balance (Frank 2005)
     d1_bias: float = 0.6    # D1 pathway relative strength at DA=0.5
     d2_bias: float = 0.4    # D2 pathway relative strength at DA=0.5
+    # Population coding: neurons per action channel (Georgopoulos 1986;
+    # Humphries, Stewart & Gurney 2006).  Each motor action is represented
+    # by a population, not a single neuron.  Population sum gives robust
+    # rate estimates for spike-based action selection.
+    neurons_per_action: int = 8
     # Exploration
     exploration_noise: float = 0.3
+    # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
+    # Slow multiplicative weight adjustment targeting stable per-neuron
+    # firing rate.  Prevents weight erosion and runaway excitation
+    # without task-specific clip values.
+    homeo_target_rate: float = 0.05   # Target firing rate per neuron
+    homeo_tau: float = 5000.0         # Slow rate-averaging τ (ms)
+    homeo_interval: int = 5000        # Forward steps between scaling events
+    homeo_max_change: float = 0.02    # Max fractional change per event
+    # Bidirectional DA modulation (Shen et al. 2008)
+    ltd_ratio: float = 0.7            # LTD/LTP magnitude ratio (Shen et al. 2008)
+    # Synaptic degradation — protein turnover (Bhatt et al. 2009)
+    readout_decay: float = 1e-5       # Per-step decay on readout weights
 
     def __post_init__(self) -> None:
         assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"

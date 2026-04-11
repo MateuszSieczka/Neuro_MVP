@@ -82,6 +82,7 @@ def _msn_decay(
 def _derive_input_gain(
     fan_in: int,
     ncfg: NeuronConfig,
+    w_clip: float,
     target_rate: float = 0.05,
 ) -> float:
     """Derive synaptic gain from AdEx rheobase — proper pA-scale current.
@@ -94,15 +95,19 @@ def _derive_input_gain(
       I_rheo = g_L × (V_T - E_L - Δ_T) = g_L × (gap - delta_t)
 
     Gain scales I_syn so that expected_active inputs produce ~I_rheo,
-    putting neurons in the responsive regime where input variations
-    translate to firing rate differences.
+    accounting for homeostatic column normalization (Turrigiano 2008)
+    that clips weight column L2 norms to ``w_clip``.  After clipping,
+    the effective per-synapse weight is approximately
+    ``w_clip / sqrt(fan_in)``.
 
     Returns gain in pA per unit input, matching the AdEx current scale.
     """
     gap = abs(ncfg.v_thresh - ncfg.v_rest)
     i_rheo = ncfg.g_L * (gap - ncfg.delta_t)  # pA (Brette & Gerstner 2005)
     expected_active = max(1.0, fan_in * target_rate)
-    return float(i_rheo / expected_active)
+    # Effective per-synapse weight after homeostatic column normalization
+    effective_w = w_clip / np.sqrt(max(1.0, float(fan_in)))
+    return float(i_rheo / (expected_active * effective_w))
 
 
 def _adex_step_bg(
@@ -183,14 +188,25 @@ class SNNDeepCritic:
         # Biophysical consistency: τ_m = C_m / g_L ⇒ g_L = C_m / τ_m
         # Default g_L=30nS assumes cortical τ≈9.4ms; ventral striatal
         # neurons with τ=15ms require g_L=18.7nS (C_m=281pF).
+        #
+        # Adaptation scaling: NeuronConfig defaults (a=4nS, b=80.5pA)
+        # are calibrated for g_L=30nS.  When g_L changes, the voltage
+        # effect of adaptation (b/g_L, a/g_L) must be preserved.
+        # Without scaling, b/g_L grows from 2.68mV to 4.30mV, making
+        # adaptation over-suppress spiking.
         _C_m = 281.0  # NeuronConfig default (Brette & Gerstner 2005)
+        _g_L_eff = _C_m / config.tau_m_critic
+        _g_L_ref = 30.0  # NeuronConfig default (Destexhe & Paré 1999)
+        _adapt_scale = _g_L_eff / _g_L_ref
         self._ncfg = NeuronConfig(
             ctx=config.ctx,
             v_rest=config.v_rest,
             v_thresh=config.v_thresh,
             v_reset=config.v_reset,
             tau_m=config.tau_m_critic,
-            g_L=_C_m / config.tau_m_critic,
+            g_L=_g_L_eff,
+            a=4.0 * _adapt_scale,
+            b=80.5 * _adapt_scale,
         )
 
         # ── Precomputed membrane decay ────────────────────────────────
@@ -198,11 +214,18 @@ class SNNDeepCritic:
 
         # ── Input gain from biophysics (AdEx rheobase) ─────────────────
         self._input_gain: float = _derive_input_gain(
-            state_size, self._ncfg,
+            state_size, self._ncfg, config.w_clip_critic,
         )
 
         # ── Weights via principled init ───────────────────────────────
         self.w_h: NDArray[np.float32] = init_weights(state_size, h, excitatory=True)
+        # Pre-normalize to homeostatic clip so the first update() does
+        # not destructively rescale the weight distribution.  Column
+        # normalization (Turrigiano 2008) then maintains this scale.
+        for j in range(h):
+            col_norm = float(np.linalg.norm(self.w_h[:, j]))
+            if col_norm > config.w_clip_critic:
+                self.w_h[:, j] *= config.w_clip_critic / col_norm
 
         # ── LIF state (warm start near threshold) ─────────────────────
         self.v_hidden: NDArray[np.float32] = np.random.uniform(
@@ -264,6 +287,13 @@ class SNNDeepCritic:
         # ── Receptor dose-response modulation (D2) ───────────────────
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
+
+        # ── Homeostatic synaptic scaling state (Turrigiano 2004) ──────
+        # Slow EMA of per-neuron firing rate.  NOT reset between episodes
+        # — homeostatic regulation operates on a timescale of hours/days.
+        self._homeo_rate: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        self._homeo_decay: float = config.ctx.decay(config.homeo_tau)
+        self._homeo_counter: int = 0
 
     def set_astrocyte(
         self,
@@ -336,6 +366,14 @@ class SNNDeepCritic:
             + self.spikes_hidden.astype(np.float32) * rate_compl
         )
 
+        # ── Homeostatic rate tracker (slow EMA, Turrigiano 2004) ──────
+        hc = 1.0 - self._homeo_decay
+        self._homeo_rate = (
+            self._homeo_rate * self._homeo_decay
+            + self.spikes_hidden.astype(np.float32) * hc
+        )
+        self._homeo_counter += 1
+
         # ── Event-based post-synaptic trace ───────────────────────────
         self._x_post *= self._post_decay
         self._x_post[self.spikes_hidden] += 1.0
@@ -368,28 +406,44 @@ class SNNDeepCritic:
 
     def update(self, td_error: float) -> None:
         """Three-factor STDP: Δw = lr × DA(td_error) × eligibility."""
-        td = float(np.clip(td_error, -50.0, 50.0))
+        td = float(np.clip(td_error, -200.0, 200.0))
         cfg = self.config
         effective_lr = cfg.critic_lr * self._receptor_lr
 
         dw_v = effective_lr * td * self.e_v
-        np.clip(dw_v, -0.1, 0.1, out=dw_v)
+        np.clip(dw_v, -1.0, 1.0, out=dw_v)
         self.w_v += dw_v
 
         db_v = effective_lr * td * self.e_bv
-        self.b_v += float(np.clip(db_v, -0.1, 0.1))
+        self.b_v += float(np.clip(db_v, -1.0, 1.0))
 
         dw_h = effective_lr * td * self.e_h
-        np.clip(dw_h, -0.1, 0.1, out=dw_h)
+        np.clip(dw_h, -1.0, 1.0, out=dw_h)
         self.w_h += dw_h
 
-        # Homeostatic column normalisation
+        # Soft readout weight decay — synaptic protein turnover
+        # (Bhatt et al. 2009).  No hard clip: allows V(s) to represent
+        # arbitrary value magnitudes for any task/horizon.
+        self.w_v *= (1.0 - cfg.readout_decay)
+        self.b_v *= (1.0 - cfg.readout_decay)
+
+        # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
+        # Multiplicative correction targeting stable per-neuron rate.
+        # Replaces hard column-norm clipping — task/scale-agnostic.
+        if self._homeo_counter > 0 and self._homeo_counter % cfg.homeo_interval == 0:
+            target = self.inh_pool.config.target_sparsity
+            for j in range(cfg.hidden_size):
+                actual = max(float(self._homeo_rate[j]), 1e-6)
+                error = (target - actual) / target
+                scale = 1.0 + cfg.homeo_max_change * float(np.clip(error, -1.0, 1.0))
+                self.w_h[:, j] *= scale
+
+        # Safety bound: 2× nominal prevents runaway in degenerate cases
         wc = cfg.w_clip_critic
-        np.clip(self.w_v, -wc, wc, out=self.w_v)
         for j in range(cfg.hidden_size):
             col_norm = float(np.linalg.norm(self.w_h[:, j]))
-            if col_norm > wc:
-                self.w_h[:, j] *= wc / col_norm
+            if col_norm > wc * 2.0:
+                self.w_h[:, j] *= (wc * 2.0) / col_norm
 
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
@@ -465,7 +519,13 @@ class D1D2Actor:
     ) -> None:
         self.config = config
         self._state_size = state_size
-        self.action_dim = motor_dim + internal_dim
+        # ── Population coding (Georgopoulos 1986) ─────────────────────
+        # Each motor action is represented by a population of MSNs, not
+        # a single neuron.  This gives robust rate estimates for spike-
+        # based action selection and meaningful inhibitory competition.
+        self.n_per_action: int = max(1, config.neurons_per_action)
+        self._total_motor: int = motor_dim * self.n_per_action
+        self.action_dim = self._total_motor + internal_dim
         self.motor_dim = motor_dim
 
         # ── D1 pathway weights (cortex → D1-MSN) ─────────────────────
@@ -473,9 +533,18 @@ class D1D2Actor:
             state_size, self.action_dim, excitatory=True,
         )
         # ── D2 pathway weights (cortex → D2-MSN) ─────────────────────
-        self.w_d2: NDArray[np.float32] = init_weights(
-            state_size, self.action_dim, excitatory=True,
-        )
+        # Frank (2005): D1 and D2 MSNs share cortical afferents
+        # (intermingled in dorsal striatum).  Pathway differentiation
+        # arises from DA modulation, not from different input weights.
+        # Copying D1→D2 ensures both pathways fire at comparable rates
+        # from the start, enabling Go/NoGo learning immediately.
+        self.w_d2: NDArray[np.float32] = self.w_d1.copy()
+        # Pre-normalize to homeostatic clip (same rationale as critic)
+        for w_mat in (self.w_d1, self.w_d2):
+            for j in range(self.action_dim):
+                col_norm = float(np.linalg.norm(w_mat[:, j]))
+                if col_norm > config.w_clip:
+                    w_mat[:, j] *= config.w_clip / col_norm
 
         # ── AdEx NeuronConfig for MSN (Up-state defaults) ────────────
         # Biophysical consistency: τ_m = C_m / g_L ⇒ g_L = C_m / τ_m
@@ -483,19 +552,28 @@ class D1D2Actor:
         # (Wilson & Kawaguchi 1996).  Forward pass overrides g_L per
         # neuron via bistable C_m/τ_eff, but ncfg.g_L must match
         # Up-state for consistent gain derivation.
+        #
+        # Adaptation scaling: same rationale as critic.  MSN g_L=11.24
+        # vs reference 30 → b/g_L would be 7.16mV (47.7% of gap!)
+        # without scaling.  With scaling, b/g_L = 2.68mV (17.9%).
         _C_m = 281.0  # NeuronConfig default (Brette & Gerstner 2005)
+        _g_L_eff = _C_m / config.tau_m_msn_up
+        _g_L_ref = 30.0  # NeuronConfig default (Destexhe & Paré 1999)
+        _adapt_scale = _g_L_eff / _g_L_ref
         self._ncfg = NeuronConfig(
             ctx=config.ctx,
             v_rest=config.v_rest,
             v_thresh=config.v_thresh,
             v_reset=config.v_reset,
             tau_m=config.tau_m_msn_up,
-            g_L=_C_m / config.tau_m_msn_up,
+            g_L=_g_L_eff,
+            a=4.0 * _adapt_scale,
+            b=80.5 * _adapt_scale,
         )
 
         # ── Input gain from biophysics (AdEx rheobase) ─────────────────
         self._input_gain: float = _derive_input_gain(
-            state_size, self._ncfg,
+            state_size, self._ncfg, config.w_clip,
         )
 
         # ── D1-MSN membrane state ────────────────────────────────────
@@ -516,16 +594,20 @@ class D1D2Actor:
         self.rate_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
         self.w_adapt_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
-        # ── Rate EMA decay ────────────────────────────────────────────
-        self._rate_decay: float = 0.9  # Fast averaging for action selection
+        # ── Rate EMA decay (matched to MSN membrane τ for consistent
+        #    spike-rate estimation timescale) ──────────────────────────
+        self._rate_decay: float = config.ctx.decay(config.tau_m_msn_up)
 
         # ── InhibitoryPool for D1 competition ─────────────────────────
+        # Planert et al. (2010): MSN in vivo rates ~1-5 Hz.  The pool
+        # target is a per-timestep firing rate, NOT a per-decision
+        # action-level sparsity.  0.05 matches cortical target_rate.
         self.inh_pool_d1 = InhibitoryPool(
             n_excitatory=self.action_dim,
             config=InhibitoryPoolConfig(
                 ctx=config.ctx,
                 n_interneurons=max(2, self.action_dim // 2),
-                target_sparsity=1.0 / max(motor_dim, 1),
+                target_sparsity=0.05,
             ),
         )
         # ── InhibitoryPool for D2 competition ─────────────────────────
@@ -534,12 +616,15 @@ class D1D2Actor:
             config=InhibitoryPoolConfig(
                 ctx=config.ctx,
                 n_interneurons=max(2, self.action_dim // 2),
-                target_sparsity=1.0 / max(motor_dim, 1),
+                target_sparsity=0.05,
             ),
         )
 
         # ── DA modulation state ───────────────────────────────────────
         self._da_level: float = 0.5
+
+        # ── NE level for temperature modulation (Usher & Damasio 2000) ─
+        self._ne_level: float = 0.3  # Baseline from NeuromodulatorConfig
 
         # ── Eligibility traces (DA-modulated Hebbian STDP, Frank 2005) ─
         self.e_d1: NDArray[np.float32] = np.zeros(
@@ -553,6 +638,18 @@ class D1D2Actor:
         # ── Pre-synaptic traces ───────────────────────────────────────
         self._x_pre: NDArray[np.float32] = np.zeros(state_size, dtype=np.float32)
         self._pre_decay: float = config.ctx.decay(20.0)
+
+        # ── Post-synaptic traces (Bi & Poo 2001: asymmetric window) ──
+        # Required for the LTD arm of STDP: when post fires before pre,
+        # synaptic weight should decrease.  Without these, eligibility
+        # is always ≥ 0 and STDP degenerates to rate-based Hebbian.
+        self._x_post_d1: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
+        self._x_post_d2: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
+        self._post_decay: float = config.ctx.decay(20.0)
 
         # ── Spike timing for causal STDP window (±20ms) ──────────────
         self._t_since_pre: NDArray[np.int32] = np.full(state_size, 1000, dtype=np.int32)
@@ -571,8 +668,21 @@ class D1D2Actor:
             [], dtype=np.float32,
         )
         # D1/D2 net evidence (exposed for Active Inference)
-        self._d1_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
-        self._d2_rates: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        # Per-action aggregated rates (population sum).
+        self._d1_rates: NDArray[np.float32] = np.zeros(motor_dim, dtype=np.float32)
+        self._d2_rates: NDArray[np.float32] = np.zeros(motor_dim, dtype=np.float32)
+
+        # ── Evidence accumulators (Gold & Shadlen 2007) ───────────────
+        # GPi/SNr integrates D1/D2 spikes over the decision window as
+        # cumulative counts, not instantaneous rates.  This gives integer-
+        # scale evidence with meaningful softmax discrimination.
+        # Separate from rate EMA (used by Active Inference readout).
+        self._spike_count_d1: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
+        self._spike_count_d2: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
 
         # ── Fast epistemic drive (error neuron → D1 excitability) ─────
         self._epistemic_drive: float = 0.0
@@ -580,6 +690,16 @@ class D1D2Actor:
         # ── Receptor dose-response modulation (D2) ───────────────────
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
+
+        # ── Homeostatic synaptic scaling state (Turrigiano 2004) ──────
+        self._homeo_rate_d1: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
+        self._homeo_rate_d2: NDArray[np.float32] = np.zeros(
+            self.action_dim, dtype=np.float32,
+        )
+        self._homeo_decay: float = config.ctx.decay(config.homeo_tau)
+        self._homeo_counter: int = 0
 
         # ── Astrocyte ATP coupling (Krok 1.3) ─────────────────────────
         self._astrocyte: AstrocyteField | None = None
@@ -603,6 +723,14 @@ class D1D2Actor:
     def set_da_level(self, da: float) -> None:
         """Set DA modulation: high DA → D1 excitation, D2 suppression."""
         self._da_level = float(np.clip(da, 0.0, 1.0))
+
+    def set_ne_level(self, ne: float) -> None:
+        """Set NE level for temperature-modulated action selection.
+
+        Reference: Humphries, Stewart & Gurney (2006); Usher & Damasio (2000).
+        NE at 0.5 → focused exploitation; extremes → exploration.
+        """
+        self._ne_level = float(np.clip(ne, 0.0, 1.0))
 
     def set_epistemic_drive(self, error_rate: NDArray[np.float32]) -> None:
         """Fast epistemic path: error neuron error_rate → D1 excitability boost.
@@ -728,29 +856,63 @@ class D1D2Actor:
         )
         self.refrac_d2[self.spikes_d2] = cfg.refrac_period
 
-        # ── Rate EMA ──────────────────────────────────────────────────
+        # ── Rate EMA (for Active Inference readout) ─────────────────────
         rc = 1.0 - self._rate_decay
         self.rate_d1 = self.rate_d1 * self._rate_decay + self.spikes_d1.astype(np.float32) * rc
         self.rate_d2 = self.rate_d2 * self._rate_decay + self.spikes_d2.astype(np.float32) * rc
 
-        # ── Store pathway rates for Active Inference readout ──────────
-        self._d1_rates = self.rate_d1.copy()
-        self._d2_rates = self.rate_d2.copy()
+        # ── Homeostatic rate tracker (slow EMA, Turrigiano 2004) ──────
+        hc = 1.0 - self._homeo_decay
+        self._homeo_rate_d1 = (
+            self._homeo_rate_d1 * self._homeo_decay
+            + self.spikes_d1.astype(np.float32) * hc
+        )
+        self._homeo_rate_d2 = (
+            self._homeo_rate_d2 * self._homeo_decay
+            + self.spikes_d2.astype(np.float32) * hc
+        )
+        self._homeo_counter += 1
 
-        # ── Net evidence: D1 - D2 per action (Go - NoGo) ─────────────
-        motor_d1 = self.rate_d1[:self.motor_dim]
-        motor_d2 = self.rate_d2[:self.motor_dim]
+        # ── Evidence accumulation (Gold & Shadlen 2007) ───────────────
+        # Spike counts over the decision window — integer-scale evidence
+        # for robust action discrimination.
+        self._spike_count_d1 += self.spikes_d1.astype(np.float32)
+        self._spike_count_d2 += self.spikes_d2.astype(np.float32)
+
+        # ── Store per-action aggregated rates (population sum) ────────
+        self._d1_rates = self.rate_d1[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).sum(axis=1)
+        self._d2_rates = self.rate_d2[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).sum(axis=1)
+
+        # ── Net evidence: D1 − D2 per action (Go − NoGo) ─────────────
+        # Use cumulative spike counts over the decision window for
+        # robust discrimination (Gold & Shadlen 2007).
+        motor_d1 = self._spike_count_d1[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).sum(axis=1)
+        motor_d2 = self._spike_count_d2[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).sum(axis=1)
+
+        # ── Action probabilities (Frank 2005: spike-rate evidence) ────
+        # Net evidence = D1 (Go) − D2 (NoGo) per action.
+        # When both rates are zero, net_evidence = 0 for all actions,
+        # giving uniform random exploration — biologically correct
+        # when the BG has no spike-based evidence.
         net_evidence = motor_d1 - motor_d2
 
-        # ── Action probabilities: softmax over spike-based net evidence ─
-        total_rate = np.sum(np.abs(motor_d1)) + np.sum(np.abs(motor_d2))
-        if total_rate < 1e-6:
-            # Network silent → uniform random exploration (no fallback hack)
-            probs = np.ones(self.motor_dim, dtype=np.float32) / self.motor_dim
-        else:
-            shifted = net_evidence - np.max(net_evidence)
-            exp_val = np.exp(shifted)
-            probs = exp_val / (np.sum(exp_val) + 1e-10)
+        # NE-modulated temperature (Humphries, Stewart & Gurney 2006;
+        # Usher & Damasio 2000).  Inverse-U: NE at optimum (0.5) →
+        # low T (focused exploitation); NE at extremes → high T
+        # (exploratory).  Ensures exploration control even when
+        # Active Inference is disabled.
+        temperature = 1.0 + 4.0 * (self._ne_level - 0.5) ** 2
+        shifted = (net_evidence - np.max(net_evidence)) / max(temperature, 0.1)
+        exp_val = np.exp(shifted)
+        probs = exp_val / (np.sum(exp_val) + 1e-10)
         probs = probs.astype(np.float32)
         self._last_probs = probs
 
@@ -765,27 +927,44 @@ class D1D2Actor:
         self._t_since_d2_spike[self.spikes_d2] = 0
 
         # ── DA-modulated Hebbian STDP eligibility (Frank 2005) ────────
-        # D1 (Go): standard Hebbian — pre × post_spike
-        # D2 (NoGo): standard Hebbian — pre × post_spike
+        # D1 (Go): Bi & Poo (2001) asymmetric window — LTP + LTD
+        # D2 (NoGo): same asymmetric window
         # Weight update modulated by TD error sign in update()
+
+        # ── Post-synaptic trace update (Bi & Poo 2001) ─────────────
+        self._x_post_d1 *= self._post_decay
+        self._x_post_d1[self.spikes_d1] += 1.0
+        self._x_post_d2 *= self._post_decay
+        self._x_post_d2[self.spikes_d2] += 1.0
+
+        # D1 eligibility: LTP (pre→post) + LTD (post→pre)
         self.e_d1 *= self._trace_decay
         if np.any(self.spikes_d1):
             d1_idx = np.where(self.spikes_d1)[0]
             ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
             self.e_d1[:, d1_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
+        if np.any(pre_binary > 0.5):
+            pre_idx = pre_binary > 0.5
+            ltd_mask_d1 = (self._t_since_d1_spike <= self._stdp_window).astype(np.float32)
+            self.e_d1[pre_idx, :] -= (self._x_post_d1 * ltd_mask_d1)[np.newaxis, :]
 
+        # D2 eligibility: LTP (pre→post) + LTD (post→pre)
         self.e_d2 *= self._trace_decay
         if np.any(self.spikes_d2):
             d2_idx = np.where(self.spikes_d2)[0]
             ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
             self.e_d2[:, d2_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
+        if np.any(pre_binary > 0.5):
+            pre_idx = pre_binary > 0.5
+            ltd_mask_d2 = (self._t_since_d2_spike <= self._stdp_window).astype(np.float32)
+            self.e_d2[pre_idx, :] -= (self._x_post_d2 * ltd_mask_d2)[np.newaxis, :]
 
         # ── Motor output ──────────────────────────────────────────────
         motor_action = probs * 2.0 - 1.0  # [0,1] → [-1,1]
 
         # ── Internal actions (WM gate, etc.) ──────────────────────────
-        if self.action_dim > self.motor_dim:
-            internal_logits = state_f32 @ self.w_d1[:, self.motor_dim:]
+        if self.action_dim > self._total_motor:
+            internal_logits = state_f32 @ self.w_d1[:, self._total_motor:]
             self.last_internal_action = 1.0 / (
                 1.0 + np.exp(-np.clip(internal_logits, -10, 10))
             )
@@ -801,29 +980,56 @@ class D1D2Actor:
         D2 (NoGo): negative TD → DA dip → strengthen active NoGo synapses (LTP)
 
         No REINFORCE grad_log_pi — purely Hebbian with dopaminergic gating.
-        Soft weight clipping: dw = clip(dw, -0.1, 0.1) per update.
+        Column normalization + Dale’s law provide weight bounds.
         """
-        td = float(np.clip(td_error, -50.0, 50.0))
+        td = float(np.clip(td_error, -200.0, 200.0))
         cfg = self.config
         effective_lr = cfg.actor_lr * self._receptor_lr
+        ltd_ratio = cfg.ltd_ratio
 
-        # D1: positive DA (reward) drives Go pathway LTP
-        dw_d1 = effective_lr * max(td, 0.0) * self.e_d1
-        np.clip(dw_d1, -0.1, 0.1, out=dw_d1)
+        # D1: positive DA -> LTP, negative DA -> LTD (bidirectional)
+        d1_ltp = effective_lr * max(td, 0.0) * self.e_d1
+        d1_ltd = effective_lr * ltd_ratio * max(-td, 0.0) * self.e_d1
+        dw_d1 = d1_ltp - d1_ltd
+        np.clip(dw_d1, -1.0, 1.0, out=dw_d1)
         self.w_d1 += dw_d1
 
-        # D2: negative DA (punishment) drives NoGo pathway LTP
-        dw_d2 = effective_lr * max(-td, 0.0) * self.e_d2
-        np.clip(dw_d2, -0.1, 0.1, out=dw_d2)
+        # D2: negative DA -> LTP, positive DA -> LTD (opposite sign)
+        d2_ltp = effective_lr * max(-td, 0.0) * self.e_d2
+        d2_ltd = effective_lr * ltd_ratio * max(td, 0.0) * self.e_d2
+        dw_d2 = d2_ltp - d2_ltd
+        np.clip(dw_d2, -1.0, 1.0, out=dw_d2)
         self.w_d2 += dw_d2
 
-        # Homeostatic column normalisation + Dale's law
+        # Dale's law: excitatory MSN weights (no sign reversal)
+        np.maximum(self.w_d1, 0.0, out=self.w_d1)
+        np.maximum(self.w_d2, 0.0, out=self.w_d2)
+
+        # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
+        # Per-pathway scaling: D2 gets more upscaling because it fires
+        # less (DA suppresses D2 in Go states, Frank 2005).  This is
+        # biologically correct: D2 homeostasis maintains the NoGo
+        # pathway against DA-driven suppression, preventing premature
+        # action commitment and supporting exploration.
+        if self._homeo_counter > 0 and self._homeo_counter % cfg.homeo_interval == 0:
+            target = self.inh_pool_d1.config.target_sparsity
+            for w, hr in ((self.w_d1, self._homeo_rate_d1),
+                          (self.w_d2, self._homeo_rate_d2)):
+                for j in range(self.action_dim):
+                    actual = max(float(hr[j]), 1e-6)
+                    error = (target - actual) / target
+                    scale = 1.0 + cfg.homeo_max_change * float(
+                        np.clip(error, -1.0, 1.0),
+                    )
+                    w[:, j] *= scale
+                np.maximum(w, 0.0, out=w)  # Maintain Dale's law
+
+        # Column norm safety bound (2× nominal)
         for w in (self.w_d1, self.w_d2):
-            np.maximum(w, 0.0, out=w)  # Dale's law: excitatory weights
             for j in range(self.action_dim):
                 col_norm = float(np.linalg.norm(w[:, j]))
-                if col_norm > cfg.w_clip:
-                    w[:, j] *= cfg.w_clip / col_norm
+                if col_norm > cfg.w_clip * 2.0:
+                    w[:, j] *= (cfg.w_clip * 2.0) / col_norm
 
     def get_action(self) -> int:
         return self._last_action
@@ -842,13 +1048,13 @@ class D1D2Actor:
 
     @property
     def pragmatic_values(self) -> NDArray[np.float32]:
-        """D1 rates as pragmatic value proxy per action."""
-        return self._d1_rates[:self.motor_dim].copy()
+        """Per-action D1 rate (population sum, Georgopoulos 1986)."""
+        return self._d1_rates.copy()
 
     @property
     def cost_values(self) -> NDArray[np.float32]:
-        """D2 rates as cost/risk proxy per action."""
-        return self._d2_rates[:self.motor_dim].copy()
+        """Per-action D2 rate (population sum)."""
+        return self._d2_rates.copy()
 
     def reset_state(self) -> None:
         """Reset transient state. Weights preserved."""
@@ -870,6 +1076,8 @@ class D1D2Actor:
         self.e_d1.fill(0.0)
         self.e_d2.fill(0.0)
         self._x_pre.fill(0.0)
+        self._x_post_d1.fill(0.0)
+        self._x_post_d2.fill(0.0)
         self._t_since_pre.fill(1000)
         self._t_since_d1_spike.fill(1000)
         self._t_since_d2_spike.fill(1000)
@@ -877,6 +1085,8 @@ class D1D2Actor:
         self._last_action = -1
         self._d1_rates.fill(0.0)
         self._d2_rates.fill(0.0)
+        self._spike_count_d1.fill(0.0)
+        self._spike_count_d2.fill(0.0)
         self.inh_pool_d1.reset_state()
         self.inh_pool_d2.reset_state()
 
@@ -886,6 +1096,32 @@ class D1D2Actor:
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
         eff_tau = self.config.tau_e_actor / ne_factor
         self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
+
+    def reset_spike_counts(self) -> None:
+        """Reset evidence accumulators for a new decision cycle.
+
+        Called at the start of each act() to clear accumulated spike
+        counts from the previous decision window.  Models the GPi/SNr
+        reset between decisions (Lo & Wang 2006).
+        """
+        self._spike_count_d1.fill(0.0)
+        self._spike_count_d2.fill(0.0)
+
+    def gate_eligibility(self, selected_action: int) -> None:
+        """Gate eligibility to the selected action channel only.
+
+        DA reinforcement targets the synaptic pathways of the winning
+        action channel (Redgrave, Gurney & Reynolds 2010).  Non-selected
+        motor populations’ eligibility is zeroed so that update() only
+        modifies the selected action’s weights.  Internal (non-motor)
+        neurons are left intact.
+        """
+        for a in range(self.motor_dim):
+            if a != selected_action:
+                start = a * self.n_per_action
+                end = start + self.n_per_action
+                self.e_d1[:, start:end] = 0.0
+                self.e_d2[:, start:end] = 0.0
 
     def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
         """Apply receptor dose-response modulation (Hill equation effects)."""
@@ -899,18 +1135,19 @@ class D1D2Actor:
         Used during theta-sweep planning: efference copy feeds into the
         world model encoder to predict outcome of contemplated actions.
         No spike threshold — captures graded intent (Cisek 2007).
+        Per-action population mean for consistent readout.
         """
         # Sub-threshold voltages relative to rest, normalized
         d1_sub = np.clip(
-            (self.v_d1[:self.motor_dim] - self.config.v_rest)
+            (self.v_d1[:self._total_motor] - self.config.v_rest)
             / (self.config.v_thresh - self.config.v_rest),
             0.0, 1.0,
-        )
+        ).reshape(self.motor_dim, self.n_per_action).mean(axis=1)
         d2_sub = np.clip(
-            (self.v_d2[:self.motor_dim] - self.config.v_rest)
+            (self.v_d2[:self._total_motor] - self.config.v_rest)
             / (self.config.v_thresh - self.config.v_rest),
             0.0, 1.0,
-        )
+        ).reshape(self.motor_dim, self.n_per_action).mean(axis=1)
         return (d1_sub - d2_sub).astype(np.float32)
 
 

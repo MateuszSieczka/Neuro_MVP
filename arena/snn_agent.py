@@ -322,20 +322,31 @@ class SNNAgent(Agent):
                 da_level=wm_da,
             )
 
+        # ── Pass NE level for temperature-modulated exploration ──────
+        self.actor.set_ne_level(self.neuromod.competition_sharpness)
+
         # ── Integrate over substeps (Wang 2002) ──────────────────────
-        # Present the same sensory input for multiple SNN timesteps so
-        # membrane potentials, spike rates, and eligibility traces have
-        # time to reach a meaningful steady state.  Each substep draws
-        # fresh Poisson spikes from the same population rates.
+        # Present the SAME Poisson realisation for every substep so the
+        # network integrates a consistent spatial pattern (Softky &
+        # Koch 1993).  Re-sampling each step destroys the signal.
+        self.actor.reset_spike_counts()  # New decision cycle (Lo & Wang 2006)
+        encoded = self._poisson.encode(pop_rates)       # single draw
+        self._act_value_sum = 0.0
         for _sub in range(self._n_substeps):
-            encoded = self._poisson.encode(pop_rates)
             sensory = self._build_sensory_inputs(encoded, state_f32)
             self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
                 attention=self._attention,
             )
+            self._act_value_sum += self.critic.last_value
         self._last_encoded_state = encoded.copy()
+
+        # ── Action-specific eligibility gating (Redgrave et al. 2010) ─
+        # DA reinforcement targets only the winning action channel.
+        # Gate off non-selected motor eligibility so update() modifies
+        # only the selected action’s synaptic weights.
+        self.actor.gate_eligibility(self.actor.get_action())
 
         # ── Active Inference selection ────────────────────────────────
         if self._use_wm:
@@ -382,8 +393,10 @@ class SNNAgent(Agent):
         effective_reward = reward + intrinsic_r
 
         # ── 3. Critic step on next_state → TD error ──────────────────
-        # Save V_trace baseline before processing next_state.
-        prev_v_trace = self.critic.v_trace
+        # V(s) = population-averaged value over the decision window
+        # (Schultz 1998; Samejima et al. 2005: ventral striatal neurons
+        # encode V through time-integrated firing rate).
+        prev_v = self._act_value_sum / max(1, self._n_substeps)
 
         # Freeze actor eligibility: the DA signal (TD error) should
         # reinforce the DECISION synapses (from act()), not the
@@ -398,30 +411,39 @@ class SNNAgent(Agent):
 
         # Integrate over substeps to let the critic develop a
         # meaningful V(s') estimate (same rationale as act()).
+        # Single Poisson draw — consistent spatial pattern across
+        # substeps (Softky & Koch 1993).
+        next_encoded = self._poisson.encode(next_pop_rates)
+        _v_next_sum = 0.0
         for _sub in range(self._n_substeps):
-            next_encoded = self._poisson.encode(next_pop_rates)
             sensory = self._build_sensory_inputs(next_encoded, next_f32)
             outputs = self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
                 attention=self._attention,
             )
+            _v_next_sum += self.critic.last_value
 
         # Restore actor eligibility to reflect only act(state) traces
         self.actor.e_d1 = _saved_e_d1
         self.actor.e_d2 = _saved_e_d2
 
-        current_v = self.critic.last_value
+        current_v = _v_next_sum / max(1, self._n_substeps)
 
         if is_terminal:
-            td_error = effective_reward - prev_v_trace
+            td_error = effective_reward - prev_v
         else:
             td_error = (
                 effective_reward
                 + self._bg_config.gamma * current_v
-                - prev_v_trace
+                - prev_v
             )
-        td_error = float(np.clip(td_error, -self._agent_cfg.td_clip, self._agent_cfg.td_clip))
+        # TD clip proportional to natural return scale 1/(1-γ)
+        # (Tobler et al. 2005 — adaptive DA coding bounded by
+        # discounted return magnitude).  Hardcoded td_clip can
+        # prevent convergence when V overshoots.
+        _natural_clip = 2.0 / max(1e-4, 1.0 - self._bg_config.gamma)
+        td_error = float(np.clip(td_error, -_natural_clip, _natural_clip))
         self._last_td_error = td_error
 
         # ── 4. Consolidation-gated plasticity ─────────────────────────

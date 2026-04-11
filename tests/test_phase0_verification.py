@@ -34,7 +34,7 @@ class TestAgentConfig:
     def test_defaults_match_old_magic_numbers(self) -> None:
         cfg = AgentConfig()
         assert cfg.intrinsic_reward_weight == 0.1
-        assert cfg.da_offset == 0.5
+        assert cfg.da_offset == 0.0
         assert cfg.td_clip == 50.0
         assert cfg.consolidation_midpoint == 0.7
         assert cfg.consolidation_steepness == 8.0

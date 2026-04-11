@@ -32,8 +32,8 @@ for ep in range(15):
 
     for step in range(500):
         # Check action selection mode BEFORE act
-        total_rate = (np.sum(np.abs(actor.rate_d1[:actor.motor_dim])) +
-                      np.sum(np.abs(actor.rate_d2[:actor.motor_dim])))
+        total_rate = (np.sum(np.abs(actor._d1_rates)) +
+                      np.sum(np.abs(actor._d2_rates)))
         if total_rate < 1e-6:
             random_actions += 1
 

@@ -21,6 +21,7 @@ from .config import (
     ReplayBufferConfig,
     ActiveInferenceConfig,
     BasalGangliaConfig,
+    AgentConfig,
     ReceptorType,
     SynapseType,
     ReceptorProfile,
@@ -48,7 +49,7 @@ from .receptor import receptor_effect, compute_layer_modulation, aggregate_recep
 from .synapse import SynapticChannels
 
 # -- Neuron layers --
-from .neuron import LIFLayer
+from .neuron import LIFLayer, HomeostaticState
 from .competitive_layer import CompetitiveLIFLayer
 from .predictive_coding import PredictiveCodingLayer
 from .pyramidal_neuron import PyramidalLayer

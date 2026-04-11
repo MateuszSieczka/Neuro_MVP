@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "MateuszSieczka",email = "113633794+MateuszSieczka@users.noreply.github.com"}
 ]
-requires-python = "^3.14"
+requires-python = ">=3.11"
 dependencies = [
     "numpy (>=2.4.4,<3.0.0)",
     "matplotlib (>=3.10.8,<4.0.0)",
@@ -13,13 +13,13 @@ dependencies = [
 ]
 
 [tool.poetry]
-packages = [{include = "core"}]
+packages = [{include = "core"}, {include = "arena"}]
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-python_files = ["tests_*.py"]
+python_files = ["test_*.py", "tests_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

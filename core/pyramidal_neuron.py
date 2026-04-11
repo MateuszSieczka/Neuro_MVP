@@ -37,6 +37,7 @@ from .config import (
     init_weights,
 )
 from .competitive_layer import CompetitiveLIFLayer
+from .neuron import HomeostaticState
 
 
 class PyramidalLayer(CompetitiveLIFLayer):
@@ -105,12 +106,11 @@ class PyramidalLayer(CompetitiveLIFLayer):
         )
 
         # ── Local homeostatic state ───────────────────────────────────
-        self.v_thresh_adaptive: NDArray[np.float32] = np.full(
-            num_neurons, ncfg.v_thresh, dtype=np.float32,
+        self._pyr_homeo_state = HomeostaticState(
+            num_neurons, ncfg.v_thresh, hcfg,
         )
-        self.avg_rate: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
+        self.v_thresh_adaptive = self._pyr_homeo_state.v_thresh_adaptive
+        self.avg_rate = self._pyr_homeo_state.avg_rate
 
         # ── Spike timing for causal STDP window (±20ms) ──────────────
         self.t_since_pre_spike: NDArray[np.int32] = np.full(
@@ -269,7 +269,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
     def generate_prediction(self) -> NDArray[np.float32]:
         """Top-down prediction via tied weights (w_apical.T)."""
         raw = self.has_spiked.astype(np.float32) @ self.w_apical.T
-        return np.clip(raw * self.pc_cfg.feedback_strength, 0.0, 1.0)
+        return np.clip(raw * self.pyr_cfg.feedback_strength, 0.0, 1.0)
 
     def set_ach_level(self, ach: float) -> None:
         """ACh → 1.0: bottom-up trust (halve apical boost); ACh → 0.0: full apical."""
@@ -301,17 +301,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
     # ------------------------------------------------------------------
 
     def _update_adaptive_threshold(self) -> None:
-        cfg = self._pyr_homeo
-        self.avg_rate = (
-            self.avg_rate * cfg.homeo_decay
-            + self.has_spiked.astype(np.float32) * (1.0 - cfg.homeo_decay)
-        )
-        rate_error = self.avg_rate - cfg.target_rate
-        self.v_thresh_adaptive += cfg.thresh_adapt_lr * rate_error
-        np.clip(
-            self.v_thresh_adaptive, cfg.thresh_min, cfg.thresh_max,
-            out=self.v_thresh_adaptive,
-        )
+        self._pyr_homeo_state.update(self.has_spiked)
 
     # ------------------------------------------------------------------
     # State management
@@ -325,6 +315,5 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.is_burst.fill(False)
         self.plateau_timer.fill(0)
         self.in_plateau.fill(False)
-        self.v_thresh_adaptive.fill(self.neuron_cfg.v_thresh)
-        self.avg_rate.fill(0.0)
+        self._pyr_homeo_state.reset(self.neuron_cfg.v_thresh)
         self._ach_apical_scale = 1.0

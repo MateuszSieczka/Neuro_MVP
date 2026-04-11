@@ -86,6 +86,10 @@ W `arena/benchmark.py`:
 - `default_seeds: list[int]` do `BenchmarkConfig`
 - `solve_rate_threshold: float = 0.5`
 
+W `arena/task_config.py`:
+
+- Dodać brakujące pole `reward_scale: float = 1.0` do `TaskConfig` — `benchmark.py` przekazuje `task.reward_scale` do `GymEnv`, ale pole nie istnieje w dataclass. Runtime `AttributeError`.
+
 ### Krok 0.2: Usunięcie dostępu do prywatnych atrybutów
 
 W `core/neuromodulator.py` — dodać publiczne property:
@@ -98,6 +102,8 @@ def reward_history(self) -> list[float]
 zamiast `self.neuromod._reward_history` w `snn_agent.py`.
 
 W `arena/snn_agent.py` — property `use_world_model: bool` (publiczne) zamiast `_use_wm`.
+
+**UWAGA:** `self.neuromod._reward_history` w snn_agent NIE ISTNIEJE — `NeuromodulatorSystem` nie posiada atrybutu `_reward_history`. Guard `hasattr()` zawsze zwraca `False`, więc `sleep_gain = 1.0` zawsze. Trzeba dodać `_reward_history: deque[float]` do `NeuromodulatorSystem.__init__()` i populować w `update_tonic_da()`, a następnie wyeksponować przez property.
 
 ### Krok 0.3: Unifikacja logiki homeostazy
 
@@ -140,11 +146,26 @@ pytest = ">=7.0"
 Obecny kod: `self._obs_var += (delta * delta2 - self._obs_var) / self._obs_count`
 Poprawić na: dzielenie przez `self._obs_count - 1` gdy `self._obs_count >= 2` (nieobciążony estymator Bessela).
 
+### Krok 0.7: Naprawić bug w PyramidalLayer.generate_prediction()
+
+**Plik:** `core/pyramidal_neuron.py`, `core/config.py`
+
+`generate_prediction()` odwołuje się do `self.pc_cfg.feedback_strength`, ale `PyramidalLayer` dziedziczy z `CompetitiveLIFLayer`, NIE z `PredictiveCodingLayer` — atrybut `pc_cfg` nie istnieje. Runtime `AttributeError` przy wywołaniu.
+
+Naprawić:
+
+1. Dodać `feedback_strength: float = 0.5` do `PyramidalConfig`
+2. Zmienić `self.pc_cfg.feedback_strength` → `self.pyr_cfg.feedback_strength`
+
 ### Weryfikacja Fazy 0
 
 - `python -m pytest tests/` — wszystkie testy przechodzą bez zmian
 - `grep -rn "self\.\(neuromod\|agent\)\._" arena/` — zero wyników na prywatne atrybuty z zewnątrz
 - Każdy config akceptuje poprawne wartości, rzuca `AssertionError` na niepoprawne
+- `PyramidalLayer().generate_prediction()` nie rzuca `AttributeError`
+- `TaskConfig` posiada pole `reward_scale` — `benchmark.py` nie rzuca `AttributeError`
+
+**NOTA o testach:** Każda kolejna faza (1-4) zmienia publiczne API modułów. Testy będą wymagały aktualizacji po każdej fazie, zachowując tę samą strukturę i cel. Faza 0 jest wyjątkiem — NIE zmienia zachowania, więc testy MUSZĄ przejść bez modyfikacji.
 
 ---
 
@@ -198,6 +219,16 @@ Różne typy neuronów z TYCH SAMYCH równań — różnią się tylko parametra
 - **Late Spiking (SOM+):** a=-2, b=0 → opóźniony firing
 
 Wszystkie warstwy potomne (`CompetitiveLIFLayer`→`AdExCompetitive`, `PredictiveCodingLayer`, `PyramidalLayer`, `ErrorNeuronLayer`, `InhibitoryPool`, `SNNDeepCritic`, `D1D2Actor`) dziedziczą zmianę automatycznie — operują na v, w_adapt zamiast samego v.
+
+**UWAGA implementacyjna:** "Automatycznie" jest uproszczeniem. Następujące warstwy NADPISUJĄ `forward()` z własną logiką membranową i wymagają ręcznej adaptacji do AdEx:
+
+- `CompetitiveLIFLayer.forward()` — wywołuje `super().forward()` → automatyczne
+- `PredictiveCodingLayer.forward()` — własna integracja → ręczna zmiana
+- `PyramidalLayer.forward()` — własna integracja z apical → ręczna zmiana
+- `ErrorNeuronLayer.forward()` — dwie oddzielne populacje (state/error) → ręczna zmiana
+- `InhibitoryPool.forward()` — własna LIF integracja → ręczna zmiana
+- `SNNDeepCritic._forward_pop()` — własna LIF integracja → ręczna zmiana
+- `D1D2Actor.forward()` — bistable MSN dynamics → ręczna zmiana
 
 ### Krok 1.2: Integrator Exponential Euler
 

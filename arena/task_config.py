@@ -39,6 +39,7 @@ class TaskConfig:
     solved_threshold: float
     eval_window: int = 20
     obs_bounds: tuple[np.ndarray, np.ndarray] | None = None
+    reward_scale: float = 1.0
     use_world_model: bool = True
     use_working_memory: bool = True
     description: str = ""

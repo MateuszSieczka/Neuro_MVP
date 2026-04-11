@@ -16,17 +16,28 @@ competitive selection, and spatial attention.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from arena.core import Environment
 from arena.snn_agent import SNNAgent
 from arena.task_config import TaskConfig
 
-# Environments with state_size >= this use columnar architecture
-COLUMNAR_THRESHOLD: int = 16
-# Default receptive field size (each column sees this many inputs)
-DEFAULT_RECEPTIVE_FIELD: int = 4
+
+@dataclass(frozen=True)
+class FactoryConfig:
+    """Agent construction parameters (previously hardcoded)."""
+    columnar_threshold: int = 16
+    default_receptive_field: int = 4
 
 
-def make_agent(task: TaskConfig, env: Environment) -> SNNAgent:
+_DEFAULT_FACTORY = FactoryConfig()
+
+
+def make_agent(
+    task: TaskConfig,
+    env: Environment,
+    factory_cfg: FactoryConfig | None = None,
+) -> SNNAgent:
     """Build an SNNAgent sized for *env*, with universal hyperparameters.
 
     Only structural information (state_size, n_actions) and the
@@ -35,12 +46,13 @@ def make_agent(task: TaskConfig, env: Environment) -> SNNAgent:
     For high-dim environments (state_size >= COLUMNAR_THRESHOLD), the
     columnar architecture is activated with derived receptive field size.
     """
-    use_columnar = env.state_size >= COLUMNAR_THRESHOLD
+    fcfg = factory_cfg or _DEFAULT_FACTORY
+    use_columnar = env.state_size >= fcfg.columnar_threshold
     rf_size: int | None = None
 
     if use_columnar:
-        # Derive receptive field size: largest divisor <= DEFAULT_RECEPTIVE_FIELD
-        rf_size = DEFAULT_RECEPTIVE_FIELD
+        # Derive receptive field size: largest divisor <= default_receptive_field
+        rf_size = fcfg.default_receptive_field
         while env.state_size % rf_size != 0 and rf_size > 1:
             rf_size -= 1
 

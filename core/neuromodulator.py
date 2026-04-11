@@ -68,6 +68,9 @@ class NeuromodulatorSystem:
         # ── Intrinsic progress (world model improvement) ──────────────
         self._episode_pred_errors: deque[float] = deque(maxlen=30)
 
+        # ── Episode return history (for sleep_gain computation) ───────
+        self._reward_history: deque[float] = deque(maxlen=50)
+
         # ── Per-region NE/ACh (Schultz 1998: DA/5-HT global;
         #    Berridge & Waterhouse 2003: NE regional;
         #    Hasselmo 2006: ACh regional) ──────────────────────────────
@@ -160,6 +163,9 @@ class NeuromodulatorSystem:
         """
         cfg = self.config
 
+        # ── Track episode returns for sleep_gain ──────────────────────
+        self._reward_history.append(episode_return)
+
         # ── Welford online mean/variance ──────────────────────────────
         self._welford_n += 1
         delta = episode_return - self._welford_mean
@@ -246,6 +252,11 @@ class NeuromodulatorSystem:
     def planning_horizon(self) -> float:
         """5-HT → temporal discount / planning depth."""
         return self.serotonin
+
+    @property
+    def reward_history(self) -> list[float]:
+        """Episode return history (for sleep_gain computation)."""
+        return list(self._reward_history)
 
     # ------------------------------------------------------------------
     # Per-region NE / ACh
@@ -339,6 +350,7 @@ class NeuromodulatorSystem:
         self._tda_history.clear()
         self._stagnation_factor = 0.0
         self._episode_pred_errors.clear()
+        self._reward_history.clear()
         # Reset per-region to baselines
         for name in self._region_names:
             self._ne_levels[name] = self.noradrenaline

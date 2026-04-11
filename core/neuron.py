@@ -28,6 +28,74 @@ from .config import (
 from .synapse import SynapticChannels
 
 
+class HomeostaticState:
+    """Shared homeostatic threshold adaptation state.
+
+    Used by LIFLayer, CompetitiveLIFLayer, and PyramidalLayer to manage
+    v_thresh_adaptive, avg_rate, and dark matter neurons with identical logic.
+    Eliminates ~60 lines of duplicated homeostatic code.
+    """
+
+    def __init__(
+        self,
+        num_neurons: int,
+        v_thresh: float,
+        config: HomeostaticConfig,
+    ) -> None:
+        self.config = config
+        self.v_thresh_adaptive: NDArray[np.float32] = np.full(
+            num_neurons, v_thresh, dtype=np.float32,
+        )
+        self.avg_rate: NDArray[np.float32] = np.zeros(
+            num_neurons, dtype=np.float32,
+        )
+        self.is_dark_matter: NDArray[np.bool_] = np.zeros(
+            num_neurons, dtype=bool,
+        )
+        n_dark = int(num_neurons * config.dark_matter_ratio)
+        if n_dark > 0:
+            dark_idx = np.random.choice(num_neurons, n_dark, replace=False)
+            self.is_dark_matter[dark_idx] = True
+            self.v_thresh_adaptive[dark_idx] += config.dark_matter_thresh_offset
+
+    def update(self, spikes: NDArray[np.bool_], window_steps: int = 1) -> None:
+        """BCM-derived threshold adaptation toward target_rate.
+
+        Args:
+            spikes: per-neuron spike counts or binary spikes for the window.
+            window_steps: number of steps in evaluation window (1 for per-step).
+        """
+        cfg = self.config
+        spikes_f = spikes.astype(np.float32)
+        spikes_per_step = spikes_f / max(window_steps, 1)
+
+        if window_steps > 1:
+            decay = cfg.ctx.decay(cfg.homeostatic_tau * window_steps)
+        else:
+            decay = cfg.homeo_decay
+
+        self.avg_rate = self.avg_rate * decay + spikes_per_step * (1.0 - decay)
+        rate_error = self.avg_rate - cfg.target_rate
+        self.v_thresh_adaptive += cfg.thresh_adapt_lr * window_steps * rate_error
+        np.clip(
+            self.v_thresh_adaptive, cfg.thresh_min, cfg.thresh_max,
+            out=self.v_thresh_adaptive,
+        )
+
+    def effective_threshold(self, ne_level: float) -> NDArray[np.float32]:
+        """Return threshold with NE-driven drop."""
+        ne_drop = ne_level * self.config.ne_thresh_drop
+        return self.v_thresh_adaptive - ne_drop
+
+    def reset(self, v_thresh: float) -> None:
+        """Reset to initial state (preserves dark matter offsets)."""
+        self.v_thresh_adaptive.fill(v_thresh)
+        self.v_thresh_adaptive[self.is_dark_matter] += (
+            self.config.dark_matter_thresh_offset
+        )
+        self.avg_rate.fill(0.0)
+
+
 class LIFLayer:
     """Vectorised Leaky Integrate-and-Fire population.
 
@@ -111,24 +179,15 @@ class LIFLayer:
 
         # ── Homeostatic state ─────────────────────────────────────────
         self._ne_level: float = 0.0
+        self._homeo_state: HomeostaticState | None = None
         if self.homeo_cfg is not None:
-            self.v_thresh_adaptive: NDArray[np.float32] = np.full(
-                num_neurons, self.neuron_cfg.v_thresh, dtype=np.float32,
+            self._homeo_state = HomeostaticState(
+                num_neurons, self.neuron_cfg.v_thresh, self.homeo_cfg,
             )
-            self.avg_rate: NDArray[np.float32] = np.zeros(
-                num_neurons, dtype=np.float32,
-            )
-            # Dark matter neurons — silent reserve for continual learning
-            self._is_dark_matter: NDArray[np.bool_] = np.zeros(
-                num_neurons, dtype=bool,
-            )
-            n_dark = int(num_neurons * self.homeo_cfg.dark_matter_ratio)
-            if n_dark > 0:
-                dark_idx = np.random.choice(num_neurons, n_dark, replace=False)
-                self._is_dark_matter[dark_idx] = True
-                self.v_thresh_adaptive[dark_idx] += (
-                    self.homeo_cfg.dark_matter_thresh_offset
-                )
+            # Backward-compat aliases
+            self.v_thresh_adaptive = self._homeo_state.v_thresh_adaptive
+            self.avg_rate = self._homeo_state.avg_rate
+            self._is_dark_matter = self._homeo_state.is_dark_matter
 
         # ── Effective decay factors (modulated by NE / ACh) ──────────
         self._mem_decay: float = self.neuron_cfg.mem_decay
@@ -244,9 +303,8 @@ class LIFLayer:
 
     def _effective_threshold(self) -> NDArray[np.float32] | float:
         """Return adaptive threshold (with NE drop) or static threshold."""
-        if self.homeo_cfg is not None:
-            ne_drop = self._ne_level * self.homeo_cfg.ne_thresh_drop
-            return self.v_thresh_adaptive - ne_drop
+        if self._homeo_state is not None:
+            return self._homeo_state.effective_threshold(self._ne_level)
         if hasattr(self, 'v_thresh_adaptive'):
             # Subclass may have created this directly (e.g. CompetitiveLIFLayer)
             ne_drop = self._ne_level * getattr(
@@ -260,24 +318,9 @@ class LIFLayer:
     # ------------------------------------------------------------------
 
     def _update_homeostatic(self) -> None:
-        """BCM-derived threshold adaptation toward target_rate.
-
-        avg_rate ← avg_rate × α + spike × (1 − α)
-        v_thresh += lr × (avg_rate − target_rate)
-        """
-        cfg = self.homeo_cfg
-        assert cfg is not None
-
-        self.avg_rate = (
-            self.avg_rate * cfg.homeo_decay
-            + self.has_spiked.astype(np.float32) * (1.0 - cfg.homeo_decay)
-        )
-        rate_error = self.avg_rate - cfg.target_rate
-        self.v_thresh_adaptive += cfg.thresh_adapt_lr * rate_error
-        np.clip(
-            self.v_thresh_adaptive, cfg.thresh_min, cfg.thresh_max,
-            out=self.v_thresh_adaptive,
-        )
+        """BCM-derived threshold adaptation toward target_rate."""
+        assert self._homeo_state is not None
+        self._homeo_state.update(self.has_spiked)
 
     # ------------------------------------------------------------------
     # Synaptic scaling (Turrigiano 2008)
@@ -384,13 +427,8 @@ class LIFLayer:
         if self.channels is not None:
             self.channels.reset()
 
-        if self.homeo_cfg is not None:
-            self.v_thresh_adaptive.fill(self.neuron_cfg.v_thresh)
-            if hasattr(self, '_is_dark_matter'):
-                self.v_thresh_adaptive[self._is_dark_matter] += (
-                    self.homeo_cfg.dark_matter_thresh_offset
-                )
-            self.avg_rate.fill(0.0)
+        if self._homeo_state is not None:
+            self._homeo_state.reset(self.neuron_cfg.v_thresh)
         self._ne_level = 0.0
 
         # Reset effective decay factors to base values

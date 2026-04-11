@@ -26,6 +26,7 @@ from core.basal_ganglia import (
 )
 from core.columnar import build_columnar_network, split_input
 from core.config import (
+    AgentConfig,
     AttentionConfig,
     BasalGangliaConfig,
     EpisodicMemoryConfig,
@@ -74,6 +75,7 @@ class SNNAgent(Agent):
         ep_config: EpisodicMemoryConfig | None = None,
         rb_config: ReplayBufferConfig | None = None,
         wmem_config: WorkingMemoryConfig | None = None,
+        agent_cfg: AgentConfig | None = None,
         use_world_model: bool = True,
         use_working_memory: bool = True,
         use_columnar: bool = False,
@@ -83,6 +85,7 @@ class SNNAgent(Agent):
     ) -> None:
         self.state_size = state_size
         self.n_actions = n_actions
+        self._agent_cfg = agent_cfg or AgentConfig()
         self._use_wm = use_world_model
         self._use_working_memory = use_working_memory and use_world_model
         self._use_columnar = use_columnar
@@ -148,7 +151,7 @@ class SNNAgent(Agent):
         self._build_graph()
 
         # ── Backward compat: BG facade for replay_buffer/sleep ────────
-        self.bg = _BGFacade(self.critic, self.actor, self._bg_config)
+        self.bg = _BGFacade(self.critic, self.actor, self._bg_config, self._agent_cfg)
 
         # ── Transient state ───────────────────────────────────────────
         self._last_td_error: float = 0.0
@@ -159,6 +162,15 @@ class SNNAgent(Agent):
         self._smooth_noise: float = 1.0
         self._best_episode_return: float = -np.inf
         self._last_encoded_state: NDArray[np.float32] | None = None
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+
+    @property
+    def use_world_model(self) -> bool:
+        """Whether the world model is active."""
+        return self._use_wm
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -268,7 +280,7 @@ class SNNAgent(Agent):
 
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
         da_level = float(np.clip(
-            self.neuromod.learning_rate_modulation + 0.5, 0.0, 1.0,
+            self.neuromod.learning_rate_modulation + self._agent_cfg.da_offset, 0.0, 1.0,
         ))
         self.actor.set_da_level(da_level)
 
@@ -332,7 +344,8 @@ class SNNAgent(Agent):
             self._last_curiosity = 0.0
 
         # ── 2. Intrinsic reward ───────────────────────────────────────
-        intrinsic_weight = 0.1 * (1.0 - self.neuromod.learning_rate_modulation)
+        acfg = self._agent_cfg
+        intrinsic_weight = acfg.intrinsic_reward_weight * (1.0 - self.neuromod.learning_rate_modulation)
         intrinsic_r = max(intrinsic_weight, 0.0) * self._last_curiosity
         effective_reward = reward + intrinsic_r
 
@@ -359,12 +372,15 @@ class SNNAgent(Agent):
                 + self._bg_config.gamma * current_v
                 - prev_v_trace
             )
-        td_error = float(np.clip(td_error, -50.0, 50.0))
+        td_error = float(np.clip(td_error, -self._agent_cfg.td_clip, self._agent_cfg.td_clip))
         self._last_td_error = td_error
 
         # ── 4. Consolidation-gated plasticity ─────────────────────────
         gate = self.neuromod.consolidation_gate
-        plasticity_scale = 0.8 + 0.2 / (1.0 + np.exp(8.0 * (gate - 0.7)))
+        acfg = self._agent_cfg
+        plasticity_scale = acfg.consolidation_floor + (1.0 - acfg.consolidation_floor) / (
+            1.0 + np.exp(acfg.consolidation_steepness * (gate - acfg.consolidation_midpoint))
+        )
 
         self.critic.update(td_error * plasticity_scale)
         self.actor.update(td_error * plasticity_scale)
@@ -435,8 +451,9 @@ class SNNAgent(Agent):
                 self.neuromod.planning_horizon,
                 getattr(self.neuromod, 'tonic_da', 0.0),
             )
+            acfg = self._agent_cfg
             self._smooth_noise = (
-                self._smooth_noise * 0.8 + target_noise * 0.2
+                self._smooth_noise * acfg.noise_smoothing + target_noise * (1.0 - acfg.noise_smoothing)
             )
 
         # ── 9. Store experience ───────────────────────────────────────
@@ -493,15 +510,16 @@ class SNNAgent(Agent):
                 self._best_episode_return = self._episode_return
 
             sleep_gain = 1.0
-            if (
-                hasattr(self.neuromod, '_reward_history')
-                and len(self.neuromod._reward_history) >= 5
-            ):
-                r_arr = np.array(self.neuromod._reward_history)
+            acfg = self._agent_cfg
+            rh = self.neuromod.reward_history
+            if len(rh) >= 5:
+                r_arr = np.array(rh)
                 r_mean = float(np.mean(r_arr))
                 r_std = float(np.std(r_arr)) + 1e-8
                 quality = (self._episode_return - r_mean) / r_std
-                sleep_gain = float(np.clip(1.0 + 0.5 * quality, 1.0, 2.5))
+                sleep_gain = float(np.clip(
+                    1.0 + acfg.sleep_gain_scale * quality, 1.0, acfg.sleep_gain_max,
+                ))
 
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,
@@ -541,10 +559,12 @@ class _BGFacade:
         critic: SNNDeepCritic,
         actor: D1D2Actor,
         config: BasalGangliaConfig,
+        agent_cfg: AgentConfig | None = None,
     ) -> None:
         self.critic = critic
         self.actor = actor
         self.config = config
+        self._agent_cfg = agent_cfg or AgentConfig()
 
     @property
     def last_v(self) -> float:
@@ -564,7 +584,7 @@ class _BGFacade:
         serotonin: float,
         tonic_da: float,
     ) -> float:
-        min_exploration = 0.15
+        min_exploration = self._agent_cfg.min_exploration
         da_noise = max(0.3, 1.0 - tonic_da)
         sero_noise = max(0.3, 1.0 - serotonin)
         return max(min_exploration, da_noise * sero_noise)

@@ -23,7 +23,7 @@ from .config import (
     HomeostaticConfig,
     CompetitiveConfig,
 )
-from .neuron import LIFLayer
+from .neuron import LIFLayer, HomeostaticState
 
 
 class CompetitiveLIFLayer(LIFLayer):
@@ -80,25 +80,14 @@ class CompetitiveLIFLayer(LIFLayer):
         self._current_window_size: int = 0
         self._phase_reset_pending: bool = False
 
-        # ── Homeostatic state (managed locally, not by parent) ────────
-        self.v_thresh_adaptive: NDArray[np.float32] = np.full(
-            num_neurons, ncfg.v_thresh, dtype=np.float32,
+        # ── Homeostatic state (via shared HomeostaticState) ───────────
+        self._homeo_kwta_state = HomeostaticState(
+            num_neurons, ncfg.v_thresh, self._homeo_kwta,
         )
-        self.avg_rate: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
-
-        # ── Dark matter neurons ───────────────────────────────────────
-        self._is_dark_matter: NDArray[np.bool_] = np.zeros(
-            num_neurons, dtype=bool,
-        )
-        n_dark = int(num_neurons * self._homeo_kwta.dark_matter_ratio)
-        if n_dark > 0:
-            dark_idx = np.random.choice(num_neurons, n_dark, replace=False)
-            self._is_dark_matter[dark_idx] = True
-            self.v_thresh_adaptive[dark_idx] += (
-                self._homeo_kwta.dark_matter_thresh_offset
-            )
+        # Expose arrays directly for backward compat
+        self.v_thresh_adaptive = self._homeo_kwta_state.v_thresh_adaptive
+        self.avg_rate = self._homeo_kwta_state.avg_rate
+        self._is_dark_matter = self._homeo_kwta_state.is_dark_matter
 
     # ------------------------------------------------------------------
     # Oscillator interface
@@ -185,7 +174,6 @@ class CompetitiveLIFLayer(LIFLayer):
 
     def _update_kwta_homeostasis(self, window_steps: int) -> None:
         """Update adaptive threshold using window-averaged firing rate."""
-        cfg = self._homeo_kwta
         spikes_f = self.window_spike_counts.astype(np.float32)
 
         # Only count winners' spikes for rate estimation
@@ -194,29 +182,14 @@ class CompetitiveLIFLayer(LIFLayer):
             losers_mask[self.last_winners] = False
             spikes_f[losers_mask] = 0.0
 
-        spikes_per_step = spikes_f / window_steps
-        ctx = cfg.ctx
-        decay = ctx.decay(cfg.homeostatic_tau * window_steps)
-
-        self.avg_rate = (
-            self.avg_rate * decay
-            + spikes_per_step * (1.0 - decay)
-        )
-        rate_error = self.avg_rate - cfg.target_rate
-        self.v_thresh_adaptive += cfg.thresh_adapt_lr * window_steps * rate_error
-        np.clip(
-            self.v_thresh_adaptive,
-            cfg.thresh_min, cfg.thresh_max,
-            out=self.v_thresh_adaptive,
-        )
+        self._homeo_kwta_state.update(spikes_f.astype(bool), window_steps)
 
     # ------------------------------------------------------------------
     # Override threshold to use our adaptive threshold
     # ------------------------------------------------------------------
 
     def _effective_threshold(self) -> NDArray[np.float32]:
-        ne_drop = self._ne_level * self._homeo_kwta.ne_thresh_drop
-        return self.v_thresh_adaptive - ne_drop
+        return self._homeo_kwta_state.effective_threshold(self._ne_level)
 
     # ------------------------------------------------------------------
     # State management
@@ -231,9 +204,4 @@ class CompetitiveLIFLayer(LIFLayer):
         super().reset_state()
         self._reset_window()
         self.last_winners = np.array([], dtype=np.int32)
-        self.v_thresh_adaptive.fill(self.neuron_cfg.v_thresh)
-        if hasattr(self, '_is_dark_matter'):
-            self.v_thresh_adaptive[self._is_dark_matter] += (
-                self._homeo_kwta.dark_matter_thresh_offset
-            )
-        self.avg_rate.fill(0.0)
+        self._homeo_kwta_state.reset(self.neuron_cfg.v_thresh)

@@ -34,6 +34,20 @@ from arena.task_config import TaskConfig, get as get_task
 
 
 # =====================================================================
+# Benchmark configuration
+# =====================================================================
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    """Benchmark evaluation parameters (previously hardcoded)."""
+    default_seeds: tuple[int, ...] = (1, 17, 42, 99, 145, 256, 500)
+    solve_rate_threshold: float = 0.5
+
+
+_DEFAULT_BENCHMARK_CFG = BenchmarkConfig()
+
+
+# =====================================================================
 # Result containers
 # =====================================================================
 
@@ -103,6 +117,7 @@ class Benchmark:
         env_id: str,
         seeds: Sequence[int] | None = None,
         verbose: bool = True,
+        benchmark_cfg: BenchmarkConfig | None = None,
     ) -> BenchmarkResult:
         """
         Execute the full benchmark for *env_id* across all seeds.
@@ -115,9 +130,11 @@ class Benchmark:
             Random seeds to use.  Defaults to the canonical set.
         verbose : bool
             Print per-seed progress lines.
+        benchmark_cfg : BenchmarkConfig, optional
+            Benchmark evaluation parameters.
         """
-        DEFAULT_SEEDS = [1, 17, 42, 99, 145, 256, 500]
-        seeds = list(seeds) if seeds is not None else DEFAULT_SEEDS
+        bcfg = benchmark_cfg or _DEFAULT_BENCHMARK_CFG
+        seeds = list(seeds) if seeds is not None else list(bcfg.default_seeds)
 
         task = get_task(env_id)
         result = BenchmarkResult(task=task)

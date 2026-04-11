@@ -114,6 +114,10 @@ class NeuronConfig(BaseConfig):
     i_thresh: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
+        assert self.v_reset < self.v_thresh, f"v_reset ({self.v_reset}) must be < v_thresh ({self.v_thresh})"
+        assert self.v_rest < self.v_thresh, f"v_rest ({self.v_rest}) must be < v_thresh ({self.v_thresh})"
+        assert self.refrac_period >= 0, f"refrac_period must be >= 0, got {self.refrac_period}"
         object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
         object.__setattr__(self, 'mem_gain', self.ctx.complement(self.tau_m))
         gap = abs(self.v_thresh - self.v_rest)
@@ -149,6 +153,10 @@ class STDPConfig(BaseConfig):
     elig_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_plus > 0, f"tau_plus must be positive, got {self.tau_plus}"
+        assert self.tau_minus > 0, f"tau_minus must be positive, got {self.tau_minus}"
+        assert self.a_plus > 0, f"a_plus must be positive, got {self.a_plus}"
+        assert self.tau_eligibility > 0, f"tau_eligibility must be positive, got {self.tau_eligibility}"
         object.__setattr__(self, 'pre_decay', self.ctx.decay(self.tau_plus))
         object.__setattr__(self, 'post_decay', self.ctx.decay(self.tau_minus))
         object.__setattr__(self, 'elig_decay', self.ctx.decay(self.tau_eligibility))
@@ -182,6 +190,10 @@ class HomeostaticConfig(BaseConfig):
     thresh_adapt_lr: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert 0 < self.target_rate < 1, f"target_rate must be in (0, 1), got {self.target_rate}"
+        assert self.homeostatic_tau > 0, f"homeostatic_tau must be positive, got {self.homeostatic_tau}"
+        assert self.thresh_min < self.thresh_max, f"thresh_min ({self.thresh_min}) must be < thresh_max ({self.thresh_max})"
+        assert 0 <= self.dark_matter_ratio <= 1, f"dark_matter_ratio must be in [0, 1], got {self.dark_matter_ratio}"
         object.__setattr__(self, 'homeo_decay', self.ctx.decay(self.homeostatic_tau))
         # BCM-derived: lr = 1 / (tau × target_rate)
         lr = 1.0 / (self.homeostatic_tau * max(self.target_rate, 1e-6))
@@ -228,6 +240,10 @@ class SynapseConfig(BaseConfig):
     gaba_b_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_ampa > 0, f"tau_ampa must be positive, got {self.tau_ampa}"
+        assert self.tau_nmda > 0, f"tau_nmda must be positive, got {self.tau_nmda}"
+        assert self.tau_ampa < self.tau_nmda, f"tau_ampa ({self.tau_ampa}) must be < tau_nmda ({self.tau_nmda})"
+        assert self.mg_concentration > 0, f"mg_concentration must be positive, got {self.mg_concentration}"
         object.__setattr__(self, 'ampa_decay', self.ctx.decay(self.tau_ampa))
         object.__setattr__(self, 'nmda_decay', self.ctx.decay(self.tau_nmda))
         object.__setattr__(self, 'gaba_a_decay', self.ctx.decay(self.tau_gaba_a))
@@ -257,6 +273,11 @@ class CompetitiveConfig(BaseConfig):
     target_sparsity: float = 0.15  # Fraction of neurons active per window
     inhibition_strength: float = 1.5  # Multiplier on i_inh (1.0 = just-sufficient)
     window_ms: float = 100.0  # k-WTA evaluation window (ms)
+
+    def __post_init__(self) -> None:
+        assert 0 < self.target_sparsity < 1, f"target_sparsity must be in (0, 1), got {self.target_sparsity}"
+        assert self.inhibition_strength > 0, f"inhibition_strength must be positive, got {self.inhibition_strength}"
+        assert self.window_ms > 0, f"window_ms must be positive, got {self.window_ms}"
 
     @staticmethod
     def derive_k(target_sparsity: float, num_neurons: int) -> int:
@@ -297,6 +318,9 @@ class PredictiveCodingConfig(BaseConfig):
     feedback_learning_rate: float = 0.005
     feedback_norm: bool = True
 
+    def __post_init__(self) -> None:
+        assert self.feedback_learning_rate > 0, f"feedback_learning_rate must be positive, got {self.feedback_learning_rate}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class PyramidalConfig(BaseConfig):
@@ -322,11 +346,15 @@ class PyramidalConfig(BaseConfig):
     # Ca²⁺ spike voltage-dependent activation (Larkum 2013)
     ca_v_half: float = 0.4  # Half-activation of apical Ca²⁺ channel
     ca_k: float = 0.1       # Activation steepness
+    # Top-down prediction scaling for generate_prediction()
+    feedback_strength: float = 0.5
 
     # ── Derived ───────────────────────────────────────────────────────
     apical_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_apical > 0, f"tau_apical must be positive, got {self.tau_apical}"
+        assert self.burst_stdp_factor > 0, f"burst_stdp_factor must be positive, got {self.burst_stdp_factor}"
         object.__setattr__(self, 'apical_decay', self.ctx.decay(self.tau_apical))
 
 
@@ -357,6 +385,10 @@ class ErrorNeuronConfig(BaseConfig):
     error_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.n_state > 0, f"n_state must be positive, got {self.n_state}"
+        assert self.n_error > 0, f"n_error must be positive, got {self.n_error}"
+        assert self.tau_state > 0, f"tau_state must be positive, got {self.tau_state}"
+        assert self.tau_error > 0, f"tau_error must be positive, got {self.tau_error}"
         object.__setattr__(self, 'state_decay', self.ctx.decay(self.tau_state))
         object.__setattr__(self, 'error_decay', self.ctx.decay(self.tau_error))
 
@@ -393,6 +425,9 @@ class InhibitoryPoolConfig(BaseConfig):
     inh_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.n_interneurons > 0, f"n_interneurons must be positive, got {self.n_interneurons}"
+        assert self.tau_m_inh > 0, f"tau_m_inh must be positive, got {self.tau_m_inh}"
+        assert 0 < self.target_sparsity < 1, f"target_sparsity must be in (0, 1), got {self.target_sparsity}"
         object.__setattr__(self, 'inh_decay', self.ctx.decay(self.tau_m_inh))
 
 
@@ -448,6 +483,11 @@ class NeuromodulatorConfig(BaseConfig):
     sero_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_da > 0, f"tau_da must be positive, got {self.tau_da}"
+        assert self.tau_ach > 0, f"tau_ach must be positive, got {self.tau_ach}"
+        assert self.tau_ne > 0, f"tau_ne must be positive, got {self.tau_ne}"
+        assert self.tau_sero > 0, f"tau_sero must be positive, got {self.tau_sero}"
+        assert 0 <= self.tonic_da_decay <= 1, f"tonic_da_decay must be in [0, 1], got {self.tonic_da_decay}"
         object.__setattr__(self, 'da_decay', self.ctx.decay(self.tau_da))
         object.__setattr__(self, 'ach_decay', self.ctx.decay(self.tau_ach))
         object.__setattr__(self, 'ne_decay', self.ctx.decay(self.tau_ne))
@@ -547,6 +587,11 @@ class OscillatorConfig(BaseConfig):
     ne_theta_shift: float = 2.0   # Hz added at NE=1
     sero_theta_shift: float = -1.0  # Hz subtracted at 5-HT=1 (longer cycles)
 
+    def __post_init__(self) -> None:
+        assert 0 < self.theta_min_hz <= self.theta_freq_hz <= self.theta_max_hz, "theta freq range invalid"
+        assert 0 < self.gamma_min_hz <= self.gamma_freq_hz <= self.gamma_max_hz, "gamma freq range invalid"
+        assert 0 <= self.pac_depth <= 1, f"pac_depth must be in [0, 1], got {self.pac_depth}"
+
 
 # =====================================================================
 # Astrocyte & Glial
@@ -579,6 +624,9 @@ class AstrocyteConfig(BaseConfig):
     d_serine_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.n_zones > 0, f"n_zones must be positive, got {self.n_zones}"
+        assert self.tau_ca > 0, f"tau_ca must be positive, got {self.tau_ca}"
+        assert self.gain_max >= self.gain_baseline, f"gain_max ({self.gain_max}) must be >= gain_baseline ({self.gain_baseline})"
         object.__setattr__(self, 'ca_decay', self.ctx.decay(self.tau_ca))
         # D-Serine decays with τ ≈ 200ms (gliotransmitter clearance)
         object.__setattr__(self, 'd_serine_decay', self.ctx.decay(200.0))
@@ -612,6 +660,8 @@ class AttentionConfig(BaseConfig):
     ior_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.base_temperature > 0, f"base_temperature must be positive, got {self.base_temperature}"
+        assert self.ior_tau > 0, f"ior_tau must be positive, got {self.ior_tau}"
         object.__setattr__(self, 'ior_decay', self.ctx.decay(self.ior_tau))
 
     def ne_modulated_temperature(self, ne: float) -> float:
@@ -654,6 +704,8 @@ class WorkingMemoryConfig(BaseConfig):
     content_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
+        assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
+        assert self.v_reset < self.v_thresh, f"v_reset ({self.v_reset}) must be < v_thresh ({self.v_thresh})"
         object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
         object.__setattr__(self, 'content_decay', self.ctx.decay(self.tau_m))
 
@@ -676,6 +728,10 @@ class EpisodicMemoryConfig(BaseConfig):
     # Consolidation resistance
     consolidation_threshold: int = 3  # Replay count to become resistant
 
+    def __post_init__(self) -> None:
+        assert self.capacity > 0, f"capacity must be positive, got {self.capacity}"
+        assert 0 < self.similarity_thresh <= 1, f"similarity_thresh must be in (0, 1], got {self.similarity_thresh}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class SequenceMemoryConfig(BaseConfig):
@@ -686,6 +742,11 @@ class SequenceMemoryConfig(BaseConfig):
     # DG-like pattern separation (D5)
     expansion_factor: int = 4     # DG expansion ratio (Rolls 2013)
     sparsity_k: float = 0.1       # Fraction of active neurons after k-WTA
+
+    def __post_init__(self) -> None:
+        assert self.learning_rate > 0, f"learning_rate must be positive, got {self.learning_rate}"
+        assert 0 < self.decay <= 1, f"decay must be in (0, 1], got {self.decay}"
+        assert self.max_weight > 0, f"max_weight must be positive, got {self.max_weight}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -702,6 +763,11 @@ class ReplayBufferConfig(BaseConfig):
     sws_replay_fraction: float = 0.7  # Fraction of sleep budget for SWS
     rem_replay_fraction: float = 0.3  # Fraction for REM
     gamma: float = 0.99
+
+    def __post_init__(self) -> None:
+        assert self.capacity > 0, f"capacity must be positive, got {self.capacity}"
+        assert 0 < self.sws_replay_fraction + self.rem_replay_fraction <= 1, "replay fractions must sum to <= 1"
+        assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"
 
 
 # =====================================================================
@@ -721,6 +787,11 @@ class WorldModelConfig(BaseConfig):
     # Multi-step rehearsal (Friston et al. 2015)
     max_rehearsal_depth: int = 3  # Planning depth (modulated by 5-HT)
 
+    def __post_init__(self) -> None:
+        assert self.hidden_size > 0, f"hidden_size must be positive, got {self.hidden_size}"
+        assert self.decode_lr > 0, f"decode_lr must be positive, got {self.decode_lr}"
+        assert self.n_neurons_per_dim > 0, f"n_neurons_per_dim must be positive, got {self.n_neurons_per_dim}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class ActiveInferenceConfig(BaseConfig):
@@ -733,10 +804,41 @@ class ActiveInferenceConfig(BaseConfig):
     pragmatic_temperature: float = 1.0
     uncertainty_method: str = "novelty"
 
+    def __post_init__(self) -> None:
+        assert self.pragmatic_temperature > 0, f"pragmatic_temperature must be positive, got {self.pragmatic_temperature}"
+        assert self.uncertainty_method in ("novelty", "entropy", "variance"), (
+            f"uncertainty_method must be one of novelty/entropy/variance, got {self.uncertainty_method}"
+        )
+
 
 # =====================================================================
 # Basal Ganglia
 # =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class AgentConfig(BaseConfig):
+    """Agent-level parameters extracted from snn_agent.py magic numbers.
+
+    These control reward shaping, plasticity gating, exploration dynamics,
+    and sleep scheduling — previously hardcoded in SNNAgent.observe().
+    """
+    intrinsic_reward_weight: float = 0.1       # curiosity weight in effective_reward
+    da_offset: float = 0.5                     # shift for DA → learning_rate_modulation
+    td_clip: float = 50.0                      # gradient clipping on TD error
+    consolidation_midpoint: float = 0.7        # sigmoid inflection for consolidation gate
+    consolidation_steepness: float = 8.0       # sigmoid steepness
+    consolidation_floor: float = 0.8           # minimum plasticity scale
+    noise_smoothing: float = 0.8               # EMA coefficient for exploration noise
+    min_exploration: float = 0.15              # exploration noise floor
+    sleep_gain_scale: float = 0.5              # quality → sleep_gain multiplier
+    sleep_gain_max: float = 2.5                # sleep_gain ceiling
+
+    def __post_init__(self) -> None:
+        assert self.td_clip > 0, f"td_clip must be positive, got {self.td_clip}"
+        assert 0 < self.consolidation_floor <= 1, f"consolidation_floor must be in (0, 1], got {self.consolidation_floor}"
+        assert 0 < self.min_exploration < 1, f"min_exploration must be in (0, 1), got {self.min_exploration}"
+        assert self.sleep_gain_max > 0, f"sleep_gain_max must be positive, got {self.sleep_gain_max}"
+
 
 @dataclass(frozen=True, kw_only=True)
 class BasalGangliaConfig(BaseConfig):
@@ -774,6 +876,13 @@ class BasalGangliaConfig(BaseConfig):
     d2_bias: float = 0.4    # D2 pathway relative strength at DA=0.5
     # Exploration
     exploration_noise: float = 0.3
+
+    def __post_init__(self) -> None:
+        assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"
+        assert self.critic_lr > 0, f"critic_lr must be positive, got {self.critic_lr}"
+        assert self.actor_lr > 0, f"actor_lr must be positive, got {self.actor_lr}"
+        assert self.tau_m_msn_up > 0, f"tau_m_msn_up must be positive, got {self.tau_m_msn_up}"
+        assert self.tau_m_critic > 0, f"tau_m_critic must be positive, got {self.tau_m_critic}"
 
 
 # =====================================================================

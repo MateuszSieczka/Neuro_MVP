@@ -72,8 +72,8 @@ class GymEnv(Environment):
             self._use_running = False
         else:
             self._obs_mean = np.zeros(self._obs_dim, dtype=np.float64)
-            self._obs_var = np.ones(self._obs_dim, dtype=np.float64)
-            self._obs_count = 1e-4
+            self._obs_M2 = np.zeros(self._obs_dim, dtype=np.float64)
+            self._obs_count = 0
             self._obs_std = np.ones(self._obs_dim, dtype=np.float64)
             self._use_running = True
 
@@ -93,8 +93,9 @@ class GymEnv(Environment):
         delta = obs - self._obs_mean
         self._obs_mean += delta / self._obs_count
         delta2 = obs - self._obs_mean
-        self._obs_var += (delta * delta2 - self._obs_var) / self._obs_count
-        self._obs_std = np.sqrt(np.maximum(self._obs_var, 1e-6))
+        self._obs_M2 += delta * delta2
+        if self._obs_count >= 2:
+            self._obs_std = np.sqrt(np.maximum(self._obs_M2 / (self._obs_count - 1), 1e-6))
 
     def reset(self, *, seed: int | None = None) -> np.ndarray:
         kwargs: dict[str, Any] = {}

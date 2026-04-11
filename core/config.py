@@ -81,20 +81,49 @@ class BaseConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class NeuronConfig(BaseConfig):
-    """Leaky Integrate-and-Fire parameters.
+    """Adaptive Exponential Integrate-and-Fire (AdEx) parameters.
+
+    Reference: Brette & Gerstner (2005) "Adaptive Exponential
+    Integrate-and-Fire Model as an Effective Description of Neuronal Activity"
+
+    Membrane equation:
+      C_m dV/dt = -g_L(V - E_L) + g_L Δ_T exp((V - V_T)/Δ_T) + I_syn - w
+
+    Adaptation equation:
+      τ_w dw/dt = a(V - E_L) - w
+
+    After spike (V ≥ V_cutoff):
+      V ← V_reset,  w ← w + b
+
+    Neuron types from SAME equations (different params):
+      Regular Spiking  (RS):  a=4, b=80.5, τ_w=144  (default)
+      Fast Spiking     (FS):  a=0, b=0,    τ_w=144  (no adaptation)
+      Intrinsic Burst  (IB):  a=2, b=60,   τ_w=20   (fast adapt → burst)
+      Late Spiking     (LS):  a=-2, b=0               (delayed firing)
 
     Biological reference values:
-      v_rest  = -70 mV  (cortical pyramidal resting potential)
-      v_thresh = -55 mV  (Na⁺ spike threshold, McCormick et al. 1985)
-      v_reset = -75 mV   (post-spike AHP)
-      tau_m   = 20 ms    (cortical pyramidal, Destexhe & Paré 1999)
-      refrac  = 2 ms     (absolute refractory, Bean 2007)
+      E_L = v_rest = -70 mV  (cortical pyramidal resting potential)
+      V_T = v_thresh = -55 mV  (Na⁺ spike threshold, McCormick et al. 1985)
+      V_reset = -75 mV   (post-spike AHP)
+      g_L = 30 nS    (Destexhe & Paré 1999)
+      C_m = 281 pF   (Brette & Gerstner 2005)
+      refrac = 2 ms  (absolute refractory, Bean 2007)
     """
+    # ── LIF-compatible fields (E_L = v_rest, V_T = v_thresh) ─────────
     v_rest: float = -70.0
     v_thresh: float = -55.0
     v_reset: float = -75.0
     tau_m: float = 20.0
     refrac_period: int = 2  # steps (= ms at dt=1)
+
+    # ── AdEx-specific fields (Brette & Gerstner 2005) ────────────────
+    delta_t: float = 2.0           # Spike initiation sharpness (mV)
+    v_spike_cutoff: float = -30.0  # Spike detection threshold (mV), above V_T
+    tau_w: float = 144.0           # Adaptation current time constant (ms)
+    a: float = 4.0                 # Subthreshold adaptation conductance (nS)
+    b: float = 80.5                # Spike-triggered adaptation increment (pA)
+    g_L: float = 30.0              # Leak conductance (nS, Destexhe & Paré 1999)
+    C_m: float = 281.0             # Membrane capacitance (pF)
 
     # Synaptic scaling (Turrigiano 2008)
     scaling_interval: int = 1000  # steps between homeostatic scaling events
@@ -104,7 +133,7 @@ class NeuronConfig(BaseConfig):
     ach_membrane_compression: float = 1.0  # ACh → up to (1 + factor)× τ_m compression
 
     # ── Derived (computed in __post_init__) ───────────────────────────
-    # Membrane decay factor per timestep
+    # Membrane decay factor per timestep (LIF-compat, used by subclasses)
     mem_decay: float = field(init=False, default=0.0)
     # Membrane gain complement (1 - decay)
     mem_gain: float = field(init=False, default=0.0)
@@ -112,12 +141,23 @@ class NeuronConfig(BaseConfig):
     gap: float = field(init=False, default=0.0)
     # Minimum current to reach threshold from rest in one tau_m
     i_thresh: float = field(init=False, default=0.0)
+    # Adaptation decay: exp(-dt / tau_w)
+    w_decay: float = field(init=False, default=0.0)
+    # Adaptation gain: 1 - exp(-dt / tau_w)
+    w_gain: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
         assert self.v_reset < self.v_thresh, f"v_reset ({self.v_reset}) must be < v_thresh ({self.v_thresh})"
         assert self.v_rest < self.v_thresh, f"v_rest ({self.v_rest}) must be < v_thresh ({self.v_thresh})"
         assert self.refrac_period >= 0, f"refrac_period must be >= 0, got {self.refrac_period}"
+        assert self.delta_t > 0, f"delta_t must be positive, got {self.delta_t}"
+        assert self.v_spike_cutoff > self.v_thresh, (
+            f"v_spike_cutoff ({self.v_spike_cutoff}) must be > v_thresh ({self.v_thresh})"
+        )
+        assert self.tau_w > 0, f"tau_w must be positive, got {self.tau_w}"
+        assert self.g_L > 0, f"g_L must be positive, got {self.g_L}"
+        assert self.C_m > 0, f"C_m must be positive, got {self.C_m}"
         object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
         object.__setattr__(self, 'mem_gain', self.ctx.complement(self.tau_m))
         gap = abs(self.v_thresh - self.v_rest)
@@ -125,6 +165,9 @@ class NeuronConfig(BaseConfig):
         # I_thresh: current that brings v from rest to thresh in one tau_m
         # v_thresh = v_rest + I × (1 - decay) => I = gap / (1 - decay)
         object.__setattr__(self, 'i_thresh', gap * (1.0 - self.mem_decay))
+        # AdEx adaptation decay factors
+        object.__setattr__(self, 'w_decay', self.ctx.decay(self.tau_w))
+        object.__setattr__(self, 'w_gain', self.ctx.complement(self.tau_w))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -445,7 +488,7 @@ class NeuromodulatorConfig(BaseConfig):
       NE:  τ ≈ 75ms   — NET reuptake (Morilak et al. 2005)
       5-HT: τ ≈ 150ms — SERT reuptake (volume transmission slower)
 
-    Tonic DA: episodic decay ≈ 10 episodes (slow VTA background)
+    Tonic DA: continuous leaky integrator τ ≈ 60s (Grace 1991).
     """
     # Phasic time constants (ms)
     tau_da: float = 200.0
@@ -453,8 +496,8 @@ class NeuromodulatorConfig(BaseConfig):
     tau_ne: float = 75.0
     tau_sero: float = 150.0
 
-    # Tonic DA episodic decay (not per-step)
-    tonic_da_decay: float = 0.9  # τ ≈ 10 episodes
+    # Tonic DA: continuous leaky integrator (Grace 1991)
+    tau_tonic_da: float = 60_000.0  # 60 seconds — minute-scale VTA background
 
     # Baselines
     baseline_da: float = 0.5
@@ -481,17 +524,19 @@ class NeuromodulatorConfig(BaseConfig):
     ach_decay: float = field(init=False, default=0.0)
     ne_decay: float = field(init=False, default=0.0)
     sero_decay: float = field(init=False, default=0.0)
+    tonic_da_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_da > 0, f"tau_da must be positive, got {self.tau_da}"
         assert self.tau_ach > 0, f"tau_ach must be positive, got {self.tau_ach}"
         assert self.tau_ne > 0, f"tau_ne must be positive, got {self.tau_ne}"
         assert self.tau_sero > 0, f"tau_sero must be positive, got {self.tau_sero}"
-        assert 0 <= self.tonic_da_decay <= 1, f"tonic_da_decay must be in [0, 1], got {self.tonic_da_decay}"
+        assert self.tau_tonic_da > 0, f"tau_tonic_da must be positive, got {self.tau_tonic_da}"
         object.__setattr__(self, 'da_decay', self.ctx.decay(self.tau_da))
         object.__setattr__(self, 'ach_decay', self.ctx.decay(self.tau_ach))
         object.__setattr__(self, 'ne_decay', self.ctx.decay(self.tau_ne))
         object.__setattr__(self, 'sero_decay', self.ctx.decay(self.tau_sero))
+        object.__setattr__(self, 'tonic_da_decay', self.ctx.decay(self.tau_tonic_da))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -606,6 +651,11 @@ class AstrocyteConfig(BaseConfig):
     tau_ca = 5000ms (5 seconds) — biological astrocyte Ca²⁺ τ = 2-10s.
     D-Serine release: sigmoid, not step function.
     Gap junction diffusion between zones.
+
+    ATP Energy Budget (Krok 1.3):
+      Continuous, not binary. ATP modulates spike threshold (V_T)
+      and leak conductance (g_L) — network silences smoothly under
+      energy depletion. Na⁺/K⁺-ATPase slowdown ≈ rising V_T + rising g_L.
     """
     n_zones: int = 16
     tau_ca: float = 5000.0      # Ca²⁺ time constant (ms) — was 500, now biological
@@ -618,6 +668,13 @@ class AstrocyteConfig(BaseConfig):
     metabolic_scale: float = 0.5
     # Gap junction diffusion coefficient (De Pittà et al. 2011)
     gap_junction_D: float = 0.01  # Diffusion coefficient between zones
+
+    # ── ATP Energy Budget ─────────────────────────────────────────────
+    atp_max: float = 1.0            # Normalised ceiling
+    atp_regen_rate: float = 0.001   # Recovery per ms (~1 s to full)
+    atp_spike_cost: float = 0.02    # Cost per spike per zone per step
+    atp_threshold_shift: float = 10.0  # Max V_T shift (mV) at zero ATP
+    atp_leak_gain: float = 0.5      # Max g_L multiplier increase at zero ATP
 
     # ── Derived ───────────────────────────────────────────────────────
     ca_decay: float = field(init=False, default=0.0)

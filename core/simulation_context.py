@@ -57,6 +57,53 @@ class SimulationContext:
         """Convert Hz to spikes-per-timestep."""
         return hz * (self.dt / 1000.0)
 
+    # ------------------------------------------------------------------
+    # Exponential Euler integrator (Krok 1.2)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def phi1(z: np.ndarray) -> np.ndarray:
+        """φ₁(z) = (exp(z) - 1) / z  with full float32 precision.
+
+        Uses np.expm1 to avoid catastrophic cancellation near z ≈ 0.
+        Branch for |z| < 1e-4 uses Taylor: 1 + z/2 (error < z²/6 ≈ 10⁻⁹).
+        """
+        return np.where(
+            np.abs(z) < 1e-4,
+            1.0 + z * 0.5,
+            np.expm1(z) / z,
+        )
+
+    def exp_euler_step(
+        self,
+        v: np.ndarray,
+        F_v: np.ndarray,
+        J_v: np.ndarray,
+    ) -> np.ndarray:
+        """Exponential Rosenbrock order-1 integration step.
+
+        V_{n+1} = V_n + φ₁(h·J) · h · F(V_n)
+
+        where:
+          F(V) = full RHS of ODE (per neuron)
+          J(V) = ∂F/∂V  (scalar Jacobian per neuron)
+          h    = self.dt
+
+        This is A-stable and handles stiffness from NMDA (τ=100ms)
+        and AdEx exponential term without O(N³) implicit costs.
+
+        Args:
+            v:   (N,) membrane potentials.
+            F_v: (N,) RHS evaluated at current V.
+            J_v: (N,) Jacobian ∂F/∂V at current V.
+
+        Returns:
+            (N,) updated membrane potentials.
+        """
+        h = self.dt
+        hz = h * J_v
+        return v + self.phi1(hz) * h * F_v
+
 
 # ── Default context (dt = 1 ms) ──────────────────────────────────────
 DEFAULT_CONTEXT = SimulationContext(dt=1.0)

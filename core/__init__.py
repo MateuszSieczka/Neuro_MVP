@@ -49,7 +49,7 @@ from .receptor import receptor_effect, compute_layer_modulation, aggregate_recep
 from .synapse import SynapticChannels
 
 # -- Neuron layers --
-from .neuron import LIFLayer, HomeostaticState
+from .neuron import AdExLayer, LIFLayer, HomeostaticState
 from .competitive_layer import CompetitiveLIFLayer
 from .predictive_coding import PredictiveCodingLayer
 from .pyramidal_neuron import PyramidalLayer

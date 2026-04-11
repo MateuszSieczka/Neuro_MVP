@@ -1,19 +1,25 @@
 """
-LIFLayer — Leaky Integrate-and-Fire neuron population with biophysical STDP.
+AdExLayer — Adaptive Exponential Integrate-and-Fire neuron population.
 
-Changes from legacy:
-  1. Multiplicative STDP kernel (Bi & Poo 2001) with proper causal asymmetry.
-  2. Calcium-based eligibility traces (Graupner & Brunel 2012); no artificial
-     [-2, 2] clipping — calcium naturally bounded.
-  3. Synaptic scaling (Turrigiano 2008) replaces hard weight clips.
-  4. Principled weight init via ``init_weights()`` from config.
-  5. Optional homeostatic threshold adaptation (BCM-derived) and dark-matter
-     neurons as composable configs, not inheritance chain flags.
-  6. SynapticChannels integration for AMPA/NMDA temporal dynamics.
-  7. NE/ACh timescale modulation with explicit compression factors.
+Reference: Brette & Gerstner (2005) "Adaptive Exponential Integrate-and-Fire
+Model as an Effective Description of Neuronal Activity"
+
+Changes from legacy LIFLayer:
+  1. AdEx membrane dynamics: exponential spike initiation + adaptation current w.
+  2. Exponential Euler integration (A-stable) instead of linear exact decay.
+  3. Spike detection at v_spike_cutoff (above V_T) instead of v_thresh.
+  4. w_adapt state: spike-triggered + subthreshold adaptation.
+  5. Different neuron types from SAME equations (RS, FS, IB, LS via params).
+  6. Multiplicative STDP kernel (Bi & Poo 2001) with proper causal asymmetry.
+  7. Calcium-based eligibility traces (Graupner & Brunel 2012).
+  8. Synaptic scaling (Turrigiano 2008) replaces hard weight clips.
+  9. SynapticChannels integration for AMPA/NMDA temporal dynamics.
+  10. NE/ACh timescale modulation with explicit compression factors.
 """
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,6 +32,9 @@ from .config import (
     init_weights,
 )
 from .synapse import SynapticChannels
+
+if TYPE_CHECKING:
+    from .astrocyte import AstrocyteField
 
 
 class HomeostaticState:
@@ -96,22 +105,23 @@ class HomeostaticState:
         self.avg_rate.fill(0.0)
 
 
-class LIFLayer:
-    """Vectorised Leaky Integrate-and-Fire population.
+class AdExLayer:
+    """Vectorised Adaptive Exponential Integrate-and-Fire population.
 
     The layer composes independent config dataclasses:
-      - ``NeuronConfig``      — membrane dynamics (tau_m, thresholds, refrac)
+      - ``NeuronConfig``      — AdEx membrane dynamics (tau_m, delta_t, tau_w, a, b, ...)
       - ``STDPConfig``        — STDP kernel parameters (Bi & Poo 2001)
       - ``HomeostaticConfig`` — optional BCM-derived threshold adaptation
       - ``SynapseConfig``     — optional AMPA/NMDA channel dynamics
 
+    Membrane equation (Brette & Gerstner 2005):
+      C_m dV/dt = -g_L(V - E_L) + g_L Δ_T exp((V - V_T)/Δ_T) + I_syn - w
+      τ_w dw/dt = a(V - E_L) - w
+
+    Integration via Exponential Euler (A-stable, handles AdEx + NMDA stiffness).
+
     Weight update is three-factor (Izhikevich 2007):
       Δw = lr × modulator × eligibility × error_signal
-
-    Eligibility traces follow the calcium-control model (Graupner & Brunel 2012):
-      e_ij is accumulated from pre/post STDP correlations and decays
-      with τ_eligibility. No artificial clipping; bounded by natural
-      calcium dynamics and synaptic scaling.
     """
 
     def __init__(
@@ -141,6 +151,11 @@ class LIFLayer:
         )
         self.has_spiked: NDArray[np.bool_] = np.zeros(num_neurons, dtype=bool)
         self.refrac_count: NDArray[np.int32] = np.zeros(num_neurons, dtype=np.int32)
+
+        # ── AdEx adaptation current (Brette & Gerstner 2005) ─────────
+        self.w_adapt: NDArray[np.float32] = np.zeros(
+            num_neurons, dtype=np.float32,
+        )
 
         # ── Synaptic weights ──────────────────────────────────────────
         self.w: NDArray[np.float32] = init_weights(
@@ -200,12 +215,44 @@ class LIFLayer:
         self._scaling_counter: int = 0
         self._scaling_interval: int = self.neuron_cfg.scaling_interval
 
+        # ── Astrocyte ATP modulation (Krok 1.3, optional) ────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx: NDArray[np.int32] | None = None
+
+    # ------------------------------------------------------------------
+    # Astrocyte coupling
+    # ------------------------------------------------------------------
+
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach an AstrocyteField for ATP-based V_T / g_L modulation.
+
+        Args:
+            astrocyte: AstrocyteField instance providing per-zone ATP state.
+            zone_idx: (num_neurons,) mapping neuron i → zone. If None,
+                      neurons are distributed evenly across zones.
+        """
+        self._astrocyte = astrocyte
+        if zone_idx is not None:
+            self._zone_idx = zone_idx.astype(np.int32)
+        else:
+            self._zone_idx = np.linspace(
+                0, astrocyte.n_zones - 1, self.num_neurons,
+            ).astype(np.int32)
+
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
 
     def forward(self, pre_spikes: NDArray[np.float32]) -> NDArray[np.bool_]:
-        """One integration step: decay → current → spike → traces.
+        """One AdEx integration step: current → exp euler → spike → adapt → traces.
+
+        Membrane (Brette & Gerstner 2005):
+          C_m dV/dt = -g_L(V-E_L) + g_L Δ_T exp((V-V_T)/Δ_T) + I_syn - w
+        Integrated via Exponential Euler (A-stable).
 
         Args:
             pre_spikes: (num_inputs,) presynaptic spike vector (0/1 or rate).
@@ -214,6 +261,8 @@ class LIFLayer:
             (num_neurons,) boolean spike array.
         """
         pre_f32 = pre_spikes.astype(np.float32)
+        ncfg = self.neuron_cfg
+        ctx = ncfg.ctx
 
         # 1. STDP trace decay
         self.x_pre *= self._pre_decay
@@ -242,34 +291,58 @@ class LIFLayer:
             # Instantaneous current-based model
             current = pre_f32 @ self.w  # (num_neurons,)
 
-        # 4. Exact exponential membrane integration
-        # v(t+1) = v(t) × decay + (v_rest + I) × (1 - decay)
-        integrated_v = (
-            self.v * self._mem_decay
-            + (self.neuron_cfg.v_rest + current) * self._mem_gain
+        # 4. AdEx membrane integration via Exponential Euler
+        # F(V) = (1/C_m) * [-g_L*(V-E_L) + g_L*Δ_T*exp((V-V_T)/Δ_T) + I - w]
+        # J(V) = ∂F/∂V = (1/C_m) * [-g_L + g_L*exp((V-V_T)/Δ_T)]
+        # ATP modulation (Krok 1.3): effective V_T and g_L per neuron
+        if self._astrocyte is not None:
+            z = self._zone_idx
+            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[z]
+            eff_g_L = ncfg.g_L * self._astrocyte.leak_gain[z]
+        else:
+            eff_v_thresh = ncfg.v_thresh
+            eff_g_L = ncfg.g_L
+
+        exp_term = np.exp(
+            np.clip((self.v - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0),
         )
-        self.v = np.where(in_refrac, self.neuron_cfg.v_reset, integrated_v)
+        inv_Cm = 1.0 / ncfg.C_m
+        F_v = inv_Cm * (
+            -eff_g_L * (self.v - ncfg.v_rest)
+            + eff_g_L * ncfg.delta_t * exp_term
+            + current - self.w_adapt
+        )
+        J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
 
-        # 5. Spike detection (adaptive threshold if homeostatic)
+        integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
+        self.v = np.where(in_refrac, ncfg.v_reset, integrated_v)
+
+        # 5. Spike detection (v >= v_spike_cutoff, combined with adaptive thresh)
         thresh = self._effective_threshold()
-        self.has_spiked = (self.v >= thresh) & ~in_refrac
+        spike_thresh = np.minimum(
+            np.float32(ncfg.v_spike_cutoff), thresh,
+        ) if isinstance(thresh, np.ndarray) else np.float32(ncfg.v_spike_cutoff)
+        self.has_spiked = (self.v >= spike_thresh) & ~in_refrac
 
-        # 6. Reset spiked neurons
-        self.v[self.has_spiked] = self.neuron_cfg.v_reset
-        self.refrac_count[self.has_spiked] = self.neuron_cfg.refrac_period
+        # 6. Reset spiked neurons + spike-triggered adaptation
+        self.v[self.has_spiked] = ncfg.v_reset
+        self.w_adapt[self.has_spiked] += ncfg.b
+        self.refrac_count[self.has_spiked] = ncfg.refrac_period
         # Event-based post trace: increment by 1.0 on spike event
         self.x_post[self.has_spiked] += 1.0
         self.t_since_post_spike[self.has_spiked] = 0
 
-        # 7. Eligibility trace — causal STDP window (±20ms, Bi & Poo 2001)
-        # LTP: pre-before-post within window → A+ × x_pre × δ(post)
-        # LTD: post-before-pre within window → -A- × x_post × δ(pre)
+        # 7. Subthreshold adaptation: w = w*decay + a*(V - E_L)*gain
+        self.w_adapt = (
+            self.w_adapt * ncfg.w_decay
+            + ncfg.a * (self.v - ncfg.v_rest) * ncfg.w_gain
+        )
+
+        # 8. Eligibility trace — causal STDP window (±20ms, Bi & Poo 2001)
         self.e *= self._elig_decay
 
         if np.any(self.has_spiked):
-            # Post spike: LTP from pre traces within causal window
             post_idx = np.where(self.has_spiked)[0]
-            # Mask: only pre neurons that spiked within ±window
             ltp_mask = (self.t_since_pre_spike <= self._stdp_window).astype(np.float32)
             self.e[:, post_idx] += (
                 self.stdp_cfg.a_plus
@@ -278,18 +351,17 @@ class LIFLayer:
 
         pre_spiked = pre_binary > 0.5
         if np.any(pre_spiked):
-            # Pre spike: LTD from post traces within causal window
             ltd_mask = (self.t_since_post_spike <= self._stdp_window).astype(np.float32)
             self.e[pre_spiked, :] -= (
                 self.stdp_cfg.a_minus
                 * (self.x_post * ltd_mask)[np.newaxis, :]
             )
 
-        # 8. Homeostatic threshold adaptation (if configured)
+        # 9. Homeostatic threshold adaptation (if configured)
         if self.homeo_cfg is not None:
             self._update_homeostatic()
 
-        # 9. Periodic synaptic scaling (Turrigiano 2008)
+        # 10. Periodic synaptic scaling (Turrigiano 2008)
         self._scaling_counter += 1
         if self._scaling_counter >= self._scaling_interval:
             self._synaptic_scaling()
@@ -418,6 +490,7 @@ class LIFLayer:
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
         self.v.fill(self.neuron_cfg.v_rest)
+        self.w_adapt.fill(0.0)
         self.e.fill(0.0)
         self.x_pre.fill(0.0)
         self.x_post.fill(0.0)
@@ -438,3 +511,7 @@ class LIFLayer:
         self._post_decay = self.stdp_cfg.post_decay
         self._elig_decay = self.stdp_cfg.elig_decay
         self._scaling_counter = 0
+
+
+# Backward-compat alias — downstream code imports LIFLayer
+LIFLayer = AdExLayer

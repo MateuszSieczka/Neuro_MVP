@@ -13,10 +13,15 @@ Changes from legacy:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import InhibitoryPoolConfig, SynapseConfig
+from .config import InhibitoryPoolConfig, SynapseConfig, NeuronConfig
+
+if TYPE_CHECKING:
+    from .astrocyte import AstrocyteField
 
 
 class InhibitoryPool:
@@ -30,17 +35,34 @@ class InhibitoryPool:
         self,
         n_excitatory: int,
         config: InhibitoryPoolConfig | None = None,
+        neuron_cfg: NeuronConfig | None = None,
     ) -> None:
         self.config = config or InhibitoryPoolConfig()
         self.n_exc = n_excitatory
         n_inh = self.config.n_interneurons
         cfg = self.config
 
+        # AdEx parameters — Fast Spiking PV+ interneurons (a=0, b=0)
+        self._ncfg = neuron_cfg or NeuronConfig(
+            ctx=cfg.ctx,
+            v_rest=cfg.v_rest,
+            v_thresh=cfg.v_thresh,
+            v_reset=cfg.v_reset,
+            tau_m=cfg.tau_m_inh,
+            a=0.0,   # FS: no subthreshold adaptation
+            b=0.0,   # FS: no spike-triggered adaptation
+        )
+
         # ── Interneuron membrane state ────────────────────────────────
         self.v_inh: NDArray[np.float32] = np.full(
             n_inh, cfg.v_rest, dtype=np.float32,
         )
         self.spikes_inh: NDArray[np.bool_] = np.zeros(n_inh, dtype=bool)
+
+        # ── AdEx adaptation current (zero for FS, but state exists) ───
+        self.w_adapt_inh: NDArray[np.float32] = np.zeros(
+            n_inh, dtype=np.float32,
+        )
 
         # ── Synaptic weights ──────────────────────────────────────────
         # E→I: log-normal-like initialization (broad convergence)
@@ -71,6 +93,25 @@ class InhibitoryPool:
         # ── DA modulation gain ────────────────────────────────────────
         self._ie_gain: float = 1.0
 
+        # ── Astrocyte ATP coupling (Krok 1.3) ─────────────────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx: NDArray[np.int32] | None = None
+
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach astrocyte for ATP-based threshold/leak modulation."""
+        self._astrocyte = astrocyte
+        if zone_idx is not None:
+            self._zone_idx = zone_idx
+        else:
+            n = self.config.n_interneurons
+            self._zone_idx = np.linspace(
+                0, astrocyte.config.n_zones - 1, n,
+            ).astype(np.int32)
+
     def step(self, exc_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
         """One timestep of E→I→E inhibition.
 
@@ -86,15 +127,40 @@ class InhibitoryPool:
         # ── E→I drive ─────────────────────────────────────────────────
         i_input = exc_f32 @ self.w_ei  # (n_inh,)
 
-        # ── Interneuron LIF integration ───────────────────────────────
-        gain = cfg.ctx.complement(cfg.tau_m_inh)
-        self.v_inh = (
-            self.v_inh * self._decay_inh
-            + (cfg.v_rest + i_input) * gain
-        )
+        # ── Interneuron AdEx integration ──────────────────────────────
+        ncfg = self._ncfg
+        ctx = ncfg.ctx
 
-        self.spikes_inh = self.v_inh >= cfg.v_thresh
-        self.v_inh[self.spikes_inh] = cfg.v_reset
+        # ATP modulation (Krok 1.3)
+        if self._astrocyte is not None:
+            zi = self._zone_idx
+            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[zi]
+            eff_g_L = ncfg.g_L * self._astrocyte.leak_gain[zi]
+        else:
+            eff_v_thresh = ncfg.v_thresh
+            eff_g_L = ncfg.g_L
+
+        exp_term = np.exp(
+            np.clip((self.v_inh - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0),
+        )
+        inv_Cm = 1.0 / ncfg.C_m
+        F_v = inv_Cm * (
+            -eff_g_L * (self.v_inh - ncfg.v_rest)
+            + eff_g_L * ncfg.delta_t * exp_term
+            + i_input - self.w_adapt_inh
+        )
+        J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
+        self.v_inh = ctx.exp_euler_step(self.v_inh, F_v, J_v)
+
+        self.spikes_inh = self.v_inh >= ncfg.v_spike_cutoff
+        self.v_inh[self.spikes_inh] = ncfg.v_reset
+        self.w_adapt_inh[self.spikes_inh] += ncfg.b
+
+        # Subthreshold adaptation
+        self.w_adapt_inh = (
+            self.w_adapt_inh * ncfg.w_decay
+            + ncfg.a * (self.v_inh - ncfg.v_rest) * ncfg.w_gain
+        )
 
         # ── I→E feedback (dual GABA channels) ────────────────────────
         inh_f32 = self.spikes_inh.astype(np.float32)
@@ -149,6 +215,7 @@ class InhibitoryPool:
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
         self.v_inh.fill(self.config.v_rest)
+        self.w_adapt_inh.fill(0.0)
         self.spikes_inh.fill(False)
         self.i_gaba_a.fill(0.0)
         self.i_gaba_b.fill(0.0)

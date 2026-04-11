@@ -42,12 +42,14 @@ from .config import (
     BasalGangliaConfig,
     ActiveInferenceConfig,
     InhibitoryPoolConfig,
+    NeuronConfig,
     init_weights,
 )
 from .free_energy import expected_free_energy
 from .interneuron import InhibitoryPool
 
 if TYPE_CHECKING:
+    from .astrocyte import AstrocyteField
     from .world_model import SNNWorldModel
 
 
@@ -98,6 +100,47 @@ def _derive_input_gain(
     return float(i_thresh / expected_active)
 
 
+def _adex_step_bg(
+    v: NDArray[np.float32],
+    w_adapt: NDArray[np.float32],
+    I_syn: NDArray[np.float32],
+    in_refrac: NDArray[np.bool_],
+    ncfg: NeuronConfig,
+    eff_v_thresh: float | NDArray[np.float32] | None = None,
+    eff_g_L: float | NDArray[np.float32] | None = None,
+) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.bool_]]:
+    """Single AdEx integration step for BG populations.
+
+    Returns: (v_new, w_adapt_new, spiked)
+    """
+    ctx = ncfg.ctx
+    vt = eff_v_thresh if eff_v_thresh is not None else ncfg.v_thresh
+    gL = eff_g_L if eff_g_L is not None else ncfg.g_L
+    exp_term = np.exp(
+        np.clip((v - vt) / ncfg.delta_t, -20.0, 10.0),
+    )
+    inv_Cm = 1.0 / ncfg.C_m
+    F_v = inv_Cm * (
+        -gL * (v - ncfg.v_rest)
+        + gL * ncfg.delta_t * exp_term
+        + I_syn - w_adapt
+    )
+    J_v = inv_Cm * (-gL + gL * exp_term)
+    integrated = ctx.exp_euler_step(v, F_v, J_v)
+    v_new = np.where(in_refrac, ncfg.v_reset, integrated)
+
+    spiked = (v_new >= ncfg.v_spike_cutoff) & ~in_refrac
+    v_new[spiked] = ncfg.v_reset
+    w_adapt[spiked] += ncfg.b
+
+    # Subthreshold adaptation
+    w_adapt_new = (
+        w_adapt * ncfg.w_decay
+        + ncfg.a * (v_new - ncfg.v_rest) * ncfg.w_gain
+    )
+    return v_new, w_adapt_new, spiked
+
+
 # =====================================================================
 # LIF Critic (ventral striatum)
 # =====================================================================
@@ -131,6 +174,15 @@ class SNNDeepCritic:
         self._state_size = state_size
         h = config.hidden_size
 
+        # ── AdEx NeuronConfig for critic population ───────────────────
+        self._ncfg = NeuronConfig(
+            ctx=config.ctx,
+            v_rest=config.v_rest,
+            v_thresh=config.v_thresh,
+            v_reset=config.v_reset,
+            tau_m=config.tau_m_critic,
+        )
+
         # ── Precomputed membrane decay ────────────────────────────────
         self._mem_decay: float = config.ctx.decay(config.tau_m_critic)
 
@@ -148,6 +200,13 @@ class SNNDeepCritic:
         ).astype(np.float32)
         self.spikes_hidden: NDArray[np.bool_] = np.zeros(h, dtype=bool)
         self.refrac_hidden: NDArray[np.int32] = np.zeros(h, dtype=np.int32)
+
+        # ── AdEx adaptation current ───────────────────────────────────
+        self.w_adapt_hidden: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+
+        # ── Astrocyte ATP coupling (Krok 1.3) ───────────────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx: NDArray[np.int32] | None = None
 
         # ── Rate-coded activation (EMA of spikes) ─────────────────────
         self.activation: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
@@ -196,6 +255,21 @@ class SNNDeepCritic:
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
 
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach astrocyte for ATP-based threshold/leak modulation."""
+        self._astrocyte = astrocyte
+        if zone_idx is not None:
+            self._zone_idx = zone_idx
+        else:
+            n = self.config.hidden_size
+            self._zone_idx = np.linspace(
+                0, astrocyte.config.n_zones - 1, n,
+            ).astype(np.int32)
+
     def forward(self, state_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
         """Single LIF step: compute V(s), update V_trace and eligibility.
 
@@ -217,25 +291,31 @@ class SNNDeepCritic:
         # ── Synaptic current ──────────────────────────────────────────
         current = (state_f32 @ self.w_h) * self._input_gain * self._receptor_gain
 
-        # ── Single LIF step (no integration loop) ─────────────────────
+        # ── Single AdEx step ──────────────────────────────────────────
         in_refrac = self.refrac_hidden > 0
         self.refrac_hidden[in_refrac] -= 1
 
-        leaked = (
-            self.v_hidden * self._mem_decay
-            + cfg.v_rest * (1.0 - self._mem_decay)
-        )
         noise = np.random.normal(
             0, cfg.membrane_noise_std, h,
         ).astype(np.float32)
-        integrated = leaked + current + noise
-        self.v_hidden = np.where(in_refrac, cfg.v_reset, integrated)
+        I_total = current + noise
+
+        # ATP modulation (Krok 1.3)
+        if self._astrocyte is not None:
+            zc = self._zone_idx
+            vt_c = self._ncfg.v_thresh + self._astrocyte.threshold_shift[zc]
+            gL_c = self._ncfg.g_L * self._astrocyte.leak_gain[zc]
+        else:
+            vt_c = gL_c = None
+
+        self.v_hidden, self.w_adapt_hidden, self.spikes_hidden = _adex_step_bg(
+            self.v_hidden, self.w_adapt_hidden, I_total, in_refrac, self._ncfg,
+            eff_v_thresh=vt_c, eff_g_L=gL_c,
+        )
 
         inh_current = self.inh_pool.step(self.spikes_hidden.astype(np.float32))
         self.v_hidden -= inh_current
 
-        self.spikes_hidden = (self.v_hidden >= cfg.v_thresh) & ~in_refrac
-        self.v_hidden[self.spikes_hidden] = cfg.v_reset
         self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
 
         rate_compl = 1.0 - self._rate_decay
@@ -307,6 +387,7 @@ class SNNDeepCritic:
         ).astype(np.float32)
         self.spikes_hidden.fill(False)
         self.refrac_hidden.fill(0)
+        self.w_adapt_hidden.fill(0.0)
         self.activation.fill(0.0)
         self.e_h.fill(0.0)
         self.e_v.fill(0.0)
@@ -389,6 +470,15 @@ class D1D2Actor:
             state_size, config.tau_m_msn_up, config,
         )
 
+        # ── AdEx NeuronConfig for MSN (Up-state defaults) ────────────
+        self._ncfg = NeuronConfig(
+            ctx=config.ctx,
+            v_rest=config.v_rest,
+            v_thresh=config.v_thresh,
+            v_reset=config.v_reset,
+            tau_m=config.tau_m_msn_up,
+        )
+
         # ── D1-MSN membrane state ────────────────────────────────────
         self.v_d1: NDArray[np.float32] = np.random.uniform(
             config.v_rest, config.v_thresh, self.action_dim,
@@ -396,6 +486,7 @@ class D1D2Actor:
         self.spikes_d1: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
         self.refrac_d1: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
         self.rate_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self.w_adapt_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
         # ── D2-MSN membrane state ────────────────────────────────────
         self.v_d2: NDArray[np.float32] = np.random.uniform(
@@ -404,6 +495,7 @@ class D1D2Actor:
         self.spikes_d2: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
         self.refrac_d2: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
         self.rate_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self.w_adapt_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
         # ── Rate EMA decay ────────────────────────────────────────────
         self._rate_decay: float = 0.9  # Fast averaging for action selection
@@ -470,6 +562,25 @@ class D1D2Actor:
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
 
+        # ── Astrocyte ATP coupling (Krok 1.3) ─────────────────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx: NDArray[np.int32] | None = None
+
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach astrocyte for ATP-based threshold/leak modulation."""
+        self._astrocyte = astrocyte
+        if zone_idx is not None:
+            self._zone_idx = zone_idx
+        else:
+            n = self.action_dim
+            self._zone_idx = np.linspace(
+                0, astrocyte.config.n_zones - 1, n,
+            ).astype(np.int32)
+
     def set_da_level(self, da: float) -> None:
         """Set DA modulation: high DA → D1 excitation, D2 suppression."""
         self._da_level = float(np.clip(da, 0.0, 1.0))
@@ -524,31 +635,76 @@ class D1D2Actor:
         cortical_drive = np.abs(current_d1) + np.abs(current_d2)
         drive_max = np.max(cortical_drive) + 1e-8
         cortical_norm = cortical_drive / drive_max
-        decay_d1 = _msn_decay(cortical_norm, cfg)
-        decay_d2 = _msn_decay(cortical_norm, cfg)
+        up_mask = cortical_norm > 0.3
+        tau_eff = np.where(up_mask, cfg.tau_m_msn_up, cfg.tau_m_msn_down).astype(np.float32)
+        g_L_eff = self._ncfg.C_m / tau_eff  # per-neuron effective g_L
 
-        # ── Single LIF step: D1 ──────────────────────────────────────
+        # ── Shared AdEx constants ─────────────────────────────────────
+        ncfg = self._ncfg
+        ctx = ncfg.ctx
+        inv_Cm = 1.0 / ncfg.C_m
+        h = ctx.dt
+
+        # ── ATP modulation (Krok 1.3) ─────────────────────────────────
+        if self._astrocyte is not None:
+            za = self._zone_idx
+            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[za]
+            g_L_eff = g_L_eff * self._astrocyte.leak_gain[za]
+        else:
+            eff_v_thresh = ncfg.v_thresh
+
+        # ── AdEx step: D1 ─────────────────────────────────────────────
         in_refrac_d1 = self.refrac_d1 > 0
         self.refrac_d1[in_refrac_d1] -= 1
         noise_d1 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
-        leaked_d1 = self.v_d1 * decay_d1 + cfg.v_rest * (1.0 - decay_d1)
-        self.v_d1 = np.where(in_refrac_d1, cfg.v_reset, leaked_d1 + current_d1 + noise_d1)
+
+        exp_term_d1 = np.exp(np.clip((self.v_d1 - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0))
+        F_d1 = inv_Cm * (
+            -g_L_eff * (self.v_d1 - ncfg.v_rest)
+            + g_L_eff * ncfg.delta_t * exp_term_d1
+            + current_d1 + noise_d1 - self.w_adapt_d1
+        )
+        J_d1 = inv_Cm * (-g_L_eff + g_L_eff * exp_term_d1)
+        integrated_d1 = ctx.exp_euler_step(self.v_d1, F_d1, J_d1)
+        self.v_d1 = np.where(in_refrac_d1, ncfg.v_reset, integrated_d1)
+
         inh_d1 = self.inh_pool_d1.step(self.spikes_d1.astype(np.float32))
         self.v_d1 -= inh_d1
-        self.spikes_d1 = (self.v_d1 >= cfg.v_thresh) & ~in_refrac_d1
-        self.v_d1[self.spikes_d1] = cfg.v_reset
+
+        self.spikes_d1 = (self.v_d1 >= ncfg.v_spike_cutoff) & ~in_refrac_d1
+        self.v_d1[self.spikes_d1] = ncfg.v_reset
+        self.w_adapt_d1[self.spikes_d1] += ncfg.b
+        self.w_adapt_d1 = (
+            self.w_adapt_d1 * ncfg.w_decay
+            + ncfg.a * (self.v_d1 - ncfg.v_rest) * ncfg.w_gain
+        )
         self.refrac_d1[self.spikes_d1] = cfg.refrac_period
 
-        # ── Single LIF step: D2 ──────────────────────────────────────
+        # ── AdEx step: D2 ─────────────────────────────────────────────
         in_refrac_d2 = self.refrac_d2 > 0
         self.refrac_d2[in_refrac_d2] -= 1
         noise_d2 = np.random.normal(0, cfg.membrane_noise_std, ad).astype(np.float32)
-        leaked_d2 = self.v_d2 * decay_d2 + cfg.v_rest * (1.0 - decay_d2)
-        self.v_d2 = np.where(in_refrac_d2, cfg.v_reset, leaked_d2 + current_d2 + noise_d2)
+
+        exp_term_d2 = np.exp(np.clip((self.v_d2 - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0))
+        F_d2 = inv_Cm * (
+            -g_L_eff * (self.v_d2 - ncfg.v_rest)
+            + g_L_eff * ncfg.delta_t * exp_term_d2
+            + current_d2 + noise_d2 - self.w_adapt_d2
+        )
+        J_d2 = inv_Cm * (-g_L_eff + g_L_eff * exp_term_d2)
+        integrated_d2 = ctx.exp_euler_step(self.v_d2, F_d2, J_d2)
+        self.v_d2 = np.where(in_refrac_d2, ncfg.v_reset, integrated_d2)
+
         inh_d2 = self.inh_pool_d2.step(self.spikes_d2.astype(np.float32))
         self.v_d2 -= inh_d2
-        self.spikes_d2 = (self.v_d2 >= cfg.v_thresh) & ~in_refrac_d2
-        self.v_d2[self.spikes_d2] = cfg.v_reset
+
+        self.spikes_d2 = (self.v_d2 >= ncfg.v_spike_cutoff) & ~in_refrac_d2
+        self.v_d2[self.spikes_d2] = ncfg.v_reset
+        self.w_adapt_d2[self.spikes_d2] += ncfg.b
+        self.w_adapt_d2 = (
+            self.w_adapt_d2 * ncfg.w_decay
+            + ncfg.a * (self.v_d2 - ncfg.v_rest) * ncfg.w_gain
+        )
         self.refrac_d2[self.spikes_d2] = cfg.refrac_period
 
         # ── Rate EMA ──────────────────────────────────────────────────
@@ -686,6 +842,8 @@ class D1D2Actor:
         self.spikes_d2.fill(False)
         self.refrac_d1.fill(0)
         self.refrac_d2.fill(0)
+        self.w_adapt_d1.fill(0.0)
+        self.w_adapt_d2.fill(0.0)
         self.rate_d1.fill(0.0)
         self.rate_d2.fill(0.0)
         self.e_d1.fill(0.0)

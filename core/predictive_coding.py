@@ -102,12 +102,12 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
     # ------------------------------------------------------------------
 
     def forward(self, pre_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Single-step predictive coding dynamics (no relaxation loop).
+        """Single-step predictive coding with AdEx dynamics.
 
-        One dt step matching the spiking paradigm:
-          1. Feedforward drive from learned weights.
-          2. Single-step gradient: v += ACh × error_gradient + (1-ACh) × top_down.
-          3. Spike detection.
+        One dt step:
+          1. Feedforward drive + prediction error gradient.
+          2. AdEx membrane integration via Exponential Euler.
+          3. Spike detection + adaptation.
           4. Update feedback prediction.
 
         Returns:
@@ -115,6 +115,7 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         """
         pre_f32 = pre_spikes.astype(np.float32)
         ncfg = self.neuron_cfg
+        ctx = ncfg.ctx
 
         # ── Feedforward drive (thalamo-cortical volley) ───────────────
         ff_drive = pre_f32 @ self.w  # (num_neurons,)
@@ -122,12 +123,6 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
 
         # ── Proactive inhibition (continuous k-WTA) ───────────────────
         self._apply_proactive_inhibition()
-
-        # ── Membrane leak ─────────────────────────────────────────────
-        self.v *= self._mem_decay
-
-        # ── Inject feedforward drive ──────────────────────────────────
-        self.v += ff_drive
 
         # ── Single-step prediction error gradient ─────────────────────
         r = np.clip(
@@ -143,18 +138,53 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
             self.ach_level * error_gradient
             + (1.0 - self.ach_level) * self.top_down_prediction
         )
-        self.v += combined
-        np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
 
-        # ── Spike phase ───────────────────────────────────────────────
+        # ── Total synaptic input ──────────────────────────────────────
+        I_syn = ff_drive + combined
+
+        # ── AdEx membrane integration via Exponential Euler ───────────
+        # ATP modulation (Krok 1.3)
+        if self._astrocyte is not None:
+            z = self._zone_idx
+            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[z]
+            eff_g_L = ncfg.g_L * self._astrocyte.leak_gain[z]
+        else:
+            eff_v_thresh = ncfg.v_thresh
+            eff_g_L = ncfg.g_L
+
+        exp_term = np.exp(
+            np.clip((self.v - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0),
+        )
+        inv_Cm = 1.0 / ncfg.C_m
+        F_v = inv_Cm * (
+            -eff_g_L * (self.v - ncfg.v_rest)
+            + eff_g_L * ncfg.delta_t * exp_term
+            + I_syn - self.w_adapt
+        )
+        J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
+
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1
 
+        integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
+        self.v = np.where(in_refrac, ncfg.v_reset, integrated_v)
+
+        # ── Spike detection ───────────────────────────────────────────
         thresh = self._effective_threshold()
-        self.has_spiked = (self.v >= thresh) & ~in_refrac
+        spike_thresh = np.minimum(
+            np.float32(ncfg.v_spike_cutoff), thresh,
+        ) if isinstance(thresh, np.ndarray) else np.float32(ncfg.v_spike_cutoff)
+        self.has_spiked = (self.v >= spike_thresh) & ~in_refrac
 
         self.v[self.has_spiked] = ncfg.v_reset
+        self.w_adapt[self.has_spiked] += ncfg.b
         self.refrac_count[self.has_spiked] = ncfg.refrac_period
+
+        # ── Subthreshold adaptation ───────────────────────────────────
+        self.w_adapt = (
+            self.w_adapt * ncfg.w_decay
+            + ncfg.a * (self.v - ncfg.v_rest) * ncfg.w_gain
+        )
 
         # ── Event-based STDP traces with causal ±20ms window ─────────
         self.x_pre *= self._pre_decay

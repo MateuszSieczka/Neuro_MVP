@@ -167,11 +167,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
         # ── 4. Proactive k-WTA inhibition ─────────────────────────────
         self._apply_proactive_inhibition()
 
-        # ── 5. Single-step dynamics (no relaxation loop) ──────────────
-        # One dt step: v += rate × (ach × error_gradient + (1-ach) × top_down)
-        self.v *= self._mem_decay
-        self.v += ff_drive
-
+        # ── 5. Prediction error gradient ──────────────────────────────
         r = np.clip((self.v - ncfg.v_rest) / ncfg.gap, 0.0, 1.0)
         my_prediction = r @ self.w_apical.T
         self.prediction_error = pre_f32 - my_prediction
@@ -179,10 +175,39 @@ class PyramidalLayer(CompetitiveLIFLayer):
 
         ach = self._ach_apical_scale
         combined = ach * error_gradient + (1.0 - ach) * self.top_down_prediction
-        self.v += combined
-        np.clip(self.v, ncfg.v_reset, ncfg.v_thresh + 10.0, out=self.v)
 
-        # ── 6. Effective threshold (apical priming + ACh) ─────────────
+        # ── 6. Total synaptic input ───────────────────────────────────
+        I_syn = ff_drive + combined
+
+        # ── 7. AdEx membrane integration via Exponential Euler ────────
+        # ATP modulation (Krok 1.3)
+        if self._astrocyte is not None:
+            z = self._zone_idx
+            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[z]
+            eff_g_L = ncfg.g_L * self._astrocyte.leak_gain[z]
+        else:
+            eff_v_thresh = ncfg.v_thresh
+            eff_g_L = ncfg.g_L
+
+        exp_term = np.exp(
+            np.clip((self.v - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0),
+        )
+        inv_Cm = 1.0 / ncfg.C_m
+        F_v = inv_Cm * (
+            -eff_g_L * (self.v - ncfg.v_rest)
+            + eff_g_L * ncfg.delta_t * exp_term
+            + I_syn - self.w_adapt
+        )
+        J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
+
+        ctx = ncfg.ctx
+        integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
+
+        in_refrac = self.refrac_count > 0
+        self.refrac_count[in_refrac] -= 1
+        self.v = np.where(in_refrac, ncfg.v_reset, integrated_v)
+
+        # ── 8. Effective threshold (apical priming + ACh) ─────────────
         effective_thresh = (
             self.v_thresh_adaptive
             - pyr.apical_boost
@@ -197,17 +222,22 @@ class PyramidalLayer(CompetitiveLIFLayer):
             ).astype(np.float32)
             self.v += noise
 
-        # ── 7. Spike detection ────────────────────────────────────────
-        in_refrac = self.refrac_count > 0
-        self.refrac_count[in_refrac] -= 1
-
-        self.has_spiked = (self.v >= effective_thresh) & ~in_refrac
+        # ── 9. Spike detection (AdEx cutoff combined with adaptive) ───
+        spike_thresh = np.minimum(np.float32(ncfg.v_spike_cutoff), effective_thresh)
+        self.has_spiked = (self.v >= spike_thresh) & ~in_refrac
         self.v[self.has_spiked] = ncfg.v_reset
+        self.w_adapt[self.has_spiked] += ncfg.b  # spike-triggered adaptation
         self.refrac_count[self.has_spiked] = ncfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
         self.t_since_post_spike[self.has_spiked] = 0
 
-        # ── 8. Eligibility traces — causal ±20ms window (Bi & Poo) ───
+        # ── 10. Subthreshold adaptation ───────────────────────────────
+        self.w_adapt = (
+            self.w_adapt * ncfg.w_decay
+            + ncfg.a * (self.v - ncfg.v_rest) * ncfg.w_gain
+        )
+
+        # ── 11. Eligibility traces — causal ±20ms window (Bi & Poo) ──
         self.e *= self._elig_decay
         if np.any(self.has_spiked):
             post_idx = np.where(self.has_spiked)[0]
@@ -224,14 +254,14 @@ class PyramidalLayer(CompetitiveLIFLayer):
                 * (self.x_post * ltd_mask)[np.newaxis, :]
             )
 
-        # ── 9. k-WTA window bookkeeping ──────────────────────────────
+        # ── 12. k-WTA window bookkeeping ─────────────────────────────
         self.window_spike_counts += self.has_spiked.astype(np.int32)
         self._current_window_size += 1
         if self._phase_reset_pending:
             self._apply_lateral_inhibition()
             self._reset_window()
 
-        # ── 10. Burst detection (BAC firing, Larkum 1999) ─────────────
+        # ── 13. Burst detection (BAC firing, Larkum 1999) ─────────────
         #  Synapse-specific burst boost (Payeur et al. 2021):
         #  boost ∝ presynaptic activity × burst factor
         self.is_burst = self.has_spiked & self.in_plateau
@@ -245,7 +275,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
                 * self.x_pre[:, np.newaxis]
             )
 
-        # ── 11. Homeostatic adaptation ────────────────────────────────
+        # ── 14. Homeostatic adaptation ────────────────────────────────
         self._update_adaptive_threshold()
 
         return self.has_spiked

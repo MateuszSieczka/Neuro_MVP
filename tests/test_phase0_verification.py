@@ -55,30 +55,26 @@ class TestAgentConfig:
 # =====================================================================
 
 class TestNoPrivateAccess:
-    def test_neuromodulator_reward_history_is_public(self) -> None:
+    def test_tonic_da_updated_per_step(self) -> None:
+        """Tonic DA is updated as part of per-step update(), no episodic API."""
         from core.neuromodulator import NeuromodulatorSystem
         nm = NeuromodulatorSystem()
-        # property exists and returns a list
-        hist = nm.reward_history
-        assert isinstance(hist, list)
-        assert len(hist) == 0
+        assert nm.tonic_da == 0.0
+        # Feed constant positive td_error — tonic_da should rise
+        pe = np.array([0.5], dtype=np.float32)
+        for _ in range(1000):
+            nm.update(prediction_error=pe, td_error=1.0)
+        assert nm.tonic_da > 0.01, "tonic_da should rise under constant RPE"
 
-    def test_reward_history_populated(self) -> None:
+    def test_tonic_da_reset(self) -> None:
+        """reset() restores tonic_da to baseline."""
         from core.neuromodulator import NeuromodulatorSystem
         nm = NeuromodulatorSystem()
-        nm.update_tonic_da(episode_return=1.5, episode_steps=100)
-        nm.update_tonic_da(episode_return=2.0, episode_steps=100)
-        hist = nm.reward_history
-        assert len(hist) == 2
-        assert hist[0] == pytest.approx(1.5)
-        assert hist[1] == pytest.approx(2.0)
-
-    def test_reward_history_cleared_on_reset(self) -> None:
-        from core.neuromodulator import NeuromodulatorSystem
-        nm = NeuromodulatorSystem()
-        nm.update_tonic_da(episode_return=1.0, episode_steps=100)
+        pe = np.array([0.5], dtype=np.float32)
+        for _ in range(100):
+            nm.update(prediction_error=pe, td_error=1.0)
         nm.reset()
-        assert len(nm.reward_history) == 0
+        assert nm.tonic_da == nm.config.baseline_tonic_da
 
 
 # =====================================================================

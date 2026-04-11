@@ -52,7 +52,7 @@ class TaskConfig:
 REGISTRY: dict[str, TaskConfig] = {
     "CartPole-v1": TaskConfig(
         env_id="CartPole-v1",
-        n_episodes=120,
+        n_episodes=250,
         max_steps=500,
         solved_threshold=450.0,
         eval_window=20,

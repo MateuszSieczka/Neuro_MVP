@@ -59,23 +59,34 @@ class AstrocyteField:
         # ── D-Serine (gliotransmitter) level per zone ─────────────────
         self.d_serine: NDArray[np.float32] = np.zeros(n, dtype=np.float32)
 
+        # ── ATP energy budget per zone (Krok 1.3) ────────────────────
+        self.atp: NDArray[np.float32] = np.full(
+            n, cfg.atp_max, dtype=np.float32,
+        )
+
         # ── Precomputed decays from config ────────────────────────────
         self._ca_decay: float = cfg.ca_decay
         self._d_serine_decay: float = cfg.d_serine_decay
 
     def update(self, spike_rates: NDArray[np.float32]) -> None:
-        """Update Ca²⁺ from local spike rates (not PE vectors).
+        """Update Ca²⁺ and ATP from local spike rates.
 
         Ca²⁺ accumulates proportionally to spike rate² — energy proxy
         (De Pittà et al. 2011). This is the SLOW channel only;
         fast epistemic signalling uses error_neuron.error_rate → D1
         directly (no astrocyte involvement).
 
+        ATP dynamics (Krok 1.3):
+          Regeneration: first-order recovery with saturation.
+          Cost: proportional to spike count per zone.
+          Modulates V_T (threshold_shift) and g_L (leak_gain) continuously.
+
         Args:
             spike_rates: (n_zones,) or (n_synapses,) firing rate vector.
         """
         rates = self._to_zones(spike_rates)
         cfg = self.config
+        dt = cfg.ctx.dt
 
         # ── Ca²⁺ dynamics: accumulation ∝ rate² ───────────────────────
         self.calcium = (
@@ -101,6 +112,15 @@ class AstrocyteField:
         release_rate = cfg.d_serine_max / (1.0 + np.exp(-sigmoid_arg))
         self.d_serine += release_rate.astype(np.float32)
         np.clip(self.d_serine, 0.0, 1.0, out=self.d_serine)
+
+        # ── ATP dynamics (Krok 1.3) ───────────────────────────────────
+        # Regeneration: first-order recovery with saturation
+        self.atp += cfg.atp_regen_rate * (cfg.atp_max - self.atp) * dt
+        # Cost: proportional to zone spike counts (rates = rate² from _to_zones,
+        # take sqrt to get effective spike count proxy)
+        zone_spike_counts = np.sqrt(rates)
+        self.atp -= cfg.atp_spike_cost * zone_spike_counts * dt
+        np.clip(self.atp, 0.0, cfg.atp_max, out=self.atp)
 
     def _to_zones(self, values: NDArray[np.float32]) -> NDArray[np.float32]:
         """Map arbitrary-length spike rate array to n_zones (rate²)."""
@@ -138,6 +158,32 @@ class AstrocyteField:
         return (cfg.gain_baseline + gain_range * self.d_serine).astype(np.float32)
 
     @property
+    def threshold_shift(self) -> NDArray[np.float32]:
+        """Per-zone spike threshold shift (mV) due to ATP depletion.
+
+        Biology: ATP↓ → Na⁺/K⁺-ATPase slows → ionic gradients weaken
+        → spike initiation threshold rises (Na⁺ channels need stronger
+        depolarisation). Continuous effect, no binary gate.
+
+        Returns 0 mV at full ATP, +atp_threshold_shift mV at zero ATP.
+        """
+        cfg = self.config
+        return (cfg.atp_threshold_shift * (1.0 - self.atp)).astype(np.float32)
+
+    @property
+    def leak_gain(self) -> NDArray[np.float32]:
+        """Per-zone leak conductance multiplier due to ATP depletion.
+
+        Biology: ATP↓ → Na/K pump slows → resting potential depolarises
+        → but K⁺ gradient weakens → net: faster potential decay
+        → less temporal integration of inputs.
+
+        Returns 1.0 at full ATP, 1.0 + atp_leak_gain at zero ATP.
+        """
+        cfg = self.config
+        return (1.0 + cfg.atp_leak_gain * (1.0 - self.atp)).astype(np.float32)
+
+    @property
     def metabolic_lr(self) -> NDArray[np.float32]:
         """Per-zone learning rate multiplier (metabolic support ∝ Ca²⁺)."""
         return (1.0 + self.config.metabolic_scale * self.calcium).astype(np.float32)
@@ -156,3 +202,4 @@ class AstrocyteField:
         """Reset transient state between episodes."""
         self.calcium.fill(0.0)
         self.d_serine.fill(0.0)
+        self.atp.fill(self.config.atp_max)

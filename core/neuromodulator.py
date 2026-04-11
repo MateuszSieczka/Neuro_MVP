@@ -8,8 +8,9 @@ Changes from legacy:
      NET τ=75ms, SERT τ=150ms) via NeuromodulatorConfig.
   2. DA RMS adaptation τ ≈ 10s (config.da_rms_decay=0.9999), not 100ms.
   3. Serotonin weights from dorsal raphe anatomy (0.7/0.3, config).
-  4. Tonic DA uses Welford running mean/variance (no percentile collapse).
+  4. Tonic DA: continuous leaky integrator τ=60s (Grace 1991), NOT episodic.
   5. Receptor-subtype-aware layer modulation via apply_to_layer().
+  6. No episode boundary concept — purely per-step dynamics.
 
 All levels normalised to [0, 1].
 """
@@ -45,31 +46,16 @@ class NeuromodulatorSystem:
         self.serotonin: float = cfg.baseline_sero
         self.tonic_da: float = cfg.baseline_tonic_da
 
-        # ── Histories ─────────────────────────────────────────────────
+        # ── Histories (per-step rolling windows) ──────────────────────
         self._error_history: deque[float] = deque(maxlen=100)
         self._td_history: deque[float] = deque(maxlen=100)
-
-        # ── Tonic DA: Welford running mean/variance ───────────────────
-        # Replaces percentile-based normalisation (zero-variance bug).
-        self._welford_n: int = 0
-        self._welford_mean: float = 0.0
-        self._welford_m2: float = 0.0
 
         # ── DA RMS with proper τ (config.da_rms_decay) ────────────────
         self._da_rms: float = 1.0
 
-        # ── Smoothed reward signal (EMA) ──────────────────────────────
-        self._smoothed_reward: float = 0.0
-
         # ── Stagnation detector (ACC) ─────────────────────────────────
         self._tda_history: deque[float] = deque(maxlen=30)
         self._stagnation_factor: float = 0.0
-
-        # ── Intrinsic progress (world model improvement) ──────────────
-        self._episode_pred_errors: deque[float] = deque(maxlen=30)
-
-        # ── Episode return history (for sleep_gain computation) ───────
-        self._reward_history: deque[float] = deque(maxlen=50)
 
         # ── Per-region NE/ACh (Schultz 1998: DA/5-HT global;
         #    Berridge & Waterhouse 2003: NE regional;
@@ -142,75 +128,13 @@ class NeuromodulatorSystem:
             + stability * (1.0 - cfg.sero_decay)
         )
 
-        self._clamp_all()
-
-    # ------------------------------------------------------------------
-    # Episodic tonic DA update (Welford algorithm)
-    # ------------------------------------------------------------------
-
-    def update_tonic_da(
-        self,
-        episode_return: float,
-        episode_steps: int,
-        prediction_error_avg: float = 0.0,
-    ) -> None:
-        """Update tonic DA at episode boundary using Welford running stats.
-
-        Fixes the percentile-based zero-variance bug: when all returns are
-        identical, percentile normalisation yields signal=0 and zeros tonic DA.
-        Welford maps return → z-score → sigmoid, giving signal ≈ 0.5 for
-        constant returns (which is correct: consistent reward = moderate tonic DA).
-        """
-        cfg = self.config
-
-        # ── Track episode returns for sleep_gain ──────────────────────
-        self._reward_history.append(episode_return)
-
-        # ── Welford online mean/variance ──────────────────────────────
-        self._welford_n += 1
-        delta = episode_return - self._welford_mean
-        self._welford_mean += delta / self._welford_n
-        delta2 = episode_return - self._welford_mean
-        self._welford_m2 += delta * delta2
-
-        if self._welford_n < 2:
-            return
-
-        variance = self._welford_m2 / (self._welford_n - 1)
-        std = float(np.sqrt(max(variance, 1e-8)))
-
-        # Z-score → sigmoid → [0, 1]
-        z = (episode_return - self._welford_mean) / std
-        reward_signal = float(1.0 / (1.0 + np.exp(-z)))
-
-        # ── Intrinsic progress (Lisman & Grace 2005) ──────────────────
-        self._episode_pred_errors.append(prediction_error_avg)
-        intrinsic = 0.0
-        if len(self._episode_pred_errors) >= 10:
-            arr = np.array(self._episode_pred_errors)
-            mid = len(arr) // 2
-            older = float(np.mean(arr[:mid]))
-            recent = float(np.mean(arr[mid:]))
-            if older > 1e-8:
-                intrinsic = float(np.clip((older - recent) / older, 0.0, 1.0))
-
-        # ── Smooth reward signal ──────────────────────────────────────
-        self._smoothed_reward = 0.85 * self._smoothed_reward + 0.15 * reward_signal
-
-        signal = float(np.clip(
-            self._smoothed_reward + 0.7 * intrinsic * (1.0 - self._smoothed_reward),
-            0.0, 1.0,
-        ))
-
-        # ── Asymmetric adaptation (hysteresis) ────────────────────────
-        if signal >= self.tonic_da:
-            decay = cfg.tonic_da_decay
-        else:
-            decay = 1.0 - (1.0 - cfg.tonic_da_decay) / 3.0
-
-        self.tonic_da = float(np.clip(
-            self.tonic_da * decay + signal * (1.0 - decay), 0.0, 1.0,
-        ))
+        # ── Tonic DA: continuous leaky integrator (Grace 1991) ────────
+        # Integrates |RPE| over ~60s window. No episode boundary needed.
+        rpe_abs = float(np.clip(abs(td_error), 0.0, 1.0))
+        self.tonic_da = (
+            self.tonic_da * cfg.tonic_da_decay
+            + rpe_abs * (1.0 - cfg.tonic_da_decay)
+        )
 
         # ── Stagnation tracking (ACC) ─────────────────────────────────
         self._tda_history.append(self.tonic_da)
@@ -218,6 +142,8 @@ class NeuromodulatorSystem:
             variability = float(np.std(list(self._tda_history)))
             raw_stag = float(np.clip(1.0 - variability / 0.05, 0.0, 1.0))
             self._stagnation_factor = 0.9 * self._stagnation_factor + 0.1 * raw_stag
+
+        self._clamp_all()
 
     # ------------------------------------------------------------------
     # Properties
@@ -252,11 +178,6 @@ class NeuromodulatorSystem:
     def planning_horizon(self) -> float:
         """5-HT → temporal discount / planning depth."""
         return self.serotonin
-
-    @property
-    def reward_history(self) -> list[float]:
-        """Episode return history (for sleep_gain computation)."""
-        return list(self._reward_history)
 
     # ------------------------------------------------------------------
     # Per-region NE / ACh
@@ -343,14 +264,8 @@ class NeuromodulatorSystem:
         self._error_history.clear()
         self._td_history.clear()
         self._da_rms = 1.0
-        self._smoothed_reward = 0.0
-        self._welford_n = 0
-        self._welford_mean = 0.0
-        self._welford_m2 = 0.0
         self._tda_history.clear()
         self._stagnation_factor = 0.0
-        self._episode_pred_errors.clear()
-        self._reward_history.clear()
         # Reset per-region to baselines
         for name in self._region_names:
             self._ne_levels[name] = self.noradrenaline

@@ -156,11 +156,7 @@ class SNNAgent(Agent):
         # ── Transient state ───────────────────────────────────────────
         self._last_td_error: float = 0.0
         self._step_count: int = 0
-        self._episode_return: float = 0.0
-        self._episode_steps: int = 0
         self._last_curiosity: float = 0.0
-        self._smooth_noise: float = 1.0
-        self._best_episode_return: float = -np.inf
         self._last_encoded_state: NDArray[np.float32] | None = None
 
     # ------------------------------------------------------------------
@@ -416,20 +412,7 @@ class SNNAgent(Agent):
                 novelty=0.0,
             )
 
-        # ── 6. Tonic DA (episode-level) ───────────────────────────────
-        self._episode_return += reward
-        self._episode_steps += 1
-        if done:
-            ep_pe = 0.0
-            if self._use_wm and self.world_model.error_history:
-                ep_pe = float(np.mean(self.world_model.error_history))
-            self.neuromod.update_tonic_da(
-                self._episode_return,
-                self._episode_steps,
-                prediction_error_avg=ep_pe,
-            )
-            self._episode_return = 0.0
-            self._episode_steps = 0
+        # ── 6. Tonic DA now updated per-step inside neuromod.update() ──
 
         # ── 7. NE-driven trace compression ────────────────────────────
         self.critic.set_plasticity_timescales(
@@ -445,16 +428,7 @@ class SNNAgent(Agent):
                 self.neuromod.planning_horizon,
             )
 
-        # ── 8. Exploration noise (per-episode smoothing) ──────────────
-        if done:
-            target_noise = self.bg.compute_exploration_noise(
-                self.neuromod.planning_horizon,
-                getattr(self.neuromod, 'tonic_da', 0.0),
-            )
-            acfg = self._agent_cfg
-            self._smooth_noise = (
-                self._smooth_noise * acfg.noise_smoothing + target_noise * (1.0 - acfg.noise_smoothing)
-            )
+        # ── 8. (Exploration noise is now continuous via tonic_da) ──────
 
         # ── 9. Store experience ───────────────────────────────────────
         if self._use_wm:
@@ -506,20 +480,14 @@ class SNNAgent(Agent):
 
         # ── 10. Sleep phase (end of episode) ──────────────────────────
         if done and self._use_wm and len(self.replay_buffer) > 0:
-            if self._episode_return > self._best_episode_return:
-                self._best_episode_return = self._episode_return
-
-            sleep_gain = 1.0
+            # sleep_gain derived from tonic_da: high tonic_da → good recent
+            # performance → more vigorous consolidation.
             acfg = self._agent_cfg
-            rh = self.neuromod.reward_history
-            if len(rh) >= 5:
-                r_arr = np.array(rh)
-                r_mean = float(np.mean(r_arr))
-                r_std = float(np.std(r_arr)) + 1e-8
-                quality = (self._episode_return - r_mean) / r_std
-                sleep_gain = float(np.clip(
-                    1.0 + acfg.sleep_gain_scale * quality, 1.0, acfg.sleep_gain_max,
-                ))
+            sleep_gain = float(np.clip(
+                1.0 + acfg.sleep_gain_scale * (self.neuromod.tonic_da * 2.0 - 1.0),
+                1.0,
+                acfg.sleep_gain_max,
+            ))
 
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,

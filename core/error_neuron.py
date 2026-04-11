@@ -14,11 +14,16 @@ Changes from legacy:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import ErrorNeuronConfig, init_weights
+from .config import ErrorNeuronConfig, NeuronConfig, init_weights
 from .free_energy import _broadcast_precision
+
+if TYPE_CHECKING:
+    from .astrocyte import AstrocyteField
 
 
 class ErrorNeuronLayer:
@@ -44,17 +49,20 @@ class ErrorNeuronLayer:
         self,
         n_input: int,
         config: ErrorNeuronConfig | None = None,
+        neuron_cfg: NeuronConfig | None = None,
     ) -> None:
         self.config = config or ErrorNeuronConfig()
         cfg = self.config
+        # AdEx parameters — use provided NeuronConfig or defaults
+        self._ncfg = neuron_cfg or NeuronConfig(ctx=cfg.ctx)
         self.n_input = n_input
         self.n_state = cfg.n_state
         self.n_error = cfg.n_error
 
         # ── State neuron membrane ─────────────────────────────────────
-        v_rest = -70.0  # mV (cortical pyramidal)
-        v_thresh = -55.0
-        v_reset = -75.0
+        v_rest = self._ncfg.v_rest
+        v_thresh = self._ncfg.v_thresh
+        v_reset = self._ncfg.v_reset
         self._v_rest = v_rest
         self._v_thresh = v_thresh
         self._v_reset = v_reset
@@ -71,6 +79,14 @@ class ErrorNeuronLayer:
         )
         self.spikes_error: NDArray[np.bool_] = np.zeros(self.n_error, dtype=bool)
         self.refrac_error: NDArray[np.int32] = np.zeros(self.n_error, dtype=np.int32)
+
+        # ── AdEx adaptation currents ──────────────────────────────────
+        self.w_adapt_state: NDArray[np.float32] = np.zeros(
+            self.n_state, dtype=np.float32,
+        )
+        self.w_adapt_error: NDArray[np.float32] = np.zeros(
+            self.n_error, dtype=np.float32,
+        )
 
         # ── Synaptic weights (principled init) ────────────────────────
         gap = abs(v_thresh - v_rest)
@@ -117,11 +133,82 @@ class ErrorNeuronLayer:
         # ── Receptor dose-response modulation (D2) ───────────────────
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
+
+        # ── Astrocyte ATP modulation (Krok 1.3, optional) ────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx_state: NDArray[np.int32] | None = None
+        self._zone_idx_error: NDArray[np.int32] | None = None
+
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx_state: NDArray[np.int32] | None = None,
+        zone_idx_error: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach AstrocyteField for ATP V_T / g_L modulation."""
+        self._astrocyte = astrocyte
+        self._zone_idx_state = (
+            zone_idx_state.astype(np.int32) if zone_idx_state is not None
+            else np.linspace(0, astrocyte.n_zones - 1, self.n_state).astype(np.int32)
+        )
+        self._zone_idx_error = (
+            zone_idx_error.astype(np.int32) if zone_idx_error is not None
+            else np.linspace(0, astrocyte.n_zones - 1, self.n_error).astype(np.int32)
+        )
+
+    def _adex_step(
+        self,
+        v: NDArray[np.float32],
+        w_adapt: NDArray[np.float32],
+        I_syn: NDArray[np.float32],
+        in_refrac: NDArray[np.bool_],
+        eff_v_thresh: float | NDArray[np.float32] | None = None,
+        eff_g_L: float | NDArray[np.float32] | None = None,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.bool_]]:
+        """Single AdEx integration step for either population.
+
+        Args:
+            eff_v_thresh: ATP-modulated V_T (or None → use ncfg.v_thresh).
+            eff_g_L: ATP-modulated g_L (or None → use ncfg.g_L).
+
+        Returns: (v_new, w_adapt_new, spiked)
+        """
+        ncfg = self._ncfg
+        ctx = ncfg.ctx
+        vt = eff_v_thresh if eff_v_thresh is not None else ncfg.v_thresh
+        gL = eff_g_L if eff_g_L is not None else ncfg.g_L
+
+        exp_term = np.exp(
+            np.clip((v - vt) / ncfg.delta_t, -20.0, 10.0),
+        )
+        inv_Cm = 1.0 / ncfg.C_m
+        F_v = inv_Cm * (
+            -gL * (v - ncfg.v_rest)
+            + gL * ncfg.delta_t * exp_term
+            + I_syn - w_adapt
+        )
+        J_v = inv_Cm * (-gL + gL * exp_term)
+        integrated = ctx.exp_euler_step(v, F_v, J_v)
+        v_new = np.where(in_refrac, ncfg.v_reset, integrated)
+
+        spiked = (v_new >= ncfg.v_spike_cutoff) & ~in_refrac
+        v_new[spiked] = ncfg.v_reset
+        w_adapt[spiked] += ncfg.b
+
+        # Subthreshold adaptation
+        w_adapt_new = (
+            w_adapt * ncfg.w_decay
+            + ncfg.a * (v_new - ncfg.v_rest) * ncfg.w_gain
+        )
+        return v_new, w_adapt_new, spiked
+
     def forward(
         self,
         input_spikes: NDArray[np.float32],
     ) -> NDArray[np.bool_]:
         """One dt step: error neurons compute ε, state neurons update μ.
+
+        Both populations use AdEx dynamics.
 
         Returns:
             (n_state,) boolean spike array.
@@ -136,34 +223,40 @@ class ErrorNeuronLayer:
         feedforward = inp @ self.w_in  # (n_error,)
         error_input = (self._ach_gain * feedforward - prediction) * self._receptor_gain
 
-        # ── Error neuron LIF (fast τ) ─────────────────────────────────
+        # ── Error neuron AdEx (fast τ) ────────────────────────────────
         in_refrac_e = self.refrac_error > 0
         self.refrac_error[in_refrac_e] -= 1
 
-        gain_e = 1.0 - cfg.error_decay
-        leaked_e = self.v_error * cfg.error_decay + self._v_rest * gain_e
-        integrated_e = leaked_e + error_input
-        self.v_error = np.where(in_refrac_e, self._v_reset, integrated_e)
+        # ATP modulation (Krok 1.3)
+        if self._astrocyte is not None:
+            ze = self._zone_idx_error
+            zs = self._zone_idx_state
+            vt_error = self._ncfg.v_thresh + self._astrocyte.threshold_shift[ze]
+            gL_error = self._ncfg.g_L * self._astrocyte.leak_gain[ze]
+            vt_state = self._ncfg.v_thresh + self._astrocyte.threshold_shift[zs]
+            gL_state = self._ncfg.g_L * self._astrocyte.leak_gain[zs]
+        else:
+            vt_error = vt_state = None
+            gL_error = gL_state = None
 
-        self.spikes_error = (self.v_error >= self._v_thresh) & ~in_refrac_e
-        self.v_error[self.spikes_error] = self._v_reset
+        self.v_error, self.w_adapt_error, self.spikes_error = self._adex_step(
+            self.v_error, self.w_adapt_error, error_input, in_refrac_e,
+            eff_v_thresh=vt_error, eff_g_L=gL_error,
+        )
         self.refrac_error[self.spikes_error] = cfg.refrac_period
 
         # ── State neuron drive: bottom-up error correction ────────────
         error_signal = self.spikes_error.astype(np.float32)
         state_input = error_signal @ self.w_bu  # (n_state,)
 
-        # ── State neuron LIF (slow τ) ─────────────────────────────────
+        # ── State neuron AdEx (slow τ) ────────────────────────────────
         in_refrac_s = self.refrac_state > 0
         self.refrac_state[in_refrac_s] -= 1
 
-        gain_s = 1.0 - cfg.state_decay
-        leaked_s = self.v_state * cfg.state_decay + self._v_rest * gain_s
-        integrated_s = leaked_s + state_input
-        self.v_state = np.where(in_refrac_s, self._v_reset, integrated_s)
-
-        self.spikes_state = (self.v_state >= self._v_thresh) & ~in_refrac_s
-        self.v_state[self.spikes_state] = self._v_reset
+        self.v_state, self.w_adapt_state, self.spikes_state = self._adex_step(
+            self.v_state, self.w_adapt_state, state_input, in_refrac_s,
+            eff_v_thresh=vt_state, eff_g_L=gL_state,
+        )
         self.refrac_state[self.spikes_state] = cfg.refrac_period
 
         # ── Rate EMA ──────────────────────────────────────────────────
@@ -256,6 +349,8 @@ class ErrorNeuronLayer:
         """Reset transient state. Weights preserved."""
         self.v_state.fill(self._v_rest)
         self.v_error.fill(self._v_rest)
+        self.w_adapt_state.fill(0.0)
+        self.w_adapt_error.fill(0.0)
         self.spikes_state.fill(False)
         self.spikes_error.fill(False)
         self.refrac_state.fill(0)

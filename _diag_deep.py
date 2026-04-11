@@ -28,9 +28,10 @@ print("=" * 72)
 print("  SECTION 1: AdEx Rheobase Analysis")
 print("=" * 72)
 
-# Critic g_L comes from NeuronConfig default (30 nS) since
-# SNNDeepCritic creates NeuronConfig without specifying g_L
+# Critic g_L now derived from C_m/tau_m (biophysical consistency fix)
 g_L_critic = ncfg_c.g_L
+# Actor g_L also derived from C_m/tau_m_msn_up in NeuronConfig
+g_L_actor_ncfg = ncfg_a.g_L
 g_L_actor_up = ncfg_a.C_m / actor.config.tau_m_msn_up
 g_L_actor_down = ncfg_a.C_m / actor.config.tau_m_msn_down
 gap = abs(ncfg_a.v_thresh - ncfg_a.v_rest)
@@ -40,11 +41,11 @@ i_rheo_critic = g_L_critic * (gap - delta_t)
 i_rheo_actor_up = g_L_actor_up * (gap - delta_t)
 i_rheo_actor_down = g_L_actor_down * (gap - delta_t)
 
-print(f"\nCritic NeuronConfig: g_L={g_L_critic} nS, C_m={ncfg_c.C_m} pF, "
-      f"tau_m={ncfg_c.tau_m} ms")
-print(f"Actor  NeuronConfig: g_L={ncfg_a.g_L} nS, C_m={ncfg_a.C_m} pF, "
-      f"tau_m={ncfg_a.tau_m} ms")
-print(f"  Actor Up-state effective g_L = C_m/tau_up = {g_L_actor_up:.2f} nS")
+print(f"\nCritic NeuronConfig: g_L={g_L_critic:.2f} nS (=C_m/tau_m={ncfg_c.C_m}/{ncfg_c.tau_m}), "
+      f"C_m={ncfg_c.C_m} pF, tau_m={ncfg_c.tau_m} ms")
+print(f"Actor  NeuronConfig: g_L={g_L_actor_ncfg:.2f} nS (=C_m/tau_m={ncfg_a.C_m}/{ncfg_a.tau_m}), "
+      f"C_m={ncfg_a.C_m} pF, tau_m={ncfg_a.tau_m} ms")
+print(f"  Actor Up-state effective g_L = C_m/tau_up = {g_L_actor_up:.2f} nS  (matches ncfg)")
 print(f"  Actor Down-state effective g_L = C_m/tau_down = {g_L_actor_down:.2f} nS")
 print(f"\nGap = |v_thresh - v_rest| = {gap:.1f} mV")
 print(f"delta_t = {delta_t:.1f} mV")
@@ -126,32 +127,53 @@ print("\n" + "=" * 72)
 print("  SECTION 5: Episode Run — Spike / Eligibility / Weight Tracking")
 print("=" * 72)
 
+# Monkey-patch forward() to accumulate spike counts across ALL substeps,
+# not just the last-substep snapshot.
+import types
+
+_orig_critic_fwd = critic.forward.__func__
+_orig_actor_fwd = actor.forward.__func__
+_cum_critic = [0]
+_cum_d1 = [0]
+_cum_d2 = [0]
+_v_max_c = [-999.0]
+_v_max_a = [-999.0]
+
+def _patched_critic_fwd(self, state_spikes):
+    result = _orig_critic_fwd(self, state_spikes)
+    _cum_critic[0] += int(np.sum(self.spikes_hidden))
+    _v_max_c[0] = max(_v_max_c[0], float(np.max(self.v_hidden)))
+    return result
+
+def _patched_actor_fwd(self, state_spikes):
+    result = _orig_actor_fwd(self, state_spikes)
+    _cum_d1[0] += int(np.sum(self.spikes_d1))
+    _cum_d2[0] += int(np.sum(self.spikes_d2))
+    _v_max_a[0] = max(_v_max_a[0], float(np.max(self.v_d1)))
+    return result
+
+critic.forward = types.MethodType(_patched_critic_fwd, critic)
+actor.forward = types.MethodType(_patched_actor_fwd, actor)
+
 w_d1_before = actor.w_d1.copy()
 w_h_before = critic.w_h.copy()
 
 state = env.reset(seed=42)
 agent.reset()
 total_reward = 0.0
-total_critic_spikes = 0
-total_actor_d1_spikes = 0
-total_actor_d2_spikes = 0
 max_e_h = 0.0
 max_e_d1 = 0.0
-v_max_critic = -999.0
-v_max_actor = -999.0
+
+n_sub = agent._n_substeps
+print(f"\nn_substeps = {n_sub} (tau_max / dt, unclamped)")
 
 for step in range(200):
     action = agent.act(state)
     ns, r, done, info = env.step(action)
     agent.observe(state, action, r, ns, done, info)
 
-    total_critic_spikes += int(np.sum(critic.spikes_hidden))
-    total_actor_d1_spikes += int(np.sum(actor.spikes_d1))
-    total_actor_d2_spikes += int(np.sum(actor.spikes_d2))
     max_e_h = max(max_e_h, float(np.max(np.abs(critic.e_h))))
     max_e_d1 = max(max_e_d1, float(np.max(np.abs(actor.e_d1))))
-    v_max_critic = max(v_max_critic, float(np.max(critic.v_hidden)))
-    v_max_actor = max(v_max_actor, float(np.max(actor.v_d1)))
 
     total_reward += r
     state = ns
@@ -161,14 +183,19 @@ for step in range(200):
 w_d1_after = actor.w_d1.copy()
 w_h_after = critic.w_h.copy()
 
+total_substeps = (step + 1) * 2 * n_sub  # act + observe
 print(f"\nEpisode: {step+1} steps, reward={total_reward:.0f}")
-print(f"\nSpike counts over episode:")
-print(f"  Critic hidden: {total_critic_spikes} (of {critic.config.hidden_size} neurons × {step+1} steps)")
-print(f"  Actor D1:      {total_actor_d1_spikes}")
-print(f"  Actor D2:      {total_actor_d2_spikes}")
-print(f"\nMax membrane voltage reached:")
-print(f"  Critic: {v_max_critic:.2f} mV  (threshold={ncfg_c.v_thresh:.1f}, cutoff={ncfg_c.v_spike_cutoff:.1f})")
-print(f"  Actor:  {v_max_actor:.2f} mV  (threshold={ncfg_a.v_thresh:.1f}, cutoff={ncfg_a.v_spike_cutoff:.1f})")
+print(f"Total substep calls: {total_substeps} ({step+1} steps × 2 × {n_sub} substeps)")
+print(f"\nCumulative spike counts (across ALL substeps):")
+print(f"  Critic hidden: {_cum_critic[0]}  "
+      f"(rate={_cum_critic[0]/(total_substeps*critic.config.hidden_size)*100:.2f}% per neuron per substep)")
+print(f"  Actor D1:      {_cum_d1[0]}  "
+      f"(rate={_cum_d1[0]/(total_substeps*actor.action_dim)*100:.2f}%)")
+print(f"  Actor D2:      {_cum_d2[0]}  "
+      f"(rate={_cum_d2[0]/(total_substeps*actor.action_dim)*100:.2f}%)")
+print(f"\nMax membrane voltage reached (across all substeps):")
+print(f"  Critic: {_v_max_c[0]:.2f} mV  (threshold={ncfg_c.v_thresh:.1f}, cutoff={ncfg_c.v_spike_cutoff:.1f})")
+print(f"  Actor:  {_v_max_a[0]:.2f} mV  (threshold={ncfg_a.v_thresh:.1f}, cutoff={ncfg_a.v_spike_cutoff:.1f})")
 print(f"\nMax eligibility trace magnitude:")
 print(f"  Critic e_h: {max_e_h:.8f}")
 print(f"  Actor e_d1: {max_e_d1:.8f}")
@@ -183,11 +210,14 @@ print("\n" + "=" * 72)
 print("  SECTION 6: Noise Unit Analysis")
 print("=" * 72)
 noise_std_mV = critic.config.membrane_noise_std
-print(f"\nmembrane_noise_std = {noise_std_mV} (documented as mV)")
-print(f"But noise is added to I_syn BEFORE AdEx division by C_m={ncfg_c.C_m} pF")
-print(f"Effective voltage noise per step ≈ noise_std / C_m × dt = "
-      f"{noise_std_mV / ncfg_c.C_m:.6f} mV  (near zero)")
-print(f"For rheobase-scale noise, need std ≈ g_L × 2.0 = {ncfg_c.g_L * 2.0:.0f} pA")
+critic_noise_pA = ncfg_c.g_L * noise_std_mV
+actor_noise_up_pA = g_L_actor_up * noise_std_mV
+print(f"\nmembrane_noise_std = {noise_std_mV} (config value)")
+print(f"Code multiplies by g_L before injecting as current (noise_std_pA = g_L × noise_std):")
+print(f"  Critic noise std: {ncfg_c.g_L:.2f} nS × {noise_std_mV} = {critic_noise_pA:.1f} pA")
+print(f"  Actor noise std (Up): {g_L_actor_up:.2f} nS × {noise_std_mV} = {actor_noise_up_pA:.1f} pA")
+print(f"  Critic noise / rheobase: {critic_noise_pA / i_rheo_critic * 100:.1f}%")
+print(f"  Actor noise / rheobase (Up): {actor_noise_up_pA / i_rheo_actor_up * 100:.1f}%")
 
 env.close()
 print("\n" + "=" * 72)

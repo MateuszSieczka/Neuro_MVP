@@ -180,12 +180,17 @@ class SNNDeepCritic:
         h = config.hidden_size
 
         # ── AdEx NeuronConfig for critic population ───────────────────
+        # Biophysical consistency: τ_m = C_m / g_L ⇒ g_L = C_m / τ_m
+        # Default g_L=30nS assumes cortical τ≈9.4ms; ventral striatal
+        # neurons with τ=15ms require g_L=18.7nS (C_m=281pF).
+        _C_m = 281.0  # NeuronConfig default (Brette & Gerstner 2005)
         self._ncfg = NeuronConfig(
             ctx=config.ctx,
             v_rest=config.v_rest,
             v_thresh=config.v_thresh,
             v_reset=config.v_reset,
             tau_m=config.tau_m_critic,
+            g_L=_C_m / config.tau_m_critic,
         )
 
         # ── Precomputed membrane decay ────────────────────────────────
@@ -473,12 +478,19 @@ class D1D2Actor:
         )
 
         # ── AdEx NeuronConfig for MSN (Up-state defaults) ────────────
+        # Biophysical consistency: τ_m = C_m / g_L ⇒ g_L = C_m / τ_m
+        # MSN Up-state τ=25ms with C_m=281pF → g_L=11.24nS
+        # (Wilson & Kawaguchi 1996).  Forward pass overrides g_L per
+        # neuron via bistable C_m/τ_eff, but ncfg.g_L must match
+        # Up-state for consistent gain derivation.
+        _C_m = 281.0  # NeuronConfig default (Brette & Gerstner 2005)
         self._ncfg = NeuronConfig(
             ctx=config.ctx,
             v_rest=config.v_rest,
             v_thresh=config.v_thresh,
             v_reset=config.v_reset,
             tau_m=config.tau_m_msn_up,
+            g_L=_C_m / config.tau_m_msn_up,
         )
 
         # ── Input gain from biophysics (AdEx rheobase) ─────────────────

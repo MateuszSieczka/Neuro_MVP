@@ -67,12 +67,20 @@ class SimulationContext:
 
         Uses np.expm1 to avoid catastrophic cancellation near z ≈ 0.
         Branch for |z| < 1e-4 uses Taylor: 1 + z/2 (error < z²/6 ≈ 10⁻⁹).
+        For |z| > 500 the asymptotic form exp(z)/z is used with a capped
+        exponent to avoid overflow/NaN while still producing a value
+        large enough to trigger AdEx spike detection.
         """
-        return np.where(
-            np.abs(z) < 1e-4,
-            1.0 + z * 0.5,
-            np.expm1(z) / z,
-        )
+        z_safe = np.asarray(z, dtype=np.float64)
+        small = np.abs(z_safe) < 1e-4
+        large = z_safe > 500.0
+        mid = ~small & ~large
+        out = np.empty_like(z_safe)
+        out[small] = 1.0 + z_safe[small] * 0.5
+        out[mid] = np.expm1(z_safe[mid]) / z_safe[mid]
+        # Asymptotic: phi1(z) ≈ exp(z)/z.  Cap exp arg to avoid inf.
+        out[large] = np.exp(np.minimum(z_safe[large], 700.0)) / z_safe[large]
+        return out
 
     def exp_euler_step(
         self,

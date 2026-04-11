@@ -173,6 +173,22 @@ class SNNAgent(Agent):
         self._last_curiosity: float = 0.0
         self._last_encoded_state: NDArray[np.float32] | None = None
 
+        # ── Integration substeps (Wang 2002: cortical decisions ~20-50 ms) ─
+        # The SNN needs multiple dt steps to integrate synaptic input
+        # and develop meaningful spike patterns.  Derived from the slowest
+        # BG membrane time constant to ensure at least one full τ_m of
+        # integration per environmental decision.
+        # NOTE: substeps only applied in act() since multiple substeps
+        # in observe() over-accumulate eligibility traces.
+        dt = self._bg_config.ctx.dt
+        tau_max = max(self._bg_config.tau_m_msn_up,
+                      self._bg_config.tau_m_critic)
+        # Use one full τ_m of integration (biophysical minimum for
+        # the membrane to reach ~63% of steady-state).  Clamping
+        # below τ/dt prevents MSN neurons from depolarising to
+        # spike cutoff, silencing the actor pathway.
+        self._n_substeps: int = max(1, round(tau_max / dt))
+
     # ------------------------------------------------------------------
     # Public properties
     # ------------------------------------------------------------------
@@ -286,8 +302,6 @@ class SNNAgent(Agent):
     def act(self, state: np.ndarray) -> int:
         state_f32 = state.astype(np.float32)
         pop_rates = self._pop_encoder.encode(state_f32)
-        encoded = self._poisson.encode(pop_rates)
-        self._last_encoded_state = encoded.copy()
 
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
         da_level = float(np.clip(
@@ -308,13 +322,20 @@ class SNNAgent(Agent):
                 da_level=wm_da,
             )
 
-        # ── Step the graph ────────────────────────────────────────────
-        sensory = self._build_sensory_inputs(encoded, state_f32)
-        self.network.step(
-            sensory_inputs=sensory,
-            neuromodulator=self.neuromod,
-            attention=self._attention,
-        )
+        # ── Integrate over substeps (Wang 2002) ──────────────────────
+        # Present the same sensory input for multiple SNN timesteps so
+        # membrane potentials, spike rates, and eligibility traces have
+        # time to reach a meaningful steady state.  Each substep draws
+        # fresh Poisson spikes from the same population rates.
+        for _sub in range(self._n_substeps):
+            encoded = self._poisson.encode(pop_rates)
+            sensory = self._build_sensory_inputs(encoded, state_f32)
+            self.network.step(
+                sensory_inputs=sensory,
+                neuromodulator=self.neuromod,
+                attention=self._attention,
+            )
+        self._last_encoded_state = encoded.copy()
 
         # ── Active Inference selection ────────────────────────────────
         if self._use_wm:
@@ -344,7 +365,6 @@ class SNNAgent(Agent):
         state_f32 = state.astype(np.float32)
         next_f32 = next_state.astype(np.float32)
         next_pop_rates = self._pop_encoder.encode(next_f32)
-        next_encoded = self._poisson.encode(next_pop_rates)
 
         is_truncated = info.get("truncated", False) if info else False
         is_terminal = done and not is_truncated
@@ -365,14 +385,31 @@ class SNNAgent(Agent):
         # Save V_trace baseline before processing next_state.
         prev_v_trace = self.critic.v_trace
 
-        # Route through NetworkGraph (oscillator tick, neuromodulator
-        # distribution, WM→critic/actor concat handled by graph).
-        sensory = self._build_sensory_inputs(next_encoded, next_f32)
-        outputs = self.network.step(
-            sensory_inputs=sensory,
-            neuromodulator=self.neuromod,
-            attention=self._attention,
-        )
+        # Freeze actor eligibility: the DA signal (TD error) should
+        # reinforce the DECISION synapses (from act()), not the
+        # observation synapses.  The network.step() below processes
+        # all layers including the actor, which would corrupt actor
+        # eligibility with next_state signals.  Saving and restoring
+        # matches the biological DA latency: dopamine arrives after
+        # the outcome and acts on the action-selection synapses
+        # (Schultz 1997).
+        _saved_e_d1 = self.actor.e_d1.copy()
+        _saved_e_d2 = self.actor.e_d2.copy()
+
+        # Integrate over substeps to let the critic develop a
+        # meaningful V(s') estimate (same rationale as act()).
+        for _sub in range(self._n_substeps):
+            next_encoded = self._poisson.encode(next_pop_rates)
+            sensory = self._build_sensory_inputs(next_encoded, next_f32)
+            outputs = self.network.step(
+                sensory_inputs=sensory,
+                neuromodulator=self.neuromod,
+                attention=self._attention,
+            )
+
+        # Restore actor eligibility to reflect only act(state) traces
+        self.actor.e_d1 = _saved_e_d1
+        self.actor.e_d2 = _saved_e_d2
 
         current_v = self.critic.last_value
 
@@ -394,8 +431,18 @@ class SNNAgent(Agent):
             1.0 + np.exp(acfg.consolidation_steepness * (gate - acfg.consolidation_midpoint))
         )
 
-        self.critic.update(td_error * plasticity_scale)
-        self.actor.update(td_error * plasticity_scale)
+        # DA arrives as a single phasic burst after the outcome
+        # (Schultz 1997) and modulates the FULL eligibility trace
+        # accumulated during cortical-striatal activity.  Dividing
+        # by n_substeps would artificially reduce the DA signal
+        # ~25×, making learning impractically slow.  Eligibility
+        # traces are naturally bounded by their per-step decay
+        # (τ_e) and the per-element dw clip (±0.1) plus column
+        # normalization prevent weight explosion.
+        td_for_update = td_error * plasticity_scale
+
+        self.critic.update(td_for_update)
+        self.actor.update(td_for_update)
 
         # ── 5. World model + neuromodulator update ────────────────────
         if self._use_wm:

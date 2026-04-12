@@ -45,9 +45,12 @@ class GaussianPopulationEncoder:
             value_min - margin, value_max + margin, n_neurons_per_dim
         ).astype(np.float32)  # (n_neurons_per_dim,)
 
-        # Sigma: inter-center spacing × 0.8 gives ~60% overlap at midpoint.
+        # Sigma: inter-center spacing × 0.5 maximises Fisher information
+        # in small populations (Pouget et al. 2000).  0.8× was optimal
+        # for 1000+ neurons; 15 neurons/dim needs sharper curves for
+        # adequate state discrimination in RL tasks.
         spacing = self._centers[1] - self._centers[0] if n_neurons_per_dim > 1 else 1.0
-        self._inv_2sigma2 = 1.0 / (2.0 * (0.8 * spacing) ** 2)
+        self._inv_2sigma2 = 1.0 / (2.0 * (0.5 * spacing) ** 2)
 
     def encode(self, values: np.ndarray) -> np.ndarray:
         """

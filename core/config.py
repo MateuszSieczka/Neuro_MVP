@@ -884,7 +884,7 @@ class AgentConfig(BaseConfig):
     td_clip: float = 50.0                      # gradient clipping on TD error
     consolidation_midpoint: float = 0.7        # sigmoid inflection for consolidation gate
     consolidation_steepness: float = 8.0       # sigmoid steepness
-    consolidation_floor: float = 0.8           # minimum plasticity scale
+    consolidation_floor: float = 1.0           # minimum plasticity scale (1.0 = gate disabled)
     noise_smoothing: float = 0.8               # EMA coefficient for exploration noise
     min_exploration: float = 0.15              # exploration noise floor
     sleep_gain_scale: float = 0.5              # quality → sleep_gain multiplier
@@ -907,9 +907,9 @@ class BasalGangliaConfig(BaseConfig):
       Down state: τ_m ≈ 80ms, high threshold (quiescent)
       Up state: τ_m ≈ 25ms, low threshold (ready to fire)
     """
-    gamma: float = 0.99
-    critic_lr: float = 7e-3
-    actor_lr: float = 5e-3
+    gamma: float = 0.95
+    critic_lr: float = 1e-3
+    actor_lr: float = 1e-2
     # Eligibility trace time constants
     tau_e_actor: float = 20.0
     tau_e_critic: float = 50.0
@@ -924,9 +924,9 @@ class BasalGangliaConfig(BaseConfig):
     v_thresh: float = -55.0
     v_reset: float = -75.0
     refrac_period: int = 2
-    membrane_noise_std: float = 2.0  # mV background cortical noise
+    membrane_noise_std: float = 1.0  # mV background cortical noise (Destexhe et al. 2003: 1-1.5 mV in vivo)
     hidden_size: int = 128
-    w_clip: float = 3.0
+    w_clip: float = 1.0
     w_clip_critic: float = 5.0
     # D1/D2 pathway balance (Frank 2005)
     d1_bias: float = 0.6    # D1 pathway relative strength at DA=0.5
@@ -935,19 +935,20 @@ class BasalGangliaConfig(BaseConfig):
     # Humphries, Stewart & Gurney 2006).  Each motor action is represented
     # by a population, not a single neuron.  Population sum gives robust
     # rate estimates for spike-based action selection.
-    neurons_per_action: int = 8
+    neurons_per_action: int = 32
     # Exploration
     exploration_noise: float = 0.3
     # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
     # Slow multiplicative weight adjustment targeting stable per-neuron
     # firing rate.  Prevents weight erosion and runaway excitation
     # without task-specific clip values.
-    homeo_target_rate: float = 0.05   # Target firing rate per neuron
+    homeo_target_rate: float = 0.01    # Target firing rate per neuron (Planert et al. 2010: MSN 1-10 Hz → 0.001-0.01 at dt=1ms)
     homeo_tau: float = 5000.0         # Slow rate-averaging τ (ms)
-    homeo_interval: int = 5000        # Forward steps between scaling events
+    homeo_interval: int = 200         # Forward steps between scaling events
     homeo_max_change: float = 0.02    # Max fractional change per event
     # Bidirectional DA modulation (Shen et al. 2008)
     ltd_ratio: float = 0.7            # LTD/LTP magnitude ratio (Shen et al. 2008)
+    d2_ltd_protection: float = 0.5    # D2 LTD ×0.5 under positive TD (Shen et al. 2008)
     # Synaptic degradation — protein turnover (Bhatt et al. 2009)
     readout_decay: float = 1e-5       # Per-step decay on readout weights
 

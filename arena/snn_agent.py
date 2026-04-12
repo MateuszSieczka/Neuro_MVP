@@ -128,8 +128,12 @@ class SNNAgent(Agent):
 
         # ── Create modules ────────────────────────────────────────────
         self.critic = SNNDeepCritic(bg_input_size, self._bg_config)
+        # internal_dim > 0 only when WM is active and needs a gate neuron.
+        # Without WM, the internal neuron wastes capacity and
+        # dilutes the motor population signal.
+        _internal_dim = 1 if self._use_working_memory else 0
         self.actor = D1D2Actor(
-            bg_input_size, n_actions, 1, self._bg_config,
+            bg_input_size, n_actions, _internal_dim, self._bg_config,
         )
 
         if self._use_working_memory:
@@ -178,8 +182,6 @@ class SNNAgent(Agent):
         # and develop meaningful spike patterns.  Derived from the slowest
         # BG membrane time constant to ensure at least one full τ_m of
         # integration per environmental decision.
-        # NOTE: substeps only applied in act() since multiple substeps
-        # in observe() over-accumulate eligibility traces.
         dt = self._bg_config.ctx.dt
         tau_max = max(self._bg_config.tau_m_msn_up,
                       self._bg_config.tau_m_critic)
@@ -188,6 +190,11 @@ class SNNAgent(Agent):
         # below τ/dt prevents MSN neurons from depolarising to
         # spike cutoff, silencing the actor pathway.
         self._n_substeps: int = max(1, round(tau_max / dt))
+        # Critic-only integration for V(s') in observe():
+        # use critic's own τ_m (faster than MSN τ_m), saving ~40% compute.
+        self._n_substeps_critic: int = max(1, round(
+            self._bg_config.tau_m_critic / dt,
+        ))
 
     # ------------------------------------------------------------------
     # Public properties
@@ -295,6 +302,54 @@ class SNNAgent(Agent):
 
         return sensory
 
+    def _build_critic_only_sensory(
+        self,
+        encoded: NDArray[np.float32],
+        raw_state: NDArray[np.float32],
+    ) -> dict[str, NDArray[np.float32]]:
+        """Build sensory_inputs with only critic (+ encoder if WM).
+
+        Used during observe()'s V(s') computation so the actor never
+        processes next_state.  The actor receives no sensory input;
+        network.step() will give it a zero-input forward pass where
+        membrane decays toward rest with no spikes and no eligibility
+        corruption.  Biologically correct: BG does not preview the
+        next state before movement (Schultz 1997).
+        """
+        sensory: dict[str, NDArray[np.float32]] = {}
+
+        if self._use_columnar:
+            col_sensory = split_input(
+                encoded, self._column_names, self._rf_size,
+            )
+            sensory.update(col_sensory)
+            if self._use_working_memory:
+                sensory["working_memory"] = encoded
+        else:
+            if self._use_working_memory:
+                sensory["working_memory"] = encoded
+                padded = np.zeros(
+                    self._encoded_size + self._wm_num_neurons, dtype=np.float32,
+                )
+                padded[self._wm_num_neurons:] = encoded
+                sensory["critic"] = padded
+            else:
+                sensory["critic"] = encoded
+            # Actor explicitly receives zeros — no next-state processing
+            actor_size = self.actor.num_inputs
+            sensory["actor"] = np.zeros(actor_size, dtype=np.float32)
+
+        if self._use_wm:
+            sensory["encoder"] = self.world_model._build_input(
+                raw_state, np.zeros(self.n_actions, dtype=np.float32),
+            )
+
+        return sensory
+
+    # _set_actor_policy_gradient REMOVED (was non-biological REINFORCE
+    # hack that destroyed STDP eligibility by 216×).  Replaced by
+    # gate_eligibility() call after substep loop — Redgrave et al. (2010).
+
     # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
@@ -326,27 +381,31 @@ class SNNAgent(Agent):
         self.actor.set_ne_level(self.neuromod.competition_sharpness)
 
         # ── Integrate over substeps (Wang 2002) ──────────────────────
-        # Present the SAME Poisson realisation for every substep so the
-        # network integrates a consistent spatial pattern (Softky &
-        # Koch 1993).  Re-sampling each step destroys the signal.
+        # Present the same sensory rate code for multiple SNN timesteps.
+        # Each substep draws fresh Poisson spikes from the same population
+        # rates — the rate is the signal, Poisson jitter provides
+        # biologically realistic trial-to-trial variability.
         self.actor.reset_spike_counts()  # New decision cycle (Lo & Wang 2006)
-        encoded = self._poisson.encode(pop_rates)       # single draw
-        self._act_value_sum = 0.0
+        self.critic.reset_spike_counts(self._n_substeps)  # Reset + set window
         for _sub in range(self._n_substeps):
+            encoded = self._poisson.encode(pop_rates)
             sensory = self._build_sensory_inputs(encoded, state_f32)
             self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
                 attention=self._attention,
             )
-            self._act_value_sum += self.critic.last_value
         self._last_encoded_state = encoded.copy()
 
-        # ── Action-specific eligibility gating (Redgrave et al. 2010) ─
-        # DA reinforcement targets only the winning action channel.
-        # Gate off non-selected motor eligibility so update() modifies
-        # only the selected action’s synaptic weights.
-        self.actor.gate_eligibility(self.actor.get_action())
+        # ── Gate eligibility to selected action (Redgrave et al. 2010) ─
+        # DA reinforcement targets only the synaptic pathways of the
+        # winning action channel.  Non-selected motor populations'
+        # eligibility is zeroed so update() modifies only the chosen
+        # action's weights.  This replaces the removed REINFORCE
+        # override with a biologically grounded gating mechanism.
+        action = self.actor.get_action()
+        if action >= 0:
+            self.actor.gate_eligibility(action)
 
         # ── Active Inference selection ────────────────────────────────
         if self._use_wm:
@@ -393,42 +452,81 @@ class SNNAgent(Agent):
         effective_reward = reward + intrinsic_r
 
         # ── 3. Critic step on next_state → TD error ──────────────────
-        # V(s) = population-averaged value over the decision window
-        # (Schultz 1998; Samejima et al. 2005: ventral striatal neurons
-        # encode V through time-integrated firing rate).
-        prev_v = self._act_value_sum / max(1, self._n_substeps)
+        # V(s) = firing-rate-normalised value at the end of the
+        # decision window.  The critic.last_value already divides
+        # spike counts by n_substeps (set in reset_spike_counts),
+        # so the final substep has the correct rate estimate.
+        prev_v = self.critic.last_value
 
-        # Freeze actor eligibility: the DA signal (TD error) should
-        # reinforce the DECISION synapses (from act()), not the
-        # observation synapses.  The network.step() below processes
-        # all layers including the actor, which would corrupt actor
-        # eligibility with next_state signals.  Saving and restoring
-        # matches the biological DA latency: dopamine arrives after
-        # the outcome and acts on the action-selection synapses
-        # (Schultz 1997).
+        # Freeze critic eligibility: the critic's eligibility traces
+        # (e_h, e_v, e_bv) were accumulated during act(state) and must
+        # be preserved for the weight update below.  Without this, the
+        # V(s') integration loop overwrites critic eligibility with
+        # next_state STDP traces, causing dw = lr × td × activation(s')
+        # instead of activation(s).
+        _saved_e_h = self.critic.e_h.copy()
+        _saved_e_v = self.critic.e_v.copy()
+        _saved_e_bv = self.critic.e_bv
+        _saved_c_x_pre = self.critic._x_pre.copy()
+        _saved_c_x_post = self.critic._x_post.copy()
+        _saved_c_t_pre = self.critic._t_since_pre.copy()
+        _saved_c_t_post = self.critic._t_since_post.copy()
+
+        # Freeze actor eligibility: DA phasic burst arrives after the
+        # outcome event and must modulate the eligibility accumulated
+        # during the motor response period (Schultz 1997).  Without
+        # save/restore, 15 substeps of decay (τ_e_actor=20ms →
+        # 0.951^15 = 0.463) destroy 54% of the credit assignment
+        # signal.  The critic-only sensory below ensures the actor
+        # receives zero input, so no new meaningful traces form.
         _saved_e_d1 = self.actor.e_d1.copy()
         _saved_e_d2 = self.actor.e_d2.copy()
+        _saved_a_x_pre = self.actor._x_pre.copy()
+        _saved_a_x_post_d1 = self.actor._x_post_d1.copy()
+        _saved_a_x_post_d2 = self.actor._x_post_d2.copy()
+        _saved_a_t_pre = self.actor._t_since_pre.copy()
+        _saved_a_t_d1 = self.actor._t_since_d1_spike.copy()
+        _saved_a_t_d2 = self.actor._t_since_d2_spike.copy()
 
         # Integrate over substeps to let the critic develop a
-        # meaningful V(s') estimate (same rationale as act()).
-        # Single Poisson draw — consistent spatial pattern across
-        # substeps (Softky & Koch 1993).
-        next_encoded = self._poisson.encode(next_pop_rates)
-        _v_next_sum = 0.0
-        for _sub in range(self._n_substeps):
-            sensory = self._build_sensory_inputs(next_encoded, next_f32)
+        # meaningful V(s') estimate.  Uses critic's own τ_m (15ms)
+        # rather than the full MSN τ (25ms).
+        # Reset critic spike counts for V(s') window with its own
+        # n_substeps so firing-rate normalisation matches this window.
+        self.critic.reset_spike_counts(self._n_substeps_critic)
+        for _sub in range(self._n_substeps_critic):
+            next_encoded = self._poisson.encode(next_pop_rates)
+            # Critic-only sensory: actor receives zeros so it does not
+            # process next_state (Schultz 1997: BG does not preview the
+            # next state before movement).
+            sensory = self._build_critic_only_sensory(next_encoded, next_f32)
             outputs = self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
                 attention=self._attention,
             )
-            _v_next_sum += self.critic.last_value
+
+        # V(s') = final rate-normalised value from the observe window
+        current_v = self.critic.last_value
+
+        # Restore critic eligibility to reflect only act(state) traces
+        self.critic.e_h = _saved_e_h
+        self.critic.e_v = _saved_e_v
+        self.critic.e_bv = _saved_e_bv
+        self.critic._x_pre = _saved_c_x_pre
+        self.critic._x_post = _saved_c_x_post
+        self.critic._t_since_pre = _saved_c_t_pre
+        self.critic._t_since_post = _saved_c_t_post
 
         # Restore actor eligibility to reflect only act(state) traces
         self.actor.e_d1 = _saved_e_d1
         self.actor.e_d2 = _saved_e_d2
-
-        current_v = _v_next_sum / max(1, self._n_substeps)
+        self.actor._x_pre = _saved_a_x_pre
+        self.actor._x_post_d1 = _saved_a_x_post_d1
+        self.actor._x_post_d2 = _saved_a_x_post_d2
+        self.actor._t_since_pre = _saved_a_t_pre
+        self.actor._t_since_d1_spike = _saved_a_t_d1
+        self.actor._t_since_d2_spike = _saved_a_t_d2
 
         if is_terminal:
             td_error = effective_reward - prev_v
@@ -438,12 +536,12 @@ class SNNAgent(Agent):
                 + self._bg_config.gamma * current_v
                 - prev_v
             )
-        # TD clip proportional to natural return scale 1/(1-γ)
-        # (Tobler et al. 2005 — adaptive DA coding bounded by
-        # discounted return magnitude).  Hardcoded td_clip can
-        # prevent convergence when V overshoots.
-        _natural_clip = 2.0 / max(1e-4, 1.0 - self._bg_config.gamma)
-        td_error = float(np.clip(td_error, -_natural_clip, _natural_clip))
+        # Adaptive TD clip: scale with current V(s) magnitude so that
+        # terminal punishment (-V(s)) is not attenuated when V grows.
+        # Tobler, Fiorillo & Schultz (2005): DA neurons adapt coding
+        # range to reward magnitude distribution.
+        _td_clip = max(10.0, 2.0 * abs(prev_v) + 5.0)
+        td_error = float(np.clip(td_error, -_td_clip, _td_clip))
         self._last_td_error = td_error
 
         # ── 4. Consolidation-gated plasticity ─────────────────────────

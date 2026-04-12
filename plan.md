@@ -1,3 +1,508 @@
+# PLAN: Naprawa SNN — Diagnostyka i Ścieżka do CartPole Gold
+
+## Status: Agent gorszy od losowego (mean=18.6 vs random=24.5)
+
+---
+
+## 0. DIAGNOSTYKA — Pełna Analiza Pipeline
+
+### 0.1 Architektura CartPole (bez WM, bez columnar, flat mode)
+
+```
+State (4D) → GaussianPopulationEncoder (4×15=60D)
+  → PoissonEncoder (60D binary per substep)
+  → [25 substeps] → SNNDeepCritic (60→128 LIF, readout→V(s))
+  → [25 substeps] → D1D2Actor (60→17 MSN bistable, 8 neurons×2 actions + 1 internal)
+  → observe(): [15 substeps critic-only] → V(s') → TD error → 3-factor STDP update
+```
+
+- `n_substeps_act = 25` (= τ_m_msn_up/dt = 25ms/1ms)
+- `n_substeps_observe = 15` (= τ_m_critic/dt = 15ms/1ms)
+- `input_gain = 125.76` (from AdEx rheobase derivation)
+- `neurons_per_action = 8`, `hidden_size = 128`
+
+### 0.2 Wyniki diagnostyczne (skrypty: `_diag_deep_analysis.py`, `_diag_focused.py`, `_diag_actor_spike.py`)
+
+#### PROBLEM 1: Actor MSN neurony ledwo spike'ują → selekcja akcji to szum
+
+**Dane:**
+
+- MSN neuron 0 potrzebuje 22 substepów aby osiągnąć spike cutoff -30 mV ze startu ~-60 mV
+- Po spike (reset do -75 mV), potrzebuje kolejnych ~25 substepów
+- Stabilna emisja: ~0.01 spike/neuron/ms = 10 Hz (biologicznie poprawna dla MSN)
+- Z 8 neuronami na akcję × 25 substepów → ~2 spike'i na akcję
+- Net evidence D1-D2 ≈ 1.5 ± 1.5, noise N(0, ~1.0) → ~coin flip
+
+**Test substepów:**
+
+```
+n_substeps= 10: total actor spikes=  0
+n_substeps= 25: total actor spikes=  7
+n_substeps= 50: total actor spikes= 16
+n_substeps=100: total actor spikes= 34
+n_substeps=200: total actor spikes= 68
+```
+
+Wynik: stała emisja ~0.01/neuron/step niezależnie od okna. To nie kwestia zbyt mało substepów — to MSN firing rate.
+
+**Root cause:** 8 neuronów per action × 1% firing rate = 0.08 spike'i/ms/action × 25ms = 2 total. Z tak niskim spike count, net evidence jest ZDOMINOWANY przez szum. Akcje są de facto losowe.
+
+**Bio comparison:** Biologicznie MSN firing rate 1-10 Hz jest poprawny (Planert et al. 2010). Ale biologiczny striatum ma ~1 milion MSN per action channel. Potrzebujemy albo więcej neuronów, albo innego readoutu.
+
+#### PROBLEM 2: D2 pathway umiera pod pozytywnym nagrodzeniem
+
+**Dane (50 epizodów):**
+
+```
+TD sign: 65-83% positive (CartPole daje +1 constant)
+D2 spk/step: 2.23 → 1.06 (halved in 50 eps)
+D1 spk/step: 6.79 → 12.99 (doubled)
+D2 weights: barely change (0.30 → 0.32)
+D1 weights: grow (0.35 → 0.42)
+```
+
+**Root cause:** Frank (2005) Go/NoGo: D2 LTP wymaga negatywnego TD (DA dip). W CartPole 65-83% TD jest pozytywne → D2 dostaje głównie LTD → zanika. Homeostaza (co 5000 kroków) jest za wolna dla epizodów ~20 kroków.
+
+#### PROBLEM 3: Critic V(s) nie rozróżnia stanów → brak sygnału uczenia
+
+**Dane (untrained network, 20 trials each):**
+
+```
+balanced   : V(s) = -0.019 ± 0.006
+tilt_right : V(s) = -0.023 ± 0.008
+tilt_left  : V(s) = -0.021 ± 0.007
+far_right  : V(s) = -0.020 ± 0.005
+falling    : V(s) = -0.031 ± 0.007
+```
+
+**SNR = 1.84** — krytycznie za mały do rozróżnienia stanów.
+
+**Root cause:** V(s) = w_v · (spike_count / n_substeps). Z 128 neuronami i ~155 total spike'ów w 25 substepach, rate ≈ 0.048 dla aktywnych neuronów, 0 dla reszty. Readout jest ultra-sparse, zaszumiony, praktycznie stały.
+
+Konsekwencja: TD error ≈ reward + γ×const - const ≈ 1.0 (constant). Critic generuje prawie identyczny TD per step, niezależnie od stanu. Brak informacyjnego sygnału uczenia.
+
+#### PROBLEM 4: Critic spike rate się zapada w czasie
+
+**Dane (100 epizodów):**
+
+```
+Ep 10:  critic spike rate = 2.08%
+Ep 50:  critic spike rate = 0.15%
+Ep 100: critic spike rate = 0.41%
+```
+
+**Root cause:** Wagi critic.w_h rosną (0.546 → 0.763), ale InhibitoryPool NIGDY nie spike'uje (0 inhibitory spikes we wszystkich substepach). Problem: interneurons mają V_thresh=-58 (niższy niż excitatory -55), ale ich wejście (spikes_exc @ w_ei) jest za słabe do depolaryzacji. Z critic spike rate 2% i w_ei mean=0.8, input to interneuron per step ≈ 0.02×128×0.8 = 2.05 — nie wystarczająco na depolarizację od -70 do -58.
+
+Bez inhibicji, bez E/I balance → wagi rosną bez limitu → adaptation current rośnie → paradoksalnie tłumi spiking.
+
+**KRYTYCZNE odkrycie:** InhibitoryPool jest martwy — 0 interneuronów spike'uje. Inhibicja GABA_A/B = 0 przez cały trening. E/I balance nie istnieje.
+
+#### PROBLEM 5: Populacja enkodująca zbyt jednorodna
+
+**Dane:**
+
+```
+Cosine sim (balanced vs 0.1 tilt): 0.969 (niemal identyczne!)
+Cosine sim (balanced vs 0.5 tilt): 0.759
+Only 4-6 neurons differ significantly out of 60
+```
+
+Cart position range: [-0.087, 0.067] — prawie zerowy w CartPole.
+Pole angle range: [-0.953, 0.964] — pełny zakres, ale tylko 1 wymiar z 4.
+
+**Root cause:** Gaussian population encoding z sigma overlap 60% tworzy gładkie, powolne zmiany. Drobne różnice stanów (ważne dla CartPole) są prawie nierozróżnialne.
+
+#### PROBLEM 6: Agent gorszy od losowego
+
+**Dane:**
+
+```
+SNN agent:  mean = 18.6, max = 75
+Random:     mean = 24.5, max = 65
+```
+
+Agent jest GORSZY niż losowy. To oznacza, że uczenie aktywnie PSUJE politykę. Prawdopodobna przyczyna: bias w D1/D2 (D1 rośnie, D2 umiera) powoduje tendencję do jednej akcji, co jest gorsze niż losowe 50/50.
+
+#### PROBLEM 7: internal_dim=1 marnuje zasoby
+
+- `D1D2Actor(state_size, n_actions=2, internal_dim=1, ...)` → action_dim = 2×8 + 1 = 17
+- 17-ty neuron nie jest ani motorem ani WM gate (bo use_working_memory=False)
+- Marnuje kolumnę wag i zaciemnia sygnał
+
+---
+
+## 1. PLAN NAPRAWY (priorytetyzowany od krytycznego do ważnego)
+
+### Zasady:
+
+- **Nie optymalizujemy pod CartPole** — naprawiamy fundamenty, które blokują KAŻDE zadanie
+- **Każda zmiana musi mieć podpis w literaturze** — bio lub fizyka
+- **Testujemy po każdej zmianie** — diagnostyczne skrypty weryfikują efekt
+
+---
+
+### FIX 1: Zwiększenie populacji aktora (neurons_per_action) [KRYTYCZNY]
+
+**Problem:** 8 neuronów × 1% rate = 2 spike'i/action/decision → szum dominuje sygnał.
+
+**Zmiana:** `BasalGangliaConfig.neurons_per_action: 8 → 32`
+
+**Uzasadnienie biologiczne:** Georgopoulos et al. (1986): kierunkowa selekcja w korze ruchowej wymaga populacji >30 neuronów dla wiarygodnego population vector. Humphries, Stewart & Gurney (2006): striatum MSN pools ~100+ per action channel w ich modelu.
+
+Z neurons_per_action=32: 32 × 0.01 × 25 = 8 spike'ów/action. Net evidence ≈ 8 ± 2.8 → SNR ≈ 2.8 (dużo lepiej).
+
+**Pliki:** `core/config.py` (BasalGangliaConfig.neurons_per_action)
+
+**Efekt:** InhibitoryPool_d1/d2 rośnie proporcjonalnie (auto n_interneurons = action_dim//2). Koszt obliczeniowy: umiarkowany (65→65 action_dim, ale macierze wag 60×65).
+
+---
+
+### FIX 2: Naprawienie InhibitoryPool — interneurony muszą spike'ować [KRYTYCZNY]
+
+**Problem:** Interneurony NIGDY nie spike'ują. GABA = 0 stale. E/I balance nie istnieje.
+
+**Root cause:** W InhibitoryPool.step(), interneurons dostają wejście `i_input = exc_spikes @ w_ei`. Z excitatory spike rate ~2% i 128 excitatory neurons: ~2.5 spike'ów aktywnych. Z w_ei_mean=0.8: i_input per interneuron ≈ 2.5 × 0.8 = 2.0. Ale interneuron ma V_thresh=-58, V_rest=-70, gap=12 mV. Rheobase z τ_m=8ms, g_L=281/8=35.1 nS: I_rheo = g_L × (gap - delta_t) = 35.1 × 10 = 351 pA.
+
+2.0 vs 351 — input jest **175× za mały**! w_ei weights are in "arbitrary units" but the interneuron needs hundreds of pA.
+
+**Zmiana:** Input do interneuronów musi być skalowany tak jak główne neurony — przez input_gain odpowiadający biofizyce:
+
+1. Dodać odpowiedni gain scaling w InhibitoryPool (analogiczny do `_derive_input_gain` w basal_ganglia.py)
+2. Alternatywnie: znormalizować w_ei tak aby expected input ≈ I_rheo
+
+**Pliki:** `core/interneuron.py`
+
+**Uzasadnienie:** Brunel & Wang (2003): PV+ interneurony w korze mają niższy próg ale otrzymują proporcjonalnie silniejsze wejście excytatoryjne. E/I balance jest fundamentem stabilnej dynamiki sieciowej.
+
+---
+
+### FIX 3: Usunięcie internal_dim z CartPole (i ogólnie gdy nie potrzebny) [WAŻNY]
+
+**Problem:** `internal_dim=1` dodaje fantomowy neuron #17.
+
+**Zmiana:** W `arena/snn_agent.py`, gdy `use_working_memory=False`:
+
+```python
+self.actor = D1D2Actor(
+    bg_input_size, n_actions, 0, self._bg_config,  # internal_dim=0
+)
+```
+
+**Pliki:** `arena/snn_agent.py`
+
+---
+
+### FIX 4: Naprawienie D2 pathway maintenance [KRYTYCZNY]
+
+**Problem:** D2 umiera pod konstant-pozytywnym reward. Homeostaza co 5000 kroków jest za wolna.
+
+**Zmiana:** Trzy komplementarne mechanizmy:
+
+**4a. Przyspieszyć homeostazę D2:**
+`BasalGangliaConfig.homeo_interval: 5000 → 500`
+Uzasadnienie: Turrigiano (2008): homeostatic scaling w kulturach neuronalnych działa na skali godzin. Ale w symulacji z dt=1ms, 500 kroków = 500ms. Przy epizodach ~20 kroków, homeostaza działa co ~25 epizodów.
+
+**4b. Asymmetric LTD ratio — D2 powinno być bardziej odporne na erozję:**
+Dodać `BasalGangliaConfig.d2_ltd_protection: float = 0.5` — D2 LTD mnożone przez ten factor. Uzasadnienie: Shen et al. (2008) pokazali że D2-MSN mają asymetryczne progi LTP/LTD, z silniejszą opornością na depotencjację.
+
+**4c. Tonic DA baseline powinno PODTRZYMYWAĆ D2:**
+Frank (2005): tonic DA utrzymuje baseline output obu pathways. Obecnie tonic_da wpływa tylko na consolidation_gate. Dodać: bazowa stymulacja D2 proporcjonalna do tonic_da (niski tonic_da → D2 bardziej aktywne → eksploracja).
+
+**Pliki:** `core/config.py`, `core/basal_ganglia.py` (D1D2Actor.update i forward)
+
+---
+
+### FIX 5: Readout V(s) oparty na membrane potential, nie na spike count [KRYTYCZNY]
+
+**Problem:** SNR readoutu na spike count = 1.84. Jeden z 128 neuronów fire'uje → wartość zmienia się skokowo.
+
+**Zmiana:** Zamienić readout na **mean membrane potential** zamiast spike rate:
+
+```python
+# STARY (ultra-sparse, noise-dominated)
+rate = self._spike_count / self._n_substeps
+current_v = np.dot(self.w_v, rate) + self.b_v
+
+# NOWY (smooth, continuous, biologically valid)
+# Normalize voltage to [0, 1] range
+v_normalized = np.clip(
+    (self.v_hidden - self.config.v_rest) / (self.config.v_thresh - self.config.v_rest),
+    0.0, 1.0,
+)
+current_v = np.dot(self.w_v, v_normalized) + self.b_v
+```
+
+**Uzasadnienie biologiczne:** Shadlen & Newsome (2001): neural population codes use both spike rates AND subthreshold fluctuations. Membrane potential carries more information than binary spike trains in small populations. Priebe & Ferster (2008): subthreshold membrane potential in V1 carries reliable orientation signals even when spike rate is very low.
+
+Potencjał membranowy jest ciągły, smooth, i zawiera informację o aktualnym inputie. Przy 128 neuronach z ciągłym V w [0, 1], readout ma pełny dynamic range.
+
+**Pliki:** `core/basal_ganglia.py` (SNNDeepCritic.forward)
+
+**UWAGA:** Eligibility traces (e_v) muszą być zaktualizowane analogicznie — eligibility powinna śledzić v_normalized, nie spike booleans.
+
+---
+
+### FIX 6: Action selection na basis membrane potential, nie spike count [KRYTYCZNY]
+
+**Problem:** Identyczny problem jak FIX 5 ale dla actora. 2 spike'i/action → coin flip.
+
+**Zmiana:**
+
+```python
+# STARY (noise-dominated spike counts)
+motor_d1 = self._spike_count_d1[:total_motor].reshape(...).sum(axis=1)
+motor_d2 = self._spike_count_d2[:total_motor].reshape(...).sum(axis=1)
+net_evidence = motor_d1 - motor_d2
+
+# NOWY (membrane potential based — population mean voltage)
+v_d1_norm = np.clip((self.v_d1 - cfg.v_rest) / (cfg.v_thresh - cfg.v_rest), 0, 1)
+v_d2_norm = np.clip((self.v_d2 - cfg.v_rest) / (cfg.v_thresh - cfg.v_rest), 0, 1)
+motor_d1_v = v_d1_norm[:total_motor].reshape(motor_dim, n_per_action).mean(axis=1)
+motor_d2_v = v_d2_norm[:total_motor].reshape(motor_dim, n_per_action).mean(axis=1)
+net_evidence = motor_d1_v - motor_d2_v
+```
+
+**Uzasadnienie:** Cisek (2007): action selection in premotor cortex reflects continuous competition of activity levels, not discrete spike counts. The "urgency signal" framework (Cisek & Kalaska 2010) operates on graded neural activity.
+
+**Pliki:** `core/basal_ganglia.py` (D1D2Actor.forward)
+
+**UWAGA o spójności z STDP:**
+STDP eligibility nadal opiera się na spike'ach (Bi & Poo 2001). To jest poprawne — uczenie jest spike-driven, ale readout korzysta z bogatszego sygnału napięciowego. Biologicznie: basal ganglia output nuclei (GPi/SNr) integrują z graded synaptic input, nie z dyskretnych spike'ów-MSN (Humphries et al. 2006).
+
+---
+
+### FIX 7: Actor eligibility preservation during observe() [WAŻNY]
+
+**Problem:** Critic eligibility jest saved/restored w observe(), ale actor eligibility NIE jest. Podczas 15 substepów observe, actor eligibility decays: 0.951^15 = 46.3% → ponad połowa sygnału uczenia stracona.
+
+**Zmiana:** Save/restore actor eligibility analogicznie do critic:
+
+```python
+# W observe(), przed V(s') integration:
+_saved_e_d1 = self.actor.e_d1.copy()
+_saved_e_d2 = self.actor.e_d2.copy()
+_saved_a_x_pre = self.actor._x_pre.copy()
+_saved_a_x_post_d1 = self.actor._x_post_d1.copy()
+_saved_a_x_post_d2 = self.actor._x_post_d2.copy()
+_saved_a_t_pre = self.actor._t_since_pre.copy()
+_saved_a_t_d1 = self.actor._t_since_d1_spike.copy()
+_saved_a_t_d2 = self.actor._t_since_d2_spike.copy()
+
+# Po V(s') integration, przed update:
+self.actor.e_d1 = _saved_e_d1
+self.actor.e_d2 = _saved_e_d2
+self.actor._x_pre = _saved_a_x_pre
+self.actor._x_post_d1 = _saved_a_x_post_d1
+self.actor._x_post_d2 = _saved_a_x_post_d2
+self.actor._t_since_pre = _saved_a_t_pre
+self.actor._t_since_d1_spike = _saved_a_t_d1
+self.actor._t_since_d2_spike = _saved_a_t_d2
+```
+
+**USUNĄĆ** komentarz w observe() mówiący że actor eligibility celowo nie jest preserved. Ten komentarz argumentuje że "residual eligibility" jest potrzebna dla non-selected actions. Ale to jest BŁĄD logiczny: gate_eligibility() already zeroed non-selected actions' eligibility. observe() doesn't rebuild meaningful eligibility because the actor receives zeros for next_state (in critic-only mode). W flat mode actor gets full next_state input, which corrupts eligibility with next_state traces — this is wrong, because we want to credit the STATE that caused the action, not the next state.
+
+**Uzasadnienie:** Schultz (1997): DA phasic burst arrives after the outcome event and modulates eligibility traces accumulated during the preceding motor response. The eligibility should reflect the action period, not the observation period.
+
+**Pliki:** `arena/snn_agent.py` (observe method)
+
+---
+
+### FIX 8: Naprawienie consolidation gate [UMIARKOWANY]
+
+**Problem:** `consolidation_floor=0.8` → plasticity_scale always 0.8-0.85. Tłumi 15-20% już marginalny sygnał uczenia.
+
+**Zmiana:** `AgentConfig.consolidation_floor: 0.8 → 1.0` (efektywnie wyłącza consolidation gate).
+
+Alternatywnie: zmienić logikę aby gate był 1.0 by default i spadał tylko w specyficznych okolicznościach (catastrophic interference detection).
+
+**Uzasadnienie:** Consolidation gate powinien chronić wiedzę, nie spowalniać jej nabywanie. Obecna implementacja ZAWSZE tłumi plastyczność. To nie jest feature — to bug w parametrze.
+
+**Pliki:** `core/config.py` (AgentConfig)
+
+---
+
+### FIX 9: Population encoder — sharper tuning curves [UMIARKOWANY]
+
+**Problem:** Cosine sim 0.97 między stanami różniącymi się o 0.1 to za mało discriminative.
+
+**Zmiana:** Zmniejszyć sigma overlap z 0.8 na 0.5:
+
+```python
+# GaussianPopulationEncoder.__init__
+# OLD: sigma = 0.8 * spacing
+# NEW: sigma = 0.5 * spacing → sharper tuning, less overlap
+self._inv_2sigma2 = 1.0 / (2.0 * (0.5 * spacing) ** 2)
+```
+
+**Uzasadnienie:** Pouget et al. (2000): optimal population coding has sigma ≈ 0.3-0.5× spacing for maximum Fisher information in small populations. The 0.8× overlap is appropriate for large populations (1000+) but suboptimal for 15 neurons per dimension.
+
+Alternatywnie/additionally: zwiększyć `n_neurons_per_dim: 15 → 25`. To da 100D zamiast 60D — dwa razy więcej input information. Koszt: proporcjonalnie większe macierze wag.
+
+**Pliki:** `core/spike_encoder.py` (GaussianPopulationEncoder)
+
+---
+
+### FIX 10: Dodanie NMDA-like synaptic integration w critic/actor [WAŻNY, TRUDNY]
+
+**Problem:** Każdy substep generuje niezależne Poisson spike'i. Neuron dostaje "szarpnięcia" prądu co 1ms, nie ciągły drive. Membrana decay'uje między substepami z dobrym inputem a substepami z kiepskim inputem.
+
+**Zmiana:** Dodać slow synaptic current trace (modelujący NMDA τ=100ms):
+
+```python
+# W forward() critic/actor, PRZED integration step:
+self._i_nmda *= self._nmda_decay  # exp(-dt/100) = 0.99
+self._i_nmda += 0.3 * current     # NMDA fraction of total current (30%)
+I_total = 0.7 * current + self._i_nmda  # AMPA (70%) + NMDA (30%)
+```
+
+**Uzasadnienie:** Myme et al. (2003): AMPA:NMDA ratio in cortex ≈ 2:1 to 4:1. NMDA provides sustained depolarization critical for temporal integration (Wang 2002). Without NMDA, the neuron can only integrate within a single timestep — there's no memory of recent input.
+
+**Nota:** Full NMDA with Mg²⁺ block (Jahr & Stevens 1990) is already defined in SynapseConfig. The simplified version above captures the key effect (slow temporal integration) without the voltage-dependent Mg²⁺ complexity. Full NMDA implementation comes in a later phase when conductance-based synapses are added.
+
+**Pliki:** `core/basal_ganglia.py` (SNNDeepCritic, D1D2Actor — add \_i_nmda state and modify forward)
+
+---
+
+### FIX 11: Zmniejszenie membrane noise std [MAŁY]
+
+**Problem:** membrane_noise_std=2.0 mV → g_L_eff × 2.0 = ~22 pA noise std w critic. Z I_rheo=243 pA to ~9% noise — high for neurons that barely spike.
+
+**Zmiana:** `BasalGangliaConfig.membrane_noise_std: 2.0 → 1.0`
+
+**Uzasadnienie:** Destexhe et al. (2003): in vivo membrane fluctuations 1-2 mV RMS. 2.0 jest górną granicą; z małymi populacjami i sparse spiking, noise maskuje sygnał.
+
+**Pliki:** `core/config.py`
+
+---
+
+## 2. HACKIEJARE I UPROSZCZENIA DO ZNALEZIENIA/USUNIĘCIA
+
+### 2.1 Hack: consolidation_gate sigmoid jest arbitralna
+
+```python
+plasticity_scale = consolidation_floor + (1.0 - consolidation_floor) / (
+    1.0 + np.exp(consolidation_steepness * (gate - consolidation_midpoint)))
+```
+
+Brak cytowania. Parametry (floor=0.8, steepness=8, midpoint=0.7) nie mają biologicznego podłoża. FIX 8 neutralizuje ten problem.
+
+### 2.2 Hack: `_natural_clip = 2.0 / (1 - γ)` na TD error
+
+```python
+_natural_clip = 2.0 / max(1e-4, 1.0 - self._bg_config.gamma)
+```
+
+Z γ=0.99: clip = 200. To jest sensowne jako safety bound, ale mnożnik 2.0 jest arbitralny. Tobler et al. (2005) pokazują adaptive DA coding ale nie specyfikują liczbowo 2.0× return magnitude. Uznajemy za akceptowalne safety bound — nie wymaga natychmiastowej zmiany.
+
+### 2.3 Hack: sleep_gain derived from tonic_da
+
+```python
+sleep_gain = clip(1.0 + 0.5 * (tonic_da * 2.0 - 1.0), 1.0, 2.5)
+```
+
+Mnożniki 0.5, 2.0, -1.0, 2.5 nie mają bibliografii. Ale sleep jest wyłączony dla CartPole (use_world_model=False), więc nie wpływa na obecny problem.
+
+### 2.4 Potencjalny hack: temperature = 1 + 4×(NE-0.5)²
+
+Inverse-U (Usher & Damasio 2000) jest cytowany, ale kształt kwadratowy z mnożnikiem 4.0 jest uproszczony. Biologicznie NE-temperature relationship jest bardziej skomplikowane (Aston-Jones & Cohen 2005). Akceptowalne jako first-order approximation.
+
+### 2.5 Potencjalny problem: `_v_trace_decay = exp(-dt/200) = 0.995`
+
+V_trace to EMA z τ=200ms. W CartPole z 25 substepami per decyzja, V_trace ledwo się zmienia między decyzjami (0.995^25 = 0.882). V_trace nie jest aktualnie używane do computation — only diagnostic (`v_trace`). Nie jest problemem ale jest martwym kodem.
+
+---
+
+## 3. KOLEJNOŚĆ IMPLEMENTACJI
+
+### Faza A: Przywrócenie bazowej funkcjonalności (agent ≥ random)
+
+1. **FIX 3**: Usuń internal_dim=1 (trivialny, 1 linijka)
+2. **FIX 7**: Actor eligibility preservation (copy-paste z critic pattern)
+3. **FIX 8**: consolidation_floor → 1.0 (1 linijka config)
+4. **FIX 11**: membrane_noise_std → 1.0 (1 linijka config)
+5. **FIX 2**: Napraw InhibitoryPool gain (dodaj input_gain do interneuron)
+6. **Uruchom diagnostic** — czy się poprawiło?
+
+### Faza B: Znacząca poprawa uczenia (agent >> random, trend rosnący)
+
+7. **FIX 5**: V(s) readout z membrane potential
+8. **FIX 6**: Action selection z membrane potential
+9. **FIX 4a/4b**: D2 maintenance (szybsza homeostaza + D2 LTD protection)
+10. **FIX 1**: neurons_per_action → 32
+11. **Uruchom diagnostic** — V(s) discrimination, D2 balance, action selection quality
+
+### Faza C: Fine-tuning i stabilizacja
+
+12. **FIX 9**: Sharper population encoding (sigma 0.5)
+13. **FIX 10**: NMDA-like synaptic integration
+14. **FIX 4c**: Tonic DA → D2 baseline modulation
+15. **Full 250 episode CartPole test** — target: mean > 200, last50 > 350
+
+---
+
+## 4. WERYFIKACJA PO KAŻDEJ FAZIE
+
+### Diagnostyki do uruchomienia (skrypty już istnieją):
+
+1. `_diag_deep_analysis.py` — pełny pipeline: spike rates, V(s), TD errors, weights, eligibility
+2. `_diag_focused.py` — InhibitoryPool accumulation, V(s) discrimination, D2 death, learning rate
+3. `_diag_actor_spike.py` — actor spike dynamics, substep requirements
+
+### Metryki sukcesu:
+
+| Metryka                | Stan obecny | Po Fazie A | Po Fazie B       | Po Fazie C       |
+| ---------------------- | ----------- | ---------- | ---------------- | ---------------- |
+| Mean score (200 ep)    | 18.6        | ≥ 25       | ≥ 80             | ≥ 200            |
+| V(s) SNR               | 1.84        | ≥ 3        | ≥ 10             | ≥ 20             |
+| D2 spike rate trend    | declining   | stable     | stable           | stable           |
+| Critic spike rate      | declining   | stable     | stable           | stable           |
+| Action balance (50/50) | biased      | balanced   | depends on state | depends on state |
+| InhibitoryPool active  | NO          | YES        | YES              | YES              |
+
+---
+
+## 5. CO NIE JEST PROBLEMEM (nie zmieniać)
+
+1. **AdEx model** — already implemented, biofizycznie poprawny
+2. **Exponential Euler integrator** — stabilny, A-stabilny
+3. **Three-factor STDP** — poprawna implementacja Bi & Poo (2001)
+4. **Neuromodulator 4-channel** — farmakologicznie poprawny
+5. **GaussianPopulationEncoder** — działa, choć sigma do tuning
+6. **PoissonEncoder** — standard bridge rate→spike
+7. **Dale's law enforcement** — poprawne
+8. **gamma=0.99** — standard RL discount
+9. **critic_lr=0.007, actor_lr=0.005** — rozsądne (effective weight change ~7% per episode)
+10. **Population encoding approach** — biologicznie uzasadnione (Pouget et al. 2000)
+
+---
+
+## 6. UWAGI O SKALOWANIU DO AGI
+
+### Co nie skaluje się:
+
+- Dense weight matrices O(N²) — plan.md Faza 2 (Small-World) rozwiązuje
+- CPU-only NumPy — docelowo wymaga GPU (CuPy/JAX)
+- Linear readout (w_v · rate) — docelowo potrzebny wielowarstwowy readout
+
+### Co skaluje się dobrze:
+
+- Spiking dynamics z AdEx — brak gradiętu do propagacji, lokalne reguły
+- Three-factor STDP — O(active_synapses), nie O(all_synapses)
+- Population coding — dodawanie wymiarów liniowo zwiększa reprezentację
+- D1/D2 dual pathway — generalizuje do dowolnej ilości akcji
+- Neuromodulator system — skaluje bez zmian (global broadcast)
+
+### Dlaczego CartPole jest dobrym testem:
+
+CartPole wymaga:
+
+- State discrimination (V(s) musi być różne dla dobrych i złych stanów)
+- Credit assignment (TD error musi wskazywać KIEDY zaczynają się złe decyzje)
+- Balanced exploration/exploitation (D1/D2 balance)
+- Temporal integration (decyzja oparta na ciągu obserwacji)
+
+Jeśli SNN nie może tego zrobić, nie rozwinie się do AGI. Naprawa tych fundamentów jest konieczna.
+
 # PLAN TRANSFORMACJI: SNN → Fundament AGI
 
 # Standalone — wystarczający do wykonania wraz z dostępem do kodu

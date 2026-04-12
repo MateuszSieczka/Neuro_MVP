@@ -43,12 +43,18 @@ class InhibitoryPool:
         cfg = self.config
 
         # AdEx parameters — Fast Spiking PV+ interneurons (a=0, b=0)
+        # Biophysical consistency: derive g_L from C_m / tau_m_inh
+        # so that the AdEx integrator uses the correct leak for the
+        # specified membrane time constant (Brunel & Wang 2003).
+        _C_m = 281.0  # NeuronConfig default (Brette & Gerstner 2005)
+        _g_L_inh = _C_m / cfg.tau_m_inh  # = 35.125 nS for tau=8ms
         self._ncfg = neuron_cfg or NeuronConfig(
             ctx=cfg.ctx,
             v_rest=cfg.v_rest,
             v_thresh=cfg.v_thresh,
             v_reset=cfg.v_reset,
             tau_m=cfg.tau_m_inh,
+            g_L=_g_L_inh,
             a=0.0,   # FS: no subthreshold adaptation
             b=0.0,   # FS: no spike-triggered adaptation
         )
@@ -90,6 +96,28 @@ class InhibitoryPool:
         self._trace_inh: NDArray[np.float32] = np.zeros(n_inh, dtype=np.float32)
         self._trace_decay: float = cfg.ctx.decay(20.0)  # τ = 20ms
 
+        # ── E→I input gain (biophysics: AdEx rheobase scaling) ────────
+        # PV+ interneurons receive convergent excitatory input and need
+        # sufficient current to reach threshold.  Without gain scaling,
+        # the raw E→I weight product is ~2 pA per step vs ~350 pA
+        # rheobase — a 175× mismatch (Brunel & Wang 2003).
+        #
+        # Gain is derived identically to the main pathway:
+        #   I_rheo = g_L × (V_T - E_L - Δ_T)
+        #   gain = I_rheo / (expected_active_inputs × mean_weight)
+        #
+        # Pessimistic estimate: PV+ interneurons must fire even with
+        # very sparse excitatory input.  In vivo, single cortical
+        # spikes can trigger PV+ firing (Gabernet, Jadhav & Feldman
+        # 2005).  Use min(3, expected) to ensure sensitivity.
+        ncfg = self._ncfg
+        gap_inh = abs(ncfg.v_thresh - ncfg.v_rest)
+        i_rheo_inh = ncfg.g_L * (gap_inh - ncfg.delta_t)
+        expected_active_exc = max(1.0, min(3.0, n_excitatory * cfg.target_sparsity))
+        self._input_gain: float = float(
+            i_rheo_inh / (expected_active_exc * cfg.w_ei_mean)
+        )
+
         # ── DA modulation gain ────────────────────────────────────────
         self._ie_gain: float = 1.0
 
@@ -124,8 +152,8 @@ class InhibitoryPool:
         exc_f32 = exc_spikes.astype(np.float32)
         cfg = self.config
 
-        # ── E→I drive ─────────────────────────────────────────────────
-        i_input = exc_f32 @ self.w_ei  # (n_inh,)
+        # ── E→I drive (scaled to AdEx rheobase) ──────────────────────
+        i_input = exc_f32 @ self.w_ei * self._input_gain
 
         # ── Interneuron AdEx integration ──────────────────────────────
         ncfg = self._ncfg

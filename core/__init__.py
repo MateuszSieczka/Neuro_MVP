@@ -21,6 +21,7 @@ from .config import (
     ReplayBufferConfig,
     ActiveInferenceConfig,
     BasalGangliaConfig,
+    VTAConfig,
     AgentConfig,
     ReceptorType,
     SynapseType,
@@ -30,6 +31,7 @@ from .config import (
     PFC_RECEPTORS,
     STRIATUM_D1_RECEPTORS,
     STRIATUM_D2_RECEPTORS,
+    STRIATUM_ACTOR_RECEPTORS,
     init_weights,
     compute_weight_std,
 )
@@ -75,11 +77,13 @@ from .world_model import SNNWorldModel, EncoderSnapshot, RehearsalResult
 
 # -- Basal ganglia --
 from .basal_ganglia import (
-    BasalGangliaAGISystem,
     ActiveInferenceModule,
     D1D2Actor,
     SNNDeepCritic,
 )
+
+# -- VTA dopaminergic circuit --
+from .vta import VTACircuit
 
 # -- Network orchestration --
 from .network import NetworkGraph, LayerConnection

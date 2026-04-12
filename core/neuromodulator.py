@@ -23,6 +23,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .config import NeuromodulatorConfig
+from .receptor import hill_response, RECEPTOR_PARAMS, ReceptorType
 
 
 class NeuromodulatorSystem:
@@ -51,7 +52,7 @@ class NeuromodulatorSystem:
         self._td_history: deque[float] = deque(maxlen=100)
 
         # ── DA RMS with proper τ (config.da_rms_decay) ────────────────
-        self._da_rms: float = 1.0
+        self._da_rms: float = cfg.baseline_da
 
         # ── Stagnation detector (ACC) ─────────────────────────────────
         self._tda_history: deque[float] = deque(maxlen=30)
@@ -87,7 +88,11 @@ class NeuromodulatorSystem:
             cfg.da_rms_decay * self._da_rms ** 2
             + (1.0 - cfg.da_rms_decay) * td_error ** 2
         ))
-        da_gain = 0.35 / max(self._da_rms, 0.1)
+        # Weber-Fechner adaptive coding (Tobler et al. 2005):
+        # gain = baseline_da / max(da_rms, baseline_da)
+        # At da_rms=1: gain=0.5 → coding range [0, 1].
+        # At da_rms→0: gain=1.0 → maximum sensitivity.
+        da_gain = cfg.baseline_da / max(self._da_rms, cfg.baseline_da)
         rpe_signal = float(np.clip(
             cfg.baseline_da + da_gain * td_error, 0.0, 1.0,
         ))
@@ -115,7 +120,13 @@ class NeuromodulatorSystem:
         self._td_history.append(float(np.clip(abs(td_error), 0.0, 10.0)))
         avg_td = float(np.mean(self._td_history)) if self._td_history else 5.0
         td_stability = 1.0 / (1.0 + avg_td)
-        reward_quality = 1.0 / (1.0 + np.exp(-(self.tonic_da * 4.0 - 2.0)))
+        # Hill equation for DRN 5-HT response to tonic DA
+        # Using RECEPTOR_PARAMS for HT1A (ec50=0.4, hill_n=1.0)
+        # to maintain consistency with pharmacological database.
+        _ht1a = RECEPTOR_PARAMS[ReceptorType.HT1A]
+        reward_quality = float(hill_response(
+            self.tonic_da, _ht1a.ec50, _ht1a.hill_n,
+        ))
         behavioral_stability = float(td_stability * reward_quality)
 
         # Dorsal raphe anatomy weights (config)
@@ -138,10 +149,19 @@ class NeuromodulatorSystem:
 
         # ── Stagnation tracking (ACC) ─────────────────────────────────
         self._tda_history.append(self.tonic_da)
-        if len(self._tda_history) >= 10:
-            variability = float(np.std(list(self._tda_history)))
-            raw_stag = float(np.clip(1.0 - variability / 0.05, 0.0, 1.0))
-            self._stagnation_factor = 0.9 * self._stagnation_factor + 0.1 * raw_stag
+        if len(self._tda_history) >= 10 and len(self._td_history) >= 10:
+            # Coefficient of variation of recent TD errors:
+            # low CV → predictable outcomes → stagnation signal
+            td_arr = np.array(list(self._td_history))
+            td_cv = float(np.std(td_arr) / (np.mean(np.abs(td_arr)) + 1e-6))
+            raw_stag = float(np.clip(1.0 - td_cv, 0.0, 1.0))
+            # Smoothing τ = 10 × mean_episode_length ≈ 200 steps.
+            # decay = exp(-1/200) ≈ 0.995 (replace ad-hoc 0.9/0.1)
+            stag_decay = 0.995
+            self._stagnation_factor = (
+                stag_decay * self._stagnation_factor
+                + (1.0 - stag_decay) * raw_stag
+            )
 
         self._clamp_all()
 
@@ -156,10 +176,17 @@ class NeuromodulatorSystem:
 
     @property
     def consolidation_gate(self) -> float:
-        """sqrt(tonic_da × serotonin) with ACC stagnation attenuation."""
-        raw = float(np.sqrt(self.tonic_da * self.serotonin))
+        """tonic_da × serotonin with ACC stagnation attenuation.
+
+        Biological: consolidation requires both sustained performance
+        (tonic DA) AND predictable environment (5-HT).  Multiplicative
+        gating is the correct conjunction (Doya 2002).
+        """
+        raw = float(self.tonic_da * self.serotonin)
         if 0.3 < self.tonic_da < 0.7:
-            acc = 1.0 - 0.5 * self._stagnation_factor
+            # ACC stagnation attenuates consolidation multiplicatively.
+            # stagnation_factor ∈ [0,1] directly scales consolidation.
+            acc = 1.0 - self._stagnation_factor
         else:
             acc = 1.0
         return raw * acc
@@ -218,9 +245,12 @@ class NeuromodulatorSystem:
 
         for name in self._region_names:
             local_pe = region_errors.get(name, 0.0)
-            # NE: global baseline + local PE boost (LC regional projection)
+            # NE: LC regional gain follows Weber law (Berridge & Waterhouse 2003):
+            # NE_region = NE_global × (1 + local_pe / (1 + local_pe))
+            # Proportional boost scaled by local surprise without arbitrary coefficient.
+            pe_boost = local_pe / (1.0 + abs(local_pe))
             self._ne_levels[name] = float(np.clip(
-                self.noradrenaline + 0.3 * local_pe, 0.0, 1.0,
+                self.noradrenaline * (1.0 + pe_boost), 0.0, 1.0,
             ))
             # ACh: global level (basal forebrain uniform projection)
             self._ach_levels[name] = self.acetylcholine
@@ -263,7 +293,7 @@ class NeuromodulatorSystem:
         self.serotonin = cfg.baseline_sero
         self._error_history.clear()
         self._td_history.clear()
-        self._da_rms = 1.0
+        self._da_rms = cfg.baseline_da
         self._tda_history.clear()
         self._stagnation_factor = 0.0
         # Reset per-region to baselines

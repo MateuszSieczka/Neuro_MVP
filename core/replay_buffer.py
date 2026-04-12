@@ -28,7 +28,6 @@ from .sequence_memory import SequenceMemory
 if TYPE_CHECKING:
     from .world_model import SNNWorldModel
     from .neuromodulator import NeuromodulatorSystem
-    from .basal_ganglia import BasalGangliaAGISystem
 
 
 # =====================================================================
@@ -110,7 +109,7 @@ class ReplayBuffer:
         self,
         world_model: "SNNWorldModel",
         neuromodulator: "NeuromodulatorSystem",
-        bg: "BasalGangliaAGISystem",
+        bg: object,
         n_experiences: int | None = None,
         sequence_memories: dict[str, SequenceMemory] | None = None,
         gamma: float | None = None,
@@ -186,7 +185,7 @@ class ReplayBuffer:
         self,
         experiences: list[Experience],
         world_model: "SNNWorldModel",
-        bg: "BasalGangliaAGISystem",
+        bg: object,
         gamma: float,
         sleep_gain: float,
         oscillator: object | None = None,
@@ -219,10 +218,10 @@ class ReplayBuffer:
         all_advantages: list[float] = []
         for i, exp in enumerate(reversed(experiences)):
             g_aug = cumulative_returns[i] + intrinsic_weight * exp.curiosity
-            # Use critic forward to get current V estimate (also updates V_trace)
+            # Use critic forward to get current V estimate (also updates activation)
             aug = exp.aug_state if exp.aug_state is not None else exp.state
             bg.critic.forward(aug)
-            vs = bg.critic.last_value
+            vs = bg.last_v
             all_advantages.append(g_aug - vs)
 
         adv_arr = np.array(all_advantages, dtype=np.float32)

@@ -598,6 +598,12 @@ STRIATUM_D1_RECEPTORS = ReceptorProfile(
 STRIATUM_D2_RECEPTORS = ReceptorProfile(
     d2_density=0.9, m4_density=0.3, alpha1_density=0.2,
 )
+# Actor profile: NO D1/D2 — DA pathway modulation is handled internally
+# in D1D2Actor.forward() via Hill equation on _da_level.  Only non-DA
+# cholinergic (M4) and noradrenergic (α1) receptors remain.
+STRIATUM_ACTOR_RECEPTORS = ReceptorProfile(
+    m4_density=0.3, alpha1_density=0.2,
+)
 
 
 # =====================================================================
@@ -880,11 +886,7 @@ class AgentConfig(BaseConfig):
     and sleep scheduling — previously hardcoded in SNNAgent.observe().
     """
     intrinsic_reward_weight: float = 0.1       # curiosity weight in effective_reward
-    da_offset: float = 0.0                     # shift for DA → learning_rate_modulation
     td_clip: float = 50.0                      # gradient clipping on TD error
-    consolidation_midpoint: float = 0.7        # sigmoid inflection for consolidation gate
-    consolidation_steepness: float = 8.0       # sigmoid steepness
-    consolidation_floor: float = 1.0           # minimum plasticity scale (1.0 = gate disabled)
     noise_smoothing: float = 0.8               # EMA coefficient for exploration noise
     min_exploration: float = 0.15              # exploration noise floor
     sleep_gain_scale: float = 0.5              # quality → sleep_gain multiplier
@@ -892,7 +894,6 @@ class AgentConfig(BaseConfig):
 
     def __post_init__(self) -> None:
         assert self.td_clip > 0, f"td_clip must be positive, got {self.td_clip}"
-        assert 0 < self.consolidation_floor <= 1, f"consolidation_floor must be in (0, 1], got {self.consolidation_floor}"
         assert 0 < self.min_exploration < 1, f"min_exploration must be in (0, 1), got {self.min_exploration}"
         assert self.sleep_gain_max > 0, f"sleep_gain_max must be positive, got {self.sleep_gain_max}"
 
@@ -907,12 +908,25 @@ class BasalGangliaConfig(BaseConfig):
       Down state: τ_m ≈ 80ms, high threshold (quiescent)
       Up state: τ_m ≈ 25ms, low threshold (ready to fire)
     """
-    gamma: float = 0.95
-    critic_lr: float = 1e-3
-    actor_lr: float = 1e-2
+    # γ = 0.99 → effective horizon = 1/(1-γ) = 100 steps.
+    # CartPole episodes can be 500 steps; γ=0.95 (horizon=20) gave
+    # poor V(s) discrimination because V(good) ≈ V(bad) ≈ 20.
+    # γ=0.99 is standard for tasks requiring long-term credit assignment.
+    # Biophysically: maps to tonic DA time scale (Grace 1991).
+    gamma: float = 0.99
+    # Two-timescale convergence (Konda & Tsitsiklis 2003): the critic
+    # must converge faster than the actor to provide a stable value
+    # signal.  actor_lr > critic_lr violates this requirement and
+    # causes noisy, non-stationary TD errors.
+    # Ratio 10:1 (critic:actor) prevents premature actor exploitation
+    # of noise before the critic develops state discrimination.
+    # With pure OpAL (D1/D2 sign-gated), slow actor lr prevents
+    # noise-driven pathway divergence during the critic warm-up period.
+    critic_lr: float = 3e-3
+    actor_lr: float = 1e-3
     # Eligibility trace time constants
-    tau_e_actor: float = 20.0
-    tau_e_critic: float = 50.0
+    tau_e_actor: float = 30.0    # Short tau for responsive EMA eligibility
+    tau_e_critic: float = 100.0   # Ventral striatum: moderate integration
     # NE compression (Aston-Jones & Cohen 2005)
     tau_ne_compression: float = 4.0
     # LIF parameters for BG populations
@@ -928,9 +942,6 @@ class BasalGangliaConfig(BaseConfig):
     hidden_size: int = 128
     w_clip: float = 1.0
     w_clip_critic: float = 5.0
-    # D1/D2 pathway balance (Frank 2005)
-    d1_bias: float = 0.6    # D1 pathway relative strength at DA=0.5
-    d2_bias: float = 0.4    # D2 pathway relative strength at DA=0.5
     # Population coding: neurons per action channel (Georgopoulos 1986;
     # Humphries, Stewart & Gurney 2006).  Each motor action is represented
     # by a population, not a single neuron.  Population sum gives robust
@@ -938,19 +949,58 @@ class BasalGangliaConfig(BaseConfig):
     neurons_per_action: int = 32
     # Exploration
     exploration_noise: float = 0.3
+    # DA pathway-specific modulation (Frank 2005; Surmeier et al. 2007)
+    # D1 receptors (Go pathway): DA excites via cAMP↑/PKA → NMDA potentiation
+    # D2 receptors (NoGo pathway): DA inhibits via cAMP↓ → reduced excitability
+    # Densities from STRIATUM profiles in receptor.py
+    d1_receptor_density: float = 0.9   # D1 expression on Go-MSNs
+    d2_receptor_density: float = 0.9   # D2 expression on NoGo-MSNs
+    # Hill equation parameters (from receptor.py RECEPTOR_PARAMS)
+    d1_ec50: float = 0.4               # Surmeier et al. (2007)
+    d1_hill_n: float = 1.5
+    d2_ec50: float = 0.3               # Surmeier et al. (2007)
+    d2_hill_n: float = 1.2
+    # Tonic DA → D2 excitability (Frank 2005; Dreyer et al. 2010)
+    # Low tonic DA → high-affinity D2 receptors tonically activated →
+    # D2 more excitable → exploration via NoGo. High tonic DA → D2
+    # suppressed → exploitation.  Range: [1.0, 1+d2_tonic_boost_max].
+    d2_tonic_boost_max: float = 0.5
+    # Baseline DA level for D2 gain compensation (should match
+    # NeuromodulatorConfig.baseline_da for consistency).
+    baseline_da: float = 0.5
     # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
     # Slow multiplicative weight adjustment targeting stable per-neuron
     # firing rate.  Prevents weight erosion and runaway excitation
     # without task-specific clip values.
     homeo_target_rate: float = 0.01    # Target firing rate per neuron (Planert et al. 2010: MSN 1-10 Hz → 0.001-0.01 at dt=1ms)
     homeo_tau: float = 5000.0         # Slow rate-averaging τ (ms)
-    homeo_interval: int = 200         # Forward steps between scaling events
-    homeo_max_change: float = 0.02    # Max fractional change per event
+    homeo_interval: int = 500         # Forward steps between scaling events (Turrigiano: hours → compressed ~0.5s biological time)
+    homeo_max_change: float = 0.005   # Max fractional change per event (Turrigiano 2004: 50% in 48h → ~0.0005 compressed 10×)
     # Bidirectional DA modulation (Shen et al. 2008)
     ltd_ratio: float = 0.7            # LTD/LTP magnitude ratio (Shen et al. 2008)
-    d2_ltd_protection: float = 0.5    # D2 LTD ×0.5 under positive TD (Shen et al. 2008)
+    # D2 LTD protection: D2-MSNs resist depotentiation via stronger
+    # PKA/DARPP-32 signaling (Shen et al. 2008).  The in-vitro finding
+    # (LTD ~50% of LTP) was too aggressive in practice: with mean
+    # positive TD, protection=0.5 causes net D2 GROWTH (WRONG sign).
+    # Derivation for balanced pathway drift:
+    #   E[dw_d2] = lr·e·(E[|td||td<0]·P(td<0) − p·E[td|td>0]·P(td>0))
+    #   For E[dw_d2] < 0 (correct shrinkage) → p > 0.71.
+    #   In the OpAL model (Frank 2005): positive RPE (DA burst) drives
+    #   D1 LTP ("Go learning"); negative RPE (DA dip) drives D2 LTP
+    #   ("NoGo learning").  D2 LTD on positive RPE is minimal in-vivo
+    #   because D2 receptor activation by tonic DA masks NMDA-dependent
+    #   LTD (Shen et al. 2008).  Setting p=0.0 eliminates D2 LTD on
+    #   positive TD, leaving D2 plasticity purely DA-dip-driven.
+    #   This prevents D2 pathway collapse in environments with
+    #   persistently positive reward (e.g. CartPole: reward=+1 always).
+    d2_ltd_protection: float = 0.0
+    # Activity-dependent D2 LTD gate (Kreitzer & Malenka 2007)
+    # D2-MSN LTD requires endocannabinoid signaling which is
+    # activity-dependent.  When D2 neurons are barely firing, eCB
+    # release drops, self-limiting further LTD.  Gate = D2_rate / target.
+    d2_ltd_activity_gate: bool = True
     # Synaptic degradation — protein turnover (Bhatt et al. 2009)
-    readout_decay: float = 1e-5       # Per-step decay on readout weights
+    readout_decay: float = 2e-5       # Compressed protein turnover (Bhatt 2009: τ~5days; compressed ~4000× → τ≈50000 steps)
 
     def __post_init__(self) -> None:
         assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"
@@ -958,6 +1008,79 @@ class BasalGangliaConfig(BaseConfig):
         assert self.actor_lr > 0, f"actor_lr must be positive, got {self.actor_lr}"
         assert self.tau_m_msn_up > 0, f"tau_m_msn_up must be positive, got {self.tau_m_msn_up}"
         assert self.tau_m_critic > 0, f"tau_m_critic must be positive, got {self.tau_m_critic}"
+
+
+# =====================================================================
+# VTA Dopaminergic Circuit
+# =====================================================================
+
+@dataclass(frozen=True, kw_only=True)
+class VTAConfig(BaseConfig):
+    """VTA dopaminergic circuit for emergent RPE computation.
+
+    Replaces algebraic TD error with a biophysical VTA circuit where DA
+    neuron firing rate emerges from excitatory/inhibitory balance.
+
+    References:
+        Eshel et al. (2015): Arithmetic and local circuitry underlying
+            dopamine prediction errors.  Science 350(6256):1–5.
+        Schultz (1997, 1998): Predictive reward signal of DA neurons.
+        Tobler et al. (2005): Adaptive coding of reward value by DA
+            neurons.  Science 307(5715):1642–1645.
+        Grace (1991): Phasic versus tonic DA release and the modulation
+            of DA system responsivity.  Neuroscience 41(1):1–24.
+        Schweighofer et al. (2008): Serotonin and the evaluation of
+            future rewards.  Ann NY Acad Sci 1104:289–300.
+        Watabe-Uchida et al. (2017): Whole-brain mapping of direct
+            inputs to midbrain DA neurons.  Neuron 74(5):858–873.
+
+    Circuit architecture:
+        VP pathway (inhibitory): critic → VP weights → VTA inhibition.
+            Carries V(s) — the prediction from the CURRENT state.
+            Net effect of VS → VP → RMTg → VTA triple-GABAergic path
+            (Eshel 2015): higher V(s) → more VTA inhibition.
+        PPTg pathway (excitatory): critic → PPTg weights → VTA excitation.
+            Carries γ_eff × V(s') — the discounted FUTURE value.
+            PPTg synaptic dynamics attenuate V(s') by exp(-T/τ_ppTg),
+            implementing temporal discount without an explicit γ parameter.
+        Reward pathway (excitatory): r → LDTg → VTA direct excitation.
+        D2 autoreceptor: VTA soma → adaptive gain (Tobler 2005).
+            Replaces Welford running-variance normalisation.
+
+    Temporal discount (replaces γ parameter):
+        γ_eff = exp(-n_substeps × dt / τ_ppTg)
+        With n_substeps=25, dt=1ms: τ_ppTg=2488ms → γ≈0.99.
+        Serotonin modulates τ_ppTg (Schweighofer 2008):
+            τ_eff = τ_ppTg × (1 + serotonin) → higher 5-HT = longer horizon.
+    """
+    # ── VP/PPTg pathway time constant ─────────────────────────────
+    # Controls effective temporal discount: γ_eff = exp(-T / τ_ppTg).
+    # τ_ppTg ≈ 2488 ms → γ ≈ 0.99 at T_step = 25 ms.
+    # Serotonin modulates: τ_eff = τ_ppTg × (1 + 5-HT).
+    tau_ppTg: float = 2488.0
+
+    # ── Reward input ──────────────────────────────────────────────
+    reward_gain: float = 1.0     # Reward → VTA excitatory conductance
+
+    # ── Value readout learning rate ───────────────────────────────
+    # Three-factor Hebbian: dw = lr × RPE × critic_activation.
+    # Matches critic_lr for two-timescale convergence (Konda 2003).
+    value_lr: float = 3e-3
+
+    # ── D2 autoreceptor (Tobler et al. 2005) ─────────────────────
+    # Slow adaptation of DA coding gain to recent RPE statistics.
+    # τ ≈ seconds (Tobler: adaptation over ~20 trials at ~500ms each).
+    tau_autoreceptor: float = 10000.0   # D2 autoreceptor τ (ms)
+    min_gain: float = 0.01             # Floor on adaptive gain
+
+    # ── Readout weight decay (protein turnover, Bhatt 2009) ──────
+    readout_decay: float = 2e-5
+
+    def __post_init__(self) -> None:
+        assert self.tau_ppTg > 0, f"tau_ppTg must be positive, got {self.tau_ppTg}"
+        assert self.reward_gain > 0, f"reward_gain must be positive, got {self.reward_gain}"
+        assert self.value_lr > 0, f"value_lr must be positive, got {self.value_lr}"
+        assert self.tau_autoreceptor > 0, f"tau_autoreceptor must be positive, got {self.tau_autoreceptor}"
 
 
 # =====================================================================

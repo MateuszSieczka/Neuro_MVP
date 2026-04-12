@@ -33,18 +33,21 @@ from core.config import (
     NeuromodulatorConfig,
     OscillatorConfig,
     ReplayBufferConfig,
+    VTAConfig,
     WorkingMemoryConfig,
     WorldModelConfig,
     CORTICAL_L4_RECEPTORS,
     PFC_RECEPTORS,
     STRIATUM_D1_RECEPTORS,
     STRIATUM_D2_RECEPTORS,
+    STRIATUM_ACTOR_RECEPTORS,
 )
 from core.episodic_memory import EpisodicMemory
 from core.neuromodulator import NeuromodulatorSystem
 from core.network import NetworkGraph
 from core.replay_buffer import Experience, ReplayBuffer
 from core.spike_encoder import GaussianPopulationEncoder, PoissonEncoder
+from core.vta import VTACircuit
 from core.working_memory import WorkingMemoryModule
 from core.world_model import SNNWorldModel
 
@@ -126,14 +129,29 @@ class SNNAgent(Agent):
         else:
             bg_input_size = bg_base_size
 
+        # ── Empirical mean input rate from population encoder ─────────
+        # GaussianPopulationEncoder produces continuous rates [0,1] which
+        # PoissonEncoder converts to binary spikes with P(spike) = rate.
+        # The expected number of active inputs = fan_in × mean(rate).
+        # We average over several sample points for robustness.
+        _rate_sum = 0.0
+        _n_samples = 0
+        for _val in [0.0, 0.5, -0.5, 1.0, -1.0]:
+            _sr = self._pop_encoder.encode(np.full(state_size, _val, dtype=np.float32))
+            _rate_sum += float(np.mean(_sr))
+            _n_samples += 1
+        _mean_input_rate = max(_rate_sum / _n_samples, 0.05)
+
         # ── Create modules ────────────────────────────────────────────
-        self.critic = SNNDeepCritic(bg_input_size, self._bg_config)
+        self.critic = SNNDeepCritic(bg_input_size, self._bg_config,
+                                     mean_input_rate=_mean_input_rate)
         # internal_dim > 0 only when WM is active and needs a gate neuron.
         # Without WM, the internal neuron wastes capacity and
         # dilutes the motor population signal.
         _internal_dim = 1 if self._use_working_memory else 0
         self.actor = D1D2Actor(
             bg_input_size, n_actions, _internal_dim, self._bg_config,
+            mean_input_rate=_mean_input_rate,
         )
 
         if self._use_working_memory:
@@ -168,8 +186,23 @@ class SNNAgent(Agent):
         self._assoc_name: str = ""
         self._build_graph()
 
+        # ── VTA dopaminergic circuit (Eshel et al. 2015) ──────────────
+        # Replaces algebraic TD error and Welford normalisation with a
+        # biophysical VTA circuit.  VP pathway reads V(s) (inhibitory),
+        # PPTg pathway reads γ×V(s') (excitatory), reward feeds direct.
+        # D2 autoreceptor provides intrinsic gain adaptation (Tobler 2005).
+        self._vta_config = VTAConfig(ctx=self._bg_config.ctx)
+        self.vta = VTACircuit(
+            critic_hidden_size=self._bg_config.hidden_size,
+            config=self._vta_config,
+        )
+
         # ── Backward compat: BG facade for replay_buffer/sleep ────────
-        self.bg = _BGFacade(self.critic, self.actor, self._bg_config, self._agent_cfg)
+        # Facade created after VTA so it can provide value readout.
+        self.bg = _BGFacade(
+            self.critic, self.actor, self._bg_config, self._agent_cfg,
+            vta=self.vta,
+        )
 
         # ── Transient state ───────────────────────────────────────────
         self._last_td_error: float = 0.0
@@ -195,6 +228,31 @@ class SNNAgent(Agent):
         self._n_substeps_critic: int = max(1, round(
             self._bg_config.tau_m_critic / dt,
         ))
+
+        # ── Dynamic headroom (Brette & Gerstner 2005) ─────────────────
+        # headroom = 1/(1-exp(-n*dt/τ)) accounts for finite integration
+        # window.  At n*dt = τ: 1/(1-e^{-1}) ≈ 1.58.  Derived from
+        # actual n_substeps instead of assuming 1τ integration.
+        _critic_n = self._n_substeps_critic
+        _actor_n = self._n_substeps
+        _tau_c = self._bg_config.tau_m_critic
+        _tau_a = self._bg_config.tau_m_msn_up
+        _headroom_c = 1.0 / max(1.0 - np.exp(-_critic_n * dt / _tau_c), 0.1)
+        _headroom_a = 1.0 / max(1.0 - np.exp(-_actor_n * dt / _tau_a), 0.1)
+        # Recompute input gains with dynamic headroom
+        from core.basal_ganglia import _derive_input_gain
+        self.critic._input_gain = _derive_input_gain(
+            bg_input_size, self.critic._ncfg,
+            self._bg_config.w_clip_critic,
+            mean_input_rate=_mean_input_rate,
+            headroom=_headroom_c,
+        )
+        self.actor._input_gain = _derive_input_gain(
+            bg_input_size, self.actor._ncfg,
+            self._bg_config.w_clip,
+            mean_input_rate=_mean_input_rate,
+            headroom=_headroom_a,
+        )
 
     # ------------------------------------------------------------------
     # Public properties
@@ -231,7 +289,7 @@ class SNNAgent(Agent):
         net.add_layer("critic", self.critic,
                        receptor_profile=STRIATUM_D1_RECEPTORS)
         net.add_layer("actor", self.actor,
-                       receptor_profile=STRIATUM_D2_RECEPTORS)
+                       receptor_profile=STRIATUM_ACTOR_RECEPTORS)
         net.mark_td_updated("critic", "actor")
 
         # ── Columnar: assoc → BG via feedforward ─────────────────────
@@ -347,8 +405,9 @@ class SNNAgent(Agent):
         return sensory
 
     # _set_actor_policy_gradient REMOVED (was non-biological REINFORCE
-    # hack that destroyed STDP eligibility by 216×).  Replaced by
-    # gate_eligibility() call after substep loop — Redgrave et al. (2010).
+    # hack that destroyed STDP eligibility by 216×).  WTA dynamics now
+    # naturally gate eligibility to the winning action channel via
+    # membrane-voltage separation (Wang 2002).
 
     # ------------------------------------------------------------------
     # Action selection
@@ -359,9 +418,7 @@ class SNNAgent(Agent):
         pop_rates = self._pop_encoder.encode(state_f32)
 
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
-        da_level = float(np.clip(
-            self.neuromod.learning_rate_modulation + self._agent_cfg.da_offset, 0.0, 1.0,
-        ))
+        da_level = float(np.clip(self.neuromod.dopamine, 0.0, 1.0))
         self.actor.set_da_level(da_level)
 
         if self._use_wm:
@@ -386,7 +443,6 @@ class SNNAgent(Agent):
         # rates — the rate is the signal, Poisson jitter provides
         # biologically realistic trial-to-trial variability.
         self.actor.reset_spike_counts()  # New decision cycle (Lo & Wang 2006)
-        self.critic.reset_spike_counts(self._n_substeps)  # Reset + set window
         for _sub in range(self._n_substeps):
             encoded = self._poisson.encode(pop_rates)
             sensory = self._build_sensory_inputs(encoded, state_f32)
@@ -397,27 +453,20 @@ class SNNAgent(Agent):
             )
         self._last_encoded_state = encoded.copy()
 
-        # ── Gate eligibility to selected action (Redgrave et al. 2010) ─
-        # DA reinforcement targets only the synaptic pathways of the
-        # winning action channel.  Non-selected motor populations'
-        # eligibility is zeroed so update() modifies only the chosen
-        # action's weights.  This replaces the removed REINFORCE
-        # override with a biologically grounded gating mechanism.
+        # VTA: capture V(s) in VP pathway after critic integration.
+        # The VP trace stores the critic's population activity snapshot
+        # at decision time — this represents "what I expected" and will
+        # inhibit VTA DA neurons during observe() (Eshel et al. 2015).
+        self.vta.store_prediction(self.critic.activation)
+
+        # WTA dynamics naturally gate eligibility: the winning action's
+        # MSNs are most depolarised → highest voltage-based eligibility.
+        # Losing actions are suppressed by the InhibitoryPool → near-rest
+        # membrane → near-zero eligibility.  No explicit zeroing needed
+        # (Wang 2002; Wickens et al. 2003).
         action = self.actor.get_action()
-        if action >= 0:
-            self.actor.gate_eligibility(action)
 
-        # ── Active Inference selection ────────────────────────────────
-        if self._use_wm:
-            selected = self.active_inference.select_action(
-                state_spikes=state_f32,
-                candidate_actions=list(range(self.n_actions)),
-                actor=self.actor,
-                ne_level=self.neuromod.competition_sharpness,
-            )
-            self.actor._last_action = selected
-
-        return self.actor.get_action()
+        return action
 
     # ------------------------------------------------------------------
     # Observation & learning
@@ -451,22 +500,19 @@ class SNNAgent(Agent):
         intrinsic_r = max(intrinsic_weight, 0.0) * self._last_curiosity
         effective_reward = reward + intrinsic_r
 
-        # ── 3. Critic step on next_state → TD error ──────────────────
-        # V(s) = firing-rate-normalised value at the end of the
-        # decision window.  The critic.last_value already divides
-        # spike counts by n_substeps (set in reset_spike_counts),
-        # so the final substep has the correct rate estimate.
-        prev_v = self.critic.last_value
+        # ── 3. Critic step on next_state → VTA RPE ──────────────────
+        # V(s) was captured in VTA VP trace during act() via
+        # vta.store_prediction().  Now integrate critic on s' to get
+        # population activity for V(s'), then let VTA compute RPE
+        # from E/I balance (Eshel et al. 2015).
 
-        # Freeze critic eligibility: the critic's eligibility traces
-        # (e_h, e_v, e_bv) were accumulated during act(state) and must
-        # be preserved for the weight update below.  Without this, the
-        # V(s') integration loop overwrites critic eligibility with
-        # next_state STDP traces, causing dw = lr × td × activation(s')
-        # instead of activation(s).
+        # Freeze critic eligibility: the critic's eligibility trace
+        # (e_h) was accumulated during act(state) and must be preserved
+        # for the weight update below.  Without this, the V(s')
+        # integration loop overwrites critic eligibility with next_state
+        # STDP traces, causing dw = lr × td × activation(s') instead of
+        # activation(s).
         _saved_e_h = self.critic.e_h.copy()
-        _saved_e_v = self.critic.e_v.copy()
-        _saved_e_bv = self.critic.e_bv
         _saved_c_x_pre = self.critic._x_pre.copy()
         _saved_c_x_post = self.critic._x_post.copy()
         _saved_c_t_pre = self.critic._t_since_pre.copy()
@@ -489,11 +535,8 @@ class SNNAgent(Agent):
         _saved_a_t_d2 = self.actor._t_since_d2_spike.copy()
 
         # Integrate over substeps to let the critic develop a
-        # meaningful V(s') estimate.  Uses critic's own τ_m (15ms)
-        # rather than the full MSN τ (25ms).
-        # Reset critic spike counts for V(s') window with its own
-        # n_substeps so firing-rate normalisation matches this window.
-        self.critic.reset_spike_counts(self._n_substeps_critic)
+        # meaningful V(s') population activity.  Uses critic's own
+        # τ_m (15ms) rather than the full MSN τ (25ms).
         for _sub in range(self._n_substeps_critic):
             next_encoded = self._poisson.encode(next_pop_rates)
             # Critic-only sensory: actor receives zeros so it does not
@@ -506,13 +549,20 @@ class SNNAgent(Agent):
                 attention=self._attention,
             )
 
-        # V(s') = final rate-normalised value from the observe window
-        current_v = self.critic.last_value
+        # ── VTA RPE computation (replaces algebraic TD error) ─────
+        # VTA DA neuron output ∝ reward + γ_eff×V(s') − V(s)
+        # where γ_eff emerges from PPTg pathway τ (serotonin-modulated)
+        # and gain adaptation from D2 autoreceptors (Tobler 2005).
+        td_error_normed = self.vta.compute_rpe(
+            critic_activation=self.critic.activation,
+            reward=effective_reward,
+            is_terminal=is_terminal,
+            serotonin=self.neuromod.serotonin,
+            n_substeps=self._n_substeps,
+        )
 
         # Restore critic eligibility to reflect only act(state) traces
         self.critic.e_h = _saved_e_h
-        self.critic.e_v = _saved_e_v
-        self.critic.e_bv = _saved_e_bv
         self.critic._x_pre = _saved_c_x_pre
         self.critic._x_post = _saved_c_x_post
         self.critic._t_since_pre = _saved_c_t_pre
@@ -528,41 +578,19 @@ class SNNAgent(Agent):
         self.actor._t_since_d1_spike = _saved_a_t_d1
         self.actor._t_since_d2_spike = _saved_a_t_d2
 
-        if is_terminal:
-            td_error = effective_reward - prev_v
-        else:
-            td_error = (
-                effective_reward
-                + self._bg_config.gamma * current_v
-                - prev_v
-            )
-        # Adaptive TD clip: scale with current V(s) magnitude so that
-        # terminal punishment (-V(s)) is not attenuated when V grows.
-        # Tobler, Fiorillo & Schultz (2005): DA neurons adapt coding
-        # range to reward magnitude distribution.
-        _td_clip = max(10.0, 2.0 * abs(prev_v) + 5.0)
-        td_error = float(np.clip(td_error, -_td_clip, _td_clip))
-        self._last_td_error = td_error
+        self._last_td_error = td_error_normed
 
-        # ── 4. Consolidation-gated plasticity ─────────────────────────
-        gate = self.neuromod.consolidation_gate
-        acfg = self._agent_cfg
-        plasticity_scale = acfg.consolidation_floor + (1.0 - acfg.consolidation_floor) / (
-            1.0 + np.exp(acfg.consolidation_steepness * (gate - acfg.consolidation_midpoint))
-        )
+        # ── 3b. VTA value weight update ───────────────────────────
+        # Three-factor Hebbian: dw_value = lr × RPE × critic_activation(s).
+        # Uses eligibility accumulated during store_prediction() (act phase).
+        self.vta.update(td_error_normed)
 
-        # DA arrives as a single phasic burst after the outcome
-        # (Schultz 1997) and modulates the FULL eligibility trace
-        # accumulated during cortical-striatal activity.  Dividing
-        # by n_substeps would artificially reduce the DA signal
-        # ~25×, making learning impractically slow.  Eligibility
-        # traces are naturally bounded by their per-step decay
-        # (τ_e) and the per-element dw clip (±0.1) plus column
-        # normalization prevent weight explosion.
-        td_for_update = td_error * plasticity_scale
-
-        self.critic.update(td_for_update)
-        self.actor.update(td_for_update)
+        # ── 4. TD-modulated plasticity ─────────────────────────────
+        # Schultz (1998): DA phasic signal is a SINGLE broadcast RPE
+        # from VTA to both ventral (critic) and dorsal (actor) striatum.
+        # Both receive the same Tobler-normalized signal.
+        self.critic.update(td_error_normed)
+        self.actor.update(td_error_normed)
 
         # ── 5. World model + neuromodulator update ────────────────────
         if self._use_wm:
@@ -572,7 +600,7 @@ class SNNAgent(Agent):
             )
             self.neuromod.update(
                 prediction_error=pred_error,
-                td_error=td_error,
+                td_error=td_error_normed,
                 novelty=self._last_curiosity,
             )
 
@@ -588,11 +616,20 @@ class SNNAgent(Agent):
                     m_t=wm_m_t, pred_error=wm_pe,
                 )
         else:
-            norm_pe = float(abs(td_error) / (1.0 + abs(td_error)))
+            # No world model: use raw TD error as prediction error signal.
+            # The previous |td|/(1+|td|) squashing destroyed magnitude
+            # information, producing a near-constant ~0.5 signal.
+            # Raw |td_error| IS the reward prediction error (Schultz 1997).
+            norm_pe = float(np.clip(abs(td_error_normed), 0.0, 10.0))
+            # State change magnitude as sensory novelty proxy
+            # (sensory cortex habituates to static input — Hasselmo 2006).
+            # ACh responds to novelty, NE to surprise (|TD|).
+            state_change = float(np.mean(np.abs(next_f32 - state_f32)))
+            sensory_novelty = float(np.clip(state_change, 0.0, 1.0))
             self.neuromod.update(
                 prediction_error=np.array([norm_pe], dtype=np.float32),
-                td_error=td_error,
-                novelty=0.0,
+                td_error=td_error_normed,
+                novelty=sensory_novelty,
             )
 
         # ── 6. Tonic DA now updated per-step inside neuromod.update() ──
@@ -667,7 +704,7 @@ class SNNAgent(Agent):
             # performance → more vigorous consolidation.
             acfg = self._agent_cfg
             sleep_gain = float(np.clip(
-                1.0 + acfg.sleep_gain_scale * (self.neuromod.tonic_da * 2.0 - 1.0),
+                1.0 + acfg.sleep_gain_scale * self.neuromod.tonic_da,
                 1.0,
                 acfg.sleep_gain_max,
             ))
@@ -688,6 +725,7 @@ class SNNAgent(Agent):
 
     def reset(self) -> None:
         self.network.reset_state()
+        self.vta.reset_state()
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()
@@ -703,6 +741,11 @@ class _BGFacade:
     Replay buffer and sleep phase call bg.critic.forward(),
     bg.critic.update(), etc. This facade routes those calls to the
     real Critic/Actor instances owned by SNNAgent.
+
+    After Phase 3, the value readout (V(s)) is computed by the VTA
+    circuit, not the critic.  The facade provides a ``last_value``
+    property that reads critic.activation via VTA's w_value weight,
+    keeping the sleep-phase code functional.
     """
 
     def __init__(
@@ -711,16 +754,20 @@ class _BGFacade:
         actor: D1D2Actor,
         config: BasalGangliaConfig,
         agent_cfg: AgentConfig | None = None,
+        vta: VTACircuit | None = None,
     ) -> None:
         self.critic = critic
         self.actor = actor
         self.config = config
         self._agent_cfg = agent_cfg or AgentConfig()
+        self._vta = vta
 
     @property
     def last_v(self) -> float:
-        """Proxy for critic's last estimated value."""
-        return self.critic.last_value
+        """Proxy for VTA-based value estimate from critic activation."""
+        if self._vta is not None:
+            return float(np.dot(self.critic.activation, self._vta.w_value))
+        return 0.0
 
     def reset_state(self) -> None:
         self.critic.reset_state()

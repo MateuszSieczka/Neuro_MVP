@@ -20,6 +20,9 @@ from numpy.typing import NDArray
 
 from .config import InhibitoryPoolConfig, SynapseConfig, NeuronConfig
 
+# GABA reversal potential (Isaacson & Scanziani 2011)
+_E_INH: float = -75.0  # mV — Cl⁻ reversal, from SynapseConfig.e_inh
+
 if TYPE_CHECKING:
     from .astrocyte import AstrocyteField
 
@@ -140,14 +143,20 @@ class InhibitoryPool:
                 0, astrocyte.config.n_zones - 1, n,
             ).astype(np.int32)
 
-    def step(self, exc_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
-        """One timestep of E→I→E inhibition.
+    def step(self, exc_spikes: NDArray[np.float32],
+             v_exc: NDArray[np.float32] | None = None) -> NDArray[np.float32]:
+        """One timestep of E→I→E inhibition (conductance-based).
 
         Args:
             exc_spikes: (n_excitatory,) spike vector.
+            v_exc: (n_excitatory,) membrane voltage of excitatory neurons.
+                   Required for conductance-based driving force computation.
+                   If None, falls back to v_rest (conservative estimate).
 
         Returns:
-            (n_excitatory,) inhibitory current to subtract from excitatory V.
+            (n_excitatory,) inhibitory current (pA-scale) to subtract from
+            excitatory I_syn.  Conductance-based: I = g_GABA × (V - E_inh).
+            Self-limiting: as V → E_inh, driving force → 0.
         """
         exc_f32 = exc_spikes.astype(np.float32)
         cfg = self.config
@@ -222,11 +231,36 @@ class InhibitoryPool:
             self.w_ie += dw_ie.astype(np.float32)
             np.maximum(self.w_ie, 0.0, out=self.w_ie)  # Inhibitory weights ≥ 0
 
-        return self.i_gaba_a + self.i_gaba_b
+        # ── Conductance-based inhibition (Isaacson & Scanziani 2011) ──
+        # I_inh = g_GABA × (V_exc - E_inh) / (V_rest - E_inh)
+        # When V_exc ≈ E_inh (-75 mV), driving force ≈ 0 → self-limiting.
+        # Normalised by the THRESHOLD driving force so that at spike
+        # threshold (where inhibition matters most), the effective
+        # inhibition matches the original current-based model.  Below
+        # threshold, inhibition is reduced (self-limiting property).
+        g_total = self.i_gaba_a + self.i_gaba_b  # conductance (arb. units)
+        ref_drive = self.config.v_thresh - _E_INH  # V_thresh - E_inh ≈ 25 mV
+        if v_exc is not None:
+            driving_force = np.clip((v_exc - _E_INH) / max(ref_drive, 1.0), 0.0, None)
+        else:
+            driving_force = (self.config.v_rest - _E_INH) / max(ref_drive, 1.0)
+        return g_total * driving_force
 
     def modulate_by_da(self, da_level: float) -> None:
-        """DA D2 modulation on PV+ interneurons (Seamans & Yang 2004)."""
-        self._ie_gain = float(0.7 + 0.8 * np.clip(da_level, 0.0, 1.0))
+        """DA D2 modulation on PV+ interneurons (Seamans & Yang 2004).
+
+        Uses Hill equation (consistent with receptor.py):
+        D2 on PV+ with density ~0.4 (less than MSN), EC50=0.3, n=1.2.
+        ie_gain = 1.0 + density × hill_response(DA, EC50, n)
+        """
+        da = float(np.clip(da_level, 0.0, 1.0))
+        # Hill equation: response = da^n / (da^n + ec50^n)
+        _ec50 = 0.3
+        _n = 1.2
+        _density = 0.4
+        da_n = da ** _n
+        response = da_n / (da_n + _ec50 ** _n)
+        self._ie_gain = float(1.0 + _density * response)
 
     def enter_sws(self, gain_multiplier: float = 2.5) -> None:
         """Elevate I→E gain during SWS (GABA surge).

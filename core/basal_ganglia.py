@@ -47,6 +47,7 @@ from .config import (
 )
 from .free_energy import expected_free_energy
 from .interneuron import InhibitoryPool
+from .receptor import hill_response
 
 if TYPE_CHECKING:
     from .astrocyte import AstrocyteField
@@ -90,6 +91,8 @@ def _derive_input_gain(
     ncfg: NeuronConfig,
     w_clip: float,
     target_rate: float = 0.05,
+    mean_input_rate: float | None = None,
+    headroom: float = 1.0,
 ) -> float:
     """Derive synaptic gain from AdEx rheobase — proper pA-scale current.
 
@@ -106,14 +109,26 @@ def _derive_input_gain(
     the effective per-synapse weight is approximately
     ``w_clip / sqrt(fan_in)``.
 
+    Parameters
+    ----------
+    mean_input_rate : float, optional
+        Actual mean input firing rate from the upstream population encoder.
+        If provided, overrides target_rate for expected_active computation.
+    headroom : float
+        Multiplicative factor ensuring neurons reach threshold within the
+        finite integration window despite DA modulation and Poisson variance.
+        Accounts for: (a) finite n_substeps × dt vs τ_m, and
+        (b) DA-pathway suppression at baseline for D1D2Actor.
+
     Returns gain in pA per unit input, matching the AdEx current scale.
     """
     gap = abs(ncfg.v_thresh - ncfg.v_rest)
     i_rheo = ncfg.g_L * (gap - ncfg.delta_t)  # pA (Brette & Gerstner 2005)
-    expected_active = max(1.0, fan_in * target_rate)
+    rate = mean_input_rate if mean_input_rate is not None else target_rate
+    expected_active = max(1.0, fan_in * rate)
     # Effective per-synapse weight after homeostatic column normalization
     effective_w = w_clip / np.sqrt(max(1.0, float(fan_in)))
-    return float(i_rheo / (expected_active * effective_w))
+    return float(headroom * i_rheo / (expected_active * effective_w))
 
 
 def _adex_step_bg(
@@ -185,7 +200,8 @@ class SNNDeepCritic:
     def num_neurons(self) -> int:
         return self.config.hidden_size
 
-    def __init__(self, state_size: int, config: BasalGangliaConfig) -> None:
+    def __init__(self, state_size: int, config: BasalGangliaConfig,
+                 mean_input_rate: float | None = None) -> None:
         self.config = config
         self._state_size = state_size
         h = config.hidden_size
@@ -219,8 +235,13 @@ class SNNDeepCritic:
         self._mem_decay: float = config.ctx.decay(config.tau_m_critic)
 
         # ── Input gain from biophysics (AdEx rheobase) ─────────────────
+        # Integration headroom: with n_substeps = τ/dt, neurons reach
+        # ~63% of steady-state.  Factor 1/(1-e^{-1}) ≈ 1.58 ensures
+        # reliable spiking despite Poisson input variance.
         self._input_gain: float = _derive_input_gain(
             state_size, self._ncfg, config.w_clip_critic,
+            mean_input_rate=mean_input_rate,
+            headroom=1.58,
         )
 
         # ── Weights via principled init ───────────────────────────────
@@ -251,31 +272,14 @@ class SNNDeepCritic:
         self.activation: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
         self._rate_decay: float = config.ctx.decay(config.tau_m_critic)
 
-        # ── Readout weights: hidden rates → V(s) ─────────────────────
-        v_std = 1.0 / np.sqrt(h)
-        self.w_v: NDArray[np.float32] = np.random.uniform(
-            -v_std, v_std, h,
-        ).astype(np.float32)
-        self.b_v: float = 0.0
+        # ── NMDA slow synaptic current trace (Wang 2002) ─────────────
+        self._i_nmda: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        self._nmda_decay: float = config.ctx.decay(100.0)  # τ_NMDA=100ms
 
-        # ── Evidence accumulator (Gold & Shadlen 2007) ─────────────
-        # Spike counts over the decision window — integer-scale evidence
-        # for robust V(s) estimation matching the actor's accumulator.
-        self._spike_count: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
-        self._n_substeps: int = 1  # set by reset_spike_counts()
-
-        # ── Membrane potential accumulator ────────────────────────────
-        # V(s) read out via time-averaged normalised membrane potential
-        # instead of spike count.  In small populations (128 neurons),
-        # spike-count readout is dominated by Poisson noise (SNR ≈ 1.8).
-        # Membrane potential carries continuous information about input
-        # drive (Priebe & Ferster 2008; Shadlen & Newsome 2001).
-        self._v_accum: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
-
-        # ── V_trace EMA (replaces peek/snapshot, τ ≈ 200ms) ──────────
-        self._v_trace_decay: float = np.exp(-config.ctx.dt / 200.0)
-        self.v_trace: float = 0.0
-        self.last_value: float = 0.0
+        # ── NOTE: Value readout (w_v, b_v) moved to VTA circuit ──────
+        # The VTA's VTACircuit.w_value replaces the old w_v linear readout.
+        # VP pathway reads V(s) and PPTg reads V(s') from critic.activation
+        # via shared w_value weight.  See core/vta.py.
 
         # ── InhibitoryPool for sparsity ───────────────────────────────
         self.inh_pool = InhibitoryPool(
@@ -289,8 +293,6 @@ class SNNDeepCritic:
 
         # ── Eligibility traces (three-factor STDP) ────────────────────
         self.e_h: NDArray[np.float32] = np.zeros((state_size, h), dtype=np.float32)
-        self.e_v: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
-        self.e_bv: float = 0.0
         self._trace_decay: float = config.ctx.decay(config.tau_e_critic)
 
         # ── Pre/post STDP traces ──────────────────────────────────────
@@ -331,11 +333,12 @@ class SNNDeepCritic:
             ).astype(np.int32)
 
     def forward(self, state_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Single LIF step: compute V(s), update V_trace and eligibility.
+        """Single LIF step: compute hidden-layer spike activity and update eligibility.
 
         Returns:
             (hidden_size,) spike activity (float32) for downstream layers.
-            Value estimate stored in self.last_value and tracked via self.v_trace.
+            Population activation (EMA of rates) readable via self.activation
+            for VTA value readout.
         """
         state_f32 = state_spikes.astype(np.float32)
         cfg = self.config
@@ -350,6 +353,13 @@ class SNNDeepCritic:
 
         # ── Synaptic current ──────────────────────────────────────────
         current = (state_f32 @ self.w_h) * self._input_gain * self._receptor_gain
+
+        # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
+        # Slow synaptic current: τ_NMDA=100ms extends effective integration
+        # window by ~4-5× beyond membrane τ=15ms.  AMPA:NMDA = 3:1.
+        _nmda_compl = 1.0 - self._nmda_decay
+        self._i_nmda = self._i_nmda * self._nmda_decay + _nmda_compl * current
+        current = 0.75 * current + 0.25 * self._i_nmda
 
         # ── Single AdEx step ──────────────────────────────────────────
         in_refrac = self.refrac_hidden > 0
@@ -375,7 +385,9 @@ class SNNDeepCritic:
             eff_v_thresh=vt_c, eff_g_L=gL_c,
         )
 
-        inh_current = self.inh_pool.step(self.spikes_hidden.astype(np.float32))
+        inh_current = self.inh_pool.step(
+            self.spikes_hidden.astype(np.float32), v_exc=self.v_hidden,
+        )
         self.v_hidden -= inh_current
 
         self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
@@ -400,86 +412,47 @@ class SNNDeepCritic:
         self._t_since_post += 1
         self._t_since_post[self.spikes_hidden] = 0
 
-        # ── Eligibility: causal STDP window (±20ms) ──────────────────
-        # Bi & Poo (2001) asymmetric amplitude: LTD × 1.05 > LTP × 1.0
-        # Signed eligibility is correct for the critic (symmetric
-        # update dw = lr × td × e) and the 128-neuron hidden layer
-        # has sufficient spikes (~19 per decision at 1% rate × 15
-        # substeps) for meaningful STDP correlations.
-        self.e_h *= self._trace_decay
-        if np.any(self.spikes_hidden):
-            post_idx = np.where(self.spikes_hidden)[0]
-            ltp_mask = (self._t_since_pre <= self._stdp_window).astype(np.float32)
-            self.e_h[:, post_idx] += (self._x_pre * ltp_mask)[:, np.newaxis]
-        if np.any(pre_binary > 0.5):
-            pre_idx = pre_binary > 0.5
-            ltd_mask = (self._t_since_post <= self._stdp_window).astype(np.float32)
-            self.e_h[pre_idx, :] -= _STDP_LTD_LTP_RATIO * (self._x_post * ltd_mask)[np.newaxis, :]
-
-        # ── Evidence accumulation (Gold & Shadlen 2007) ───────────
-        self._spike_count += self.spikes_hidden.astype(np.float32)
-
-        # ── Membrane potential readout accumulator ────────────────────
-        # Normalise voltage to [0, 1]: 0 = at rest, 1 = at threshold.
-        # Continuous signal carries more information than binary spikes
-        # in small populations (Priebe & Ferster 2008).
+        # ── Membrane potential normalisation ──────────────────────────
+        # Continuous [0,1] signal: 0 = at rest, 1 = at threshold.
+        # Used for eligibility, readout, and evidence accumulation.
         ncfg = self._ncfg
         v_normalized = np.clip(
             (self.v_hidden - ncfg.v_rest) / (ncfg.v_thresh - ncfg.v_rest),
             0.0, 1.0,
         ).astype(np.float32)
-        self._v_accum += v_normalized
 
-        # Readout eligibility tracks population-mean-centered membrane
-        # potential.  Neurons more depolarised than average get positive
-        # eligibility; neurons below average get negative.  This enables
-        # selective credit assignment: the critic learns WHICH hidden
-        # neurons carry value information (Shadlen & Newsome 2001).
-        v_mean_pop = float(np.mean(v_normalized))
-        v_centered = v_normalized - v_mean_pop
-        self.e_v = self.e_v * self._trace_decay + v_centered
-        self.e_bv = self.e_bv * self._trace_decay + v_mean_pop
+        # ── Voltage-based eligibility (Clopath et al. 2010) ──────────
+        # EMA form: e = e * decay + (1 - decay) * outer(v_pre, v_post)
+        # (1-decay) converts sum to bounded EMA — eligibility stays in
+        # [-1, 1] independent of n_substeps.  Captures ALL neurons'
+        # membrane state, not just spiking neurons (~25% of population).
+        _e_compl = 1.0 - self._trace_decay
+        _v_post_centered = v_normalized - float(np.mean(v_normalized))
+        self.e_h = self.e_h * self._trace_decay + _e_compl * np.outer(state_f32, _v_post_centered)
 
-        # ── V(s) readout via time-averaged membrane potential ─────────
-        # Ventral striatal value estimation.  Normalise by n_substeps
-        # for scale-invariance between act() and observe() windows.
-        v_mean = self._v_accum / self._n_substeps
-        current_v = float(np.dot(self.w_v, v_mean) + self.b_v)
-        self.last_value = current_v
-        self.v_trace = (
-            self.v_trace * self._v_trace_decay
-            + current_v * (1.0 - self._v_trace_decay)
-        )
+        # NOTE: Evidence accumulation and V(s) readout moved to VTA circuit.
+        # VTA reads critic.activation via w_value (VP/PPTg pathways).
+        # See core/vta.py — VTACircuit.store_prediction() and compute_rpe().
 
         return self.spikes_hidden.astype(np.float32)
 
     def update(self, td_error: float) -> None:
-        """Three-factor STDP: Δw = lr × DA(td_error) × eligibility."""
-        td = float(np.clip(td_error, -200.0, 200.0))
+        """Three-factor STDP: Δw = lr × DA(td_error) × eligibility.
+
+        Value readout (w_v, b_v) moved to VTA circuit — this method
+        now only updates the hidden-layer weights (w_h).
+
+        No arbitrary clips — learning bounded by:
+        - VTA D2-autoreceptor-normalized RPE (Tobler 2005)
+        - EMA eligibility traces (Clopath 2010)
+        - Homeostatic column norm bounds (Turrigiano 2008)
+        """
+        td = float(td_error)
         cfg = self.config
         effective_lr = cfg.critic_lr * self._receptor_lr
 
-        dw_v = effective_lr * td * self.e_v
-        np.clip(dw_v, -1.0, 1.0, out=dw_v)
-        self.w_v += dw_v
-
-        db_v = effective_lr * td * self.e_bv
-        self.b_v += float(np.clip(db_v, -1.0, 1.0))
-
         dw_h = effective_lr * td * self.e_h
-        np.clip(dw_h, -1.0, 1.0, out=dw_h)
         self.w_h += dw_h
-
-        # Soft readout weight decay — synaptic protein turnover
-        # (Bhatt et al. 2009).  No hard clip: allows V(s) to represent
-        # arbitrary value magnitudes for any task/horizon.
-        self.w_v *= (1.0 - cfg.readout_decay)
-        # b_v decays 100× faster than w_v to prevent monotonic inflation.
-        # Without this, b_v grows to ~13 over 200 episodes because
-        # e_bv is always positive (mean normalised voltage > 0).
-        # The faster decay prevents bias from dominating V(s) while
-        # still allowing short-term baseline adaptation.
-        self.b_v *= (1.0 - cfg.readout_decay * 100.0)
 
         # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
         # Multiplicative correction targeting stable per-neuron rate.
@@ -488,16 +461,19 @@ class SNNDeepCritic:
             target = cfg.homeo_target_rate
             for j in range(cfg.hidden_size):
                 actual = max(float(self._homeo_rate[j]), 1e-6)
+                if actual < target * 0.01:
+                    continue  # silent neuron — no transmission to scale
                 error = (target - actual) / target
-                scale = 1.0 + cfg.homeo_max_change * float(np.clip(error, -1.0, 1.0))
+                error = float(np.clip(error, -0.5, 0.5))
+                scale = 1.0 + cfg.homeo_max_change * error
                 self.w_h[:, j] *= scale
 
-        # Safety bound: 2× nominal prevents runaway in degenerate cases
+        # Column norm bound (homeostatic ceiling, Turrigiano 2008)
         wc = cfg.w_clip_critic
         for j in range(cfg.hidden_size):
             col_norm = float(np.linalg.norm(self.w_h[:, j]))
-            if col_norm > wc * 2.0:
-                self.w_h[:, j] *= (wc * 2.0) / col_norm
+            if col_norm > wc:
+                self.w_h[:, j] *= wc / col_norm
 
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
@@ -510,36 +486,12 @@ class SNNDeepCritic:
         self.w_adapt_hidden.fill(0.0)
         self.activation.fill(0.0)
         self.e_h.fill(0.0)
-        self.e_v.fill(0.0)
-        self.e_bv = 0.0
-        self.v_trace = 0.0
-        self.last_value = 0.0
-        self._spike_count.fill(0.0)
-        self._v_accum.fill(0.0)
+        self._i_nmda.fill(0.0)
         self._x_pre.fill(0.0)
         self._x_post.fill(0.0)
         self._t_since_pre.fill(1000)
         self._t_since_post.fill(1000)
         self.inh_pool.reset_state()
-
-    def reset_spike_counts(self, n_substeps: int = 1) -> None:
-        """Reset evidence accumulator for a new decision cycle.
-
-        Called at the start of each act() to clear accumulated spike
-        counts from the previous decision window.  Models the ventral
-        striatal reset between decisions (Gold & Shadlen 2007).
-
-        Parameters
-        ----------
-        n_substeps : int
-            Number of substeps in the upcoming decision window.
-            Used to normalise spike counts to firing rates (0–1)
-            so V(s) is scale-invariant across different
-            integration windows (act vs observe).
-        """
-        self._spike_count.fill(0.0)
-        self._v_accum.fill(0.0)
-        self._n_substeps = max(1, n_substeps)
 
     def set_plasticity_timescales(self, ne: float) -> None:
         """NE modulates eligibility trace decay (Aston-Jones & Cohen 2005)."""
@@ -591,6 +543,7 @@ class D1D2Actor:
         motor_dim: int,
         internal_dim: int,
         config: BasalGangliaConfig,
+        mean_input_rate: float | None = None,
     ) -> None:
         self.config = config
         self._state_size = state_size
@@ -650,9 +603,24 @@ class D1D2Actor:
         )
 
         # ── Input gain from biophysics (AdEx rheobase) ─────────────────
+        # Integration headroom: with n_substeps × dt ≈ τ_m, the neuron
+        # only reaches 63 % of steady-state voltage → multiply by
+        # 1/(1−e^{-1}) ≈ 1.58 so mean input ≈ I_rheo within the window.
         self._input_gain: float = _derive_input_gain(
             state_size, self._ncfg, config.w_clip,
+            mean_input_rate=mean_input_rate,
+            headroom=1.58,
         )
+        # D2-MSN gain compensation: at baseline DA the D2-receptor
+        # Hill suppression reduces current to d2_net_mod ≈ 0.52 × I.
+        # Without compensation D2 sits below rheobase and never fires,
+        # killing NoGo learning.  Exact compensation — no safety margin.
+        _baseline_da = config.baseline_da
+        _d2_resp = hill_response(_baseline_da, config.d2_ec50, config.d2_hill_n)
+        _d2_mod = 1.0 - config.d2_receptor_density * _d2_resp
+        _d2_tonic = 1.0 + config.d2_tonic_boost_max * (1.0 - _baseline_da)
+        _d2_net_mod = max(_d2_mod * _d2_tonic, 0.1)
+        self._d2_gain_comp: float = 1.0 / _d2_net_mod
 
         # ── D1-MSN membrane state ────────────────────────────────────
         self.v_d1: NDArray[np.float32] = np.random.uniform(
@@ -662,6 +630,11 @@ class D1D2Actor:
         self.refrac_d1: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
         self.rate_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
         self.w_adapt_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+
+        # ── NMDA slow synaptic current traces (Wang 2002) ─────────────
+        self._i_nmda_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self._i_nmda_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self._nmda_decay: float = config.ctx.decay(100.0)  # τ_NMDA=100ms
 
         # ── D2-MSN membrane state ────────────────────────────────────
         self.v_d2: NDArray[np.float32] = np.random.uniform(
@@ -740,7 +713,7 @@ class D1D2Actor:
         self._stdp_window: int = 20
 
         # ── Action tracking ───────────────────────────────────────────
-        self._last_probs: NDArray[np.float32] | None = None
+        self._last_net_evidence: NDArray[np.float32] | None = None
         self._last_action: int = -1
         self.last_internal_action: NDArray[np.float32] = np.array(
             [], dtype=np.float32,
@@ -856,14 +829,40 @@ class D1D2Actor:
 
         # ── Synaptic currents ─────────────────────────────────────────
         current_d1 = (state_f32 @ self.w_d1) * self._input_gain * self._receptor_gain
-        current_d2 = (state_f32 @ self.w_d2) * self._input_gain * self._receptor_gain
+        current_d2 = (state_f32 @ self.w_d2) * self._input_gain * self._receptor_gain * self._d2_gain_comp
 
-        # ── DA modulation (Frank 2005) ────────────────────────────────
-        da = self._da_level
-        d1_mod = cfg.d1_bias + da * (1.0 - cfg.d1_bias)
-        d2_mod = cfg.d2_bias * (1.0 - da) + (1.0 - cfg.d2_bias)
+        # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
+        # Slow synaptic current: τ_NMDA=100ms extends effective
+        # integration window by ~4× beyond membrane τ=25ms.
+        _nmda_compl = 1.0 - self._nmda_decay
+        self._i_nmda_d1 = self._i_nmda_d1 * self._nmda_decay + _nmda_compl * current_d1
+        self._i_nmda_d2 = self._i_nmda_d2 * self._nmda_decay + _nmda_compl * current_d2
+        current_d1 = 0.75 * current_d1 + 0.25 * self._i_nmda_d1
+        current_d2 = 0.75 * current_d2 + 0.25 * self._i_nmda_d2
+
+        # ── DA pathway-specific modulation (Frank 2005; Surmeier 2007) ─
+        # D1 (Go): DA activates D1 receptors → cAMP↑/PKA → NMDA
+        #   potentiation → INCREASED excitability.
+        #   Phasic DA burst (high DA from TD>0) → D1 excited → Go.
+        # D2 (NoGo): DA activates D2 receptors → cAMP↓ → REDUCED
+        #   excitability.  High tonic DA suppresses D2; DA dip
+        #   (negative TD) releases D2 from suppression → NoGo.
+        # This replaces the uniform receptor_gain that applied identical
+        # modulation to both pathways.
+        da = float(np.clip(self._da_level, 0.0, 1.0))
+        # D1: excitatory Hill response — high DA → more D1 current
+        d1_resp = hill_response(da, cfg.d1_ec50, cfg.d1_hill_n)
+        d1_mod = 1.0 + cfg.d1_receptor_density * d1_resp
+        # D2: inhibitory Hill response — high DA → less D2 current
+        d2_resp = hill_response(da, cfg.d2_ec50, cfg.d2_hill_n)
+        d2_mod = 1.0 - cfg.d2_receptor_density * d2_resp
+        # D2 tonic boost: low tonic DA → high-affinity D2 tonically
+        # activated → D2 more excitable (Dreyer et al. 2010).
+        # When DA is high, D2 is suppressed (d2_mod < 1) AND no tonic
+        # boost.  When DA is low, D2 is released AND gets tonic boost.
+        d2_tonic = 1.0 + cfg.d2_tonic_boost_max * (1.0 - da)
         current_d1 *= d1_mod
-        current_d2 *= d2_mod
+        current_d2 *= d2_mod * d2_tonic
 
         # ── Fast epistemic drive: error neurons → D1 excitability ─────
         # High prediction error boosts Go pathway (explore novel states)
@@ -871,10 +870,12 @@ class D1D2Actor:
             current_d1 *= 1.0 + self._epistemic_drive
 
         # ── Bistable MSN decay (Wilson & Kawaguchi 1996) ──────────────
+        # Competitive threshold: median cortical drive gives natural
+        # 50% up/down split (Plenz & Kitai 1998).  Floor at 0:
+        # when cortical input is absent, all MSN stay in down state.
         cortical_drive = np.abs(current_d1) + np.abs(current_d2)
-        drive_max = np.max(cortical_drive) + 1e-8
-        cortical_norm = cortical_drive / drive_max
-        up_mask = cortical_norm > 0.3
+        drive_threshold = float(np.median(cortical_drive))
+        up_mask = cortical_drive > drive_threshold
         tau_eff = np.where(up_mask, cfg.tau_m_msn_up, cfg.tau_m_msn_down).astype(np.float32)
         g_L_eff = self._ncfg.C_m / tau_eff  # per-neuron effective g_L
 
@@ -908,7 +909,9 @@ class D1D2Actor:
         integrated_d1 = ctx.exp_euler_step(self.v_d1, F_d1, J_d1)
         self.v_d1 = np.where(in_refrac_d1, ncfg.v_reset, integrated_d1)
 
-        inh_d1 = self.inh_pool_d1.step(self.spikes_d1.astype(np.float32))
+        inh_d1 = self.inh_pool_d1.step(
+            self.spikes_d1.astype(np.float32), v_exc=self.v_d1,
+        )
         self.v_d1 -= inh_d1
 
         self.spikes_d1 = (self.v_d1 >= ncfg.v_spike_cutoff) & ~in_refrac_d1
@@ -936,7 +939,9 @@ class D1D2Actor:
         integrated_d2 = ctx.exp_euler_step(self.v_d2, F_d2, J_d2)
         self.v_d2 = np.where(in_refrac_d2, ncfg.v_reset, integrated_d2)
 
-        inh_d2 = self.inh_pool_d2.step(self.spikes_d2.astype(np.float32))
+        inh_d2 = self.inh_pool_d2.step(
+            self.spikes_d2.astype(np.float32), v_exc=self.v_d2,
+        )
         self.v_d2 -= inh_d2
 
         self.spikes_d2 = (self.v_d2 >= ncfg.v_spike_cutoff) & ~in_refrac_d2
@@ -964,6 +969,18 @@ class D1D2Actor:
             + self.spikes_d2.astype(np.float32) * hc
         )
         self._homeo_counter += 1
+
+        # ── Event-based post-synaptic traces (Bi & Poo 2001) ─────────
+        # Required for the LTD arm of STDP in eligibility below.
+        self._x_post_d1 *= self._post_decay
+        self._x_post_d1[self.spikes_d1] += 1.0
+        self._t_since_d1_spike += 1
+        self._t_since_d1_spike[self.spikes_d1] = 0
+
+        self._x_post_d2 *= self._post_decay
+        self._x_post_d2[self.spikes_d2] += 1.0
+        self._t_since_d2_spike += 1
+        self._t_since_d2_spike[self.spikes_d2] = 0
 
         # ── Evidence accumulation (Gold & Shadlen 2007) ───────────────
         # Spike counts over the decision window — integer-scale evidence
@@ -1008,60 +1025,38 @@ class D1D2Actor:
         ).mean(axis=1) / _n
         net_evidence = motor_d1 - motor_d2  # Scale: ~[-0.3, 0.3] naturally
 
-        # ── Action selection via WTA (Mink 1996, Humphries et al. 2006)─
-        # No additive noise: SNN membrane noise (g_L × noise_std) +
-        # Poisson input variability already provide biologically correct
-        # trial-to-trial exploration (Faisal, Selen & Wolpert 2008).
-        # NE modulates INPUT GAIN earlier in forward() via d1/d2_mod,
-        # not output noise (Servan-Schreiber, Printz & Cohen 1990;
-        # Aston-Jones & Cohen 2005: gain modulation, not additive noise).
+        # ── Action selection via WTA (Wang 2002; Usher & McClelland 2001)
+        # Winner-take-all: the most depolarised action channel IS the
+        # action.  Ties broken by membrane noise already present in
+        # the AdEx dynamics above.  NE modulates exploration by scaling
+        # noise amplitude upstream (cfg.membrane_noise_std × g_L_eff),
+        # not through an external temperature on a softmax.
         action = int(np.argmax(net_evidence))
         self._last_action = action
+        self._last_net_evidence = net_evidence.copy()
 
-        # Store probabilities for diagnostics (softmax of net evidence
-        # for entropy reporting, NOT used for action selection)
-        shifted = net_evidence - np.max(net_evidence)
-        exp_val = np.exp(shifted)
-        probs = exp_val / (np.sum(exp_val) + 1e-10)
-        self._last_probs = probs.astype(np.float32)
+        # ── Voltage-based eligibility (Clopath et al. 2010) ──────────
+        # EMA form captures ALL neurons' membrane state for credit
+        # assignment matching the membrane-voltage readout in action
+        # selection.  (1-decay) converts sum to bounded EMA.
+        # Non-centered: v_d1_norm ∈ [0,1] gives positive eligibility
+        # for active neurons.  Ratchet prevented by WTA-mediated
+        # inhibition (suppresses losing actions' membrane → lower
+        # eligibility) + column norm clipping + OpAL sign separation.
+        _e_compl = 1.0 - self._trace_decay
+        self.e_d1 = self.e_d1 * self._trace_decay + _e_compl * np.outer(state_f32, v_d1_norm)
+        self.e_d2 = self.e_d2 * self._trace_decay + _e_compl * np.outer(state_f32, v_d2_norm)
 
-        # ── Spike timing updates (diagnostic) ─────────────────────────
-        self._t_since_d1_spike += 1
-        self._t_since_d1_spike[self.spikes_d1] = 0
-        self._t_since_d2_spike += 1
-        self._t_since_d2_spike[self.spikes_d2] = 0
-
-        # ── Post-synaptic traces (backward compat) ───────────────────
-        self._x_post_d1 *= self._post_decay
-        self._x_post_d1[self.spikes_d1] += 1.0
-        self._x_post_d2 *= self._post_decay
-        self._x_post_d2[self.spikes_d2] += 1.0
-
-        # ── Mean-centered voltage eligibility ─────────────────────────
-        # Neurons more depolarised than population average get positive
-        # eligibility; neurons below average get negative.  Dense signal
-        # that works even with sparse spiking (~2% MSN rate), unlike
-        # spike-dependent LTD which was too sparse for meaningful
-        # negative eligibility (Clopath et al. 2010 adaptation).
-        v_d1_centered = v_d1_norm - np.mean(v_d1_norm)
-        v_d2_centered = v_d2_norm - np.mean(v_d2_norm)
-
-        self.e_d1 = self.e_d1 * self._trace_decay + np.outer(pre_binary, v_d1_centered)
-        self.e_d2 = self.e_d2 * self._trace_decay + np.outer(pre_binary, v_d2_centered)
-
-        # ── Motor output ──────────────────────────────────────────────
-        motor_action = probs * 2.0 - 1.0  # [0,1] → [-1,1]
-
-        # ── Internal actions (WM gate, etc.) ──────────────────────────
+        # ── Internal actions (WM gate) via MSN dynamics ─────────────
+        # WM gate uses the same bistable MSN membrane state as motor
+        # actions — no sigmoid.  The normalised D1 membrane potential
+        # of the internal neuron(s) IS the gate signal [0, 1].
         if self.action_dim > self._total_motor:
-            internal_logits = state_f32 @ self.w_d1[:, self._total_motor:]
-            self.last_internal_action = 1.0 / (
-                1.0 + np.exp(-np.clip(internal_logits, -10, 10))
-            )
+            self.last_internal_action = v_d1_norm[self._total_motor:].copy()
         else:
             self.last_internal_action = np.array([], dtype=np.float32)
 
-        return motor_action.astype(np.float32)
+        return net_evidence.astype(np.float32)
 
     def update(self, td_error: float) -> None:
         """DA-modulated three-factor STDP (Frank 2005 Go/NoGo model).
@@ -1070,37 +1065,44 @@ class D1D2Actor:
         D2 (NoGo): negative TD → DA dip → strengthen active NoGo synapses (LTP)
 
         No REINFORCE grad_log_pi — purely Hebbian with dopaminergic gating.
-        Column normalization + Dale’s law provide weight bounds.
+        No arbitrary clips — bounded by Welford normalization + column norms.
         """
-        td = float(np.clip(td_error, -200.0, 200.0))
+        td = float(td_error)
         cfg = self.config
         effective_lr = cfg.actor_lr * self._receptor_lr
-        ltd_ratio = cfg.ltd_ratio
 
-        # D1 (Go): DA burst (td>0) × signed eligibility → selective LTP/LTD
-        # D2 (NoGo): DA dip (-td) × signed eligibility → selective LTP/LTD
-        # With signed eligibility, each synapse can be independently
-        # strengthened or weakened based on its spike timing correlation.
-        dw_d1 = effective_lr * td * self.e_d1
-        np.clip(dw_d1, -1.0, 1.0, out=dw_d1)
-        self.w_d1 += dw_d1
+        # ── Pure OpAL model (Frank 2005, Collins & Frank 2014) ────────
+        # D1 (Go): ONLY learns from positive RPE (DA burst).
+        #   Positive TD → D1 LTP for selected action → "do this again"
+        # D2 (NoGo): ONLY learns from negative RPE (DA dip).
+        #   Negative TD → D2 LTP for selected action → "avoid this"
+        # Cross-pathway plasticity blocked: D1 LTD on dips requires
+        # prolonged DA depletion (Shen et al. 2008); D2 LTD on bursts
+        # requires eCB signaling minimal at resting rates (Kreitzer &
+        # Malenka 2007).  Pure separation prevents pathway collapse
+        # when reward is persistently positive (CartPole: reward=+1
+        # every step, terminal TD is negative only after V(s) grows).
 
-        # D2 LTD protection: D2-MSN have asymmetric LTD threshold
-        # (Shen et al. 2008) — more resistant to depotentiation
-        d2_lr = effective_lr
-        if td > 0:  # positive TD → D2 gets LTD → protect
-            d2_lr *= cfg.d2_ltd_protection
-        dw_d2 = d2_lr * (-td) * self.e_d2
-        np.clip(dw_d2, -1.0, 1.0, out=dw_d2)
-        self.w_d2 += dw_d2
+        # D1 (Go): only LTP on positive TD (DA burst)
+        if td > 0:
+            dw_d1 = effective_lr * td * self.e_d1
+            self.w_d1 += dw_d1
 
-        # Dale's law with silent synapse floor (Kerchner & Nicoll 2008):
-        # NMDA-only synapses have ~1% of mature AMPA conductance.
-        # Floor = 1e-4 preserves structural connectivity without
-        # creating upward pressure that dominates the learning signal.
-        _W_FLOOR = 1e-4
-        np.maximum(self.w_d1, _W_FLOOR, out=self.w_d1)
-        np.maximum(self.w_d2, _W_FLOOR, out=self.w_d2)
+        # D2 (NoGo): only LTP on negative TD (DA dip)
+        if td < 0:
+            dw_d2 = effective_lr * (-td) * self.e_d2
+            self.w_d2 += dw_d2
+
+        # Synaptic protein turnover removed: voltage-based EMA
+        # eligibility inherently bounds updates via (1-decay) factor,
+        # making explicit weight decay unnecessary.
+
+        # Dale's law: excitatory synapses cannot go negative.
+        # Floor = 0 (pure Dale's law).  Silent synapses exist
+        # biologically (Kerchner & Nicoll 2008) and STDP reactivates
+        # them when needed — no artificial minimum required.
+        np.maximum(self.w_d1, 0.0, out=self.w_d1)
+        np.maximum(self.w_d2, 0.0, out=self.w_d2)
 
         # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
         # Per-pathway scaling: D2 gets more upscaling because it fires
@@ -1108,40 +1110,56 @@ class D1D2Actor:
         # biologically correct: D2 homeostasis maintains the NoGo
         # pathway against DA-driven suppression, preventing premature
         # action commitment and supporting exploration.
+        # CAPS: (1) Silent neurons (rate < 1% of target) do not get
+        # upscaled — homeostasis requires some baseline synaptic
+        # transmission to detect the mismatch (Turrigiano 2004).
+        # (2) Upward error capped at 0.25 to prevent runaway inflation
+        # when neurons are chronically below target.
         if self._homeo_counter > 0 and self._homeo_counter % cfg.homeo_interval == 0:
             target = cfg.homeo_target_rate
             for w, hr in ((self.w_d1, self._homeo_rate_d1),
                           (self.w_d2, self._homeo_rate_d2)):
                 for j in range(self.action_dim):
                     actual = max(float(hr[j]), 1e-6)
+                    # Silent neuron gate: no scaling without transmission
+                    if actual < target * 0.01:
+                        continue
                     error = (target - actual) / target
-                    scale = 1.0 + cfg.homeo_max_change * float(
-                        np.clip(error, -1.0, 1.0),
-                    )
+                    # Symmetric bound (Turrigiano 2008)
+                    error = float(np.clip(error, -0.5, 0.5))
+                    scale = 1.0 + cfg.homeo_max_change * error
                     w[:, j] *= scale
                 np.maximum(w, 0.0, out=w)  # Maintain Dale's law
 
-        # Column norm safety bound (2× nominal)
+        # Column norm bound (homeostatic ceiling, Turrigiano 2008)
         for w in (self.w_d1, self.w_d2):
             for j in range(self.action_dim):
                 col_norm = float(np.linalg.norm(w[:, j]))
-                if col_norm > cfg.w_clip * 2.0:
-                    w[:, j] *= (cfg.w_clip * 2.0) / col_norm
+                if col_norm > cfg.w_clip:
+                    w[:, j] *= cfg.w_clip / col_norm
 
     def get_action(self) -> int:
         return self._last_action
 
     @property
     def action_entropy(self) -> float:
-        """Normalized entropy of action distribution [0, 1]."""
-        if self._last_probs is None:
+        """Decision uncertainty from evidence margin (Kiani & Shadlen 2009).
+
+        Returns [0, 1]: 0 = one action clearly dominant, 1 = all equal.
+        Based on winner–runner-up margin relative to evidence range.
+        """
+        if self._last_net_evidence is None:
             return 1.0
-        p = self._last_probs
-        entropy = -float(np.sum(p * np.log(p + 1e-10)))
-        max_entropy = float(np.log(max(self.motor_dim, 2)))
-        if max_entropy < 1e-8:
+        ev = self._last_net_evidence
+        if len(ev) < 2:
             return 0.0
-        return float(np.clip(entropy / max_entropy, 0.0, 1.0))
+        sorted_ev = np.sort(ev)[::-1]
+        margin = sorted_ev[0] - sorted_ev[1]
+        ev_range = sorted_ev[0] - sorted_ev[-1]
+        if ev_range < 1e-8:
+            return 1.0
+        confidence = margin / ev_range
+        return float(np.clip(1.0 - confidence, 0.0, 1.0))
 
     @property
     def pragmatic_values(self) -> NDArray[np.float32]:
@@ -1172,13 +1190,15 @@ class D1D2Actor:
         self.rate_d2.fill(0.0)
         self.e_d1.fill(0.0)
         self.e_d2.fill(0.0)
+        self._i_nmda_d1.fill(0.0)
+        self._i_nmda_d2.fill(0.0)
         self._x_pre.fill(0.0)
         self._x_post_d1.fill(0.0)
         self._x_post_d2.fill(0.0)
         self._t_since_pre.fill(1000)
         self._t_since_d1_spike.fill(1000)
         self._t_since_d2_spike.fill(1000)
-        self._last_probs = None
+        self._last_net_evidence = None
         self._last_action = -1
         self._d1_rates.fill(0.0)
         self._d2_rates.fill(0.0)
@@ -1191,8 +1211,9 @@ class D1D2Actor:
         self.inh_pool_d2.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
-        """NE modulates policy trace decay."""
+        """NE modulates policy trace decay and exploration temperature."""
         ne = float(np.clip(ne, 0.0, 1.0))
+        self._ne_level = ne  # used by softmax temperature in forward()
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
         eff_tau = self.config.tau_e_actor / ne_factor
         self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
@@ -1424,73 +1445,3 @@ class ActiveInferenceModule:
         self.last_total_values = total
         self.last_selected_action = max(total, key=lambda k: total[k])
         return self.last_selected_action
-
-
-# =====================================================================
-# Integrated BG System
-# =====================================================================
-
-class BasalGangliaAGISystem:
-    """Integrated BG: D1/D2 Actor + LIF Critic + Active Inference.
-
-    TD error uses V_trace EMA instead of peek/snapshot:
-      δ = r + γ × V_now - V_trace
-    """
-
-    def __init__(
-        self,
-        state_size: int,
-        motor_dim: int,
-        internal_dim: int = 1,
-        config: BasalGangliaConfig | None = None,
-    ) -> None:
-        self.config = config or BasalGangliaConfig()
-        self.critic = SNNDeepCritic(state_size, self.config)
-        self.actor = D1D2Actor(state_size, motor_dim, internal_dim, self.config)
-
-    def step(
-        self,
-        state_spikes: NDArray[np.float32],
-        reward: float,
-        is_terminal: bool = False,
-        da_level: float = 0.5,
-    ) -> tuple[NDArray[np.float32], NDArray[np.float32], float]:
-        """One BG step: critic → TD (via V_trace) → update → actor."""
-        self.critic.forward(state_spikes)
-        current_v = self.critic.last_value
-
-        # TD error: δ = r + γ × V_now - V_trace (Schultz 1998)
-        if is_terminal:
-            td_error = reward - self.critic.v_trace
-        else:
-            td_error = reward + self.config.gamma * current_v - self.critic.v_trace
-
-        td_error = float(np.clip(td_error, -50.0, 50.0))
-
-        self.actor.set_da_level(da_level)
-        self.critic.update(td_error)
-        self.actor.update(td_error)
-
-        motor_action = self.actor.forward(state_spikes)
-
-        return motor_action, self.actor.last_internal_action, td_error
-
-    def reset_state(self) -> None:
-        """Reset transient state between episodes."""
-        self.critic.reset_state()
-        self.actor.reset_state()
-
-    def set_plasticity_timescales(self, ne: float) -> None:
-        self.critic.set_plasticity_timescales(ne)
-        self.actor.set_plasticity_timescales(ne)
-
-    def compute_exploration_noise(
-        self,
-        serotonin: float,
-        tonic_da: float,
-    ) -> float:
-        """Exploration noise from DA × 5-HT (Doya 2002)."""
-        min_exploration = 0.15
-        da_noise = max(0.3, 1.0 - tonic_da)
-        sero_noise = max(0.3, 1.0 - serotonin)
-        return max(min_exploration, da_noise * sero_noise)

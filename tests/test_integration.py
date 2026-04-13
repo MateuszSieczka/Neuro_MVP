@@ -215,17 +215,28 @@ class TestStochasticButton:
     """
     StochasticButton: press → EV +3.9, don't press → 0.
     Agent must learn that pressing is beneficial ON AVERAGE.
+    Averaged over 3 seeds because stochastic reward + spike-count
+    WTA creates high per-run variance.
     """
 
     def test_learns_to_press(self):
-        env = StochasticButtonEnv()
-        agent = make_agent(env)
-        rewards = run_episodes(agent, env, 400)
+        late_scores = []
+        for seed in range(3):
+            np.random.seed(seed * 13 + 1)
+            env = StochasticButtonEnv()
+            agent = make_agent(env)
+            rewards = run_episodes(agent, env, 400)
 
-        late = mean_last_n(rewards, 100)
-        print(f"\n[StochasticButton] Late mean: {late:.2f} (optimal ~3.9)")
-        # Should at least be pressing most of the time (>2.0 means >50% presses)
-        assert late > 1.5, f"Not learning stochastic reward: late mean = {late:.2f}"
+            late = mean_last_n(rewards, 100)
+            print(f"\n[StochasticButton seed={seed}] Late mean: {late:.2f}")
+            late_scores.append(late)
+
+        mean_late = float(np.mean(late_scores))
+        print(f"[StochasticButton] Mean late: {mean_late:.2f} (optimal ~3.9)")
+        assert mean_late > 2.0, (
+            f"Not learning stochastic reward: mean late = {mean_late:.2f} "
+            f"(per-seed: {[f'{x:.2f}' for x in late_scores]})"
+        )
 
 
 # =====================================================================
@@ -245,7 +256,7 @@ class TestTwoButton:
 
         late = mean_last_n(rewards, 100)
         print(f"\n[TwoButton] Late mean: {late:.2f} (optimal +1.0, random 0.0)")
-        assert late > 0.3, f"No context learning: late mean = {late:.2f}"
+        assert late > 0.5, f"No context learning: late mean = {late:.2f}"
 
 
 # =====================================================================
@@ -267,7 +278,7 @@ class TestCorridor:
         print(f"\n[Corridor] Late mean: {late:.2f} (optimal 9.6, random ~4.5)")
         # Random policy: 50% right → ~8 steps avg → reward ≈ 10 - 0.1*8 = 9.2
         # But random can also stay → negative.  Just check improvement.
-        assert late > 5.0, f"No corridor learning: late mean = {late:.2f}"
+        assert late > 7.0, f"No corridor learning: late mean = {late:.2f}"
 
 
 # =====================================================================
@@ -278,18 +289,30 @@ class TestPunishmentAvoidance:
     """
     Context A: action 1 → -3 (suppress!), Context B: action 1 → +2 (go!).
     Tests D2/NoGo learning from negative TD error.
+    Averaged over 3 seeds (spike-count WTA + readout noise can
+    occasionally fail to discover the avoid action on a single seed).
     """
 
     def test_learns_to_avoid(self):
-        env = PunishmentAvoidanceEnv()
-        agent = make_agent(env)
-        rewards = run_episodes(agent, env, 500)
+        late_scores = []
+        for seed in range(3):
+            np.random.seed(seed * 11 + 3)
+            env = PunishmentAvoidanceEnv()
+            agent = make_agent(env)
+            rewards = run_episodes(agent, env, 500)
 
-        late = mean_last_n(rewards, 100)
-        print(f"\n[PunishmentAvoidance] Late mean: {late:.2f} (optimal +1.0, random -0.5)")
+            late = mean_last_n(rewards, 100)
+            print(f"\n[PunishmentAvoidance seed={seed}] Late mean: {late:.2f}")
+            late_scores.append(late)
+
+        mean_late = float(np.mean(late_scores))
+        print(f"[PunishmentAvoidance] Mean late: {mean_late:.2f} (optimal +1.0, random -0.5)")
         # Random: 50% context A × (50% × 0 + 50% × -3) + 50% context B × (50% × 0 + 50% × 2)
         # = 50% × -1.5 + 50% × 1.0 = -0.25
-        assert late > -0.2, f"Not avoiding punishment: late mean = {late:.2f}"
+        assert mean_late > 0.1, (
+            f"Not avoiding punishment: mean late = {mean_late:.2f} "
+            f"(per-seed: {[f'{x:.2f}' for x in late_scores]})"
+        )
 
 
 # =====================================================================
@@ -300,29 +323,30 @@ class TestShiftingBandit:
     """
     3-armed bandit with payoff reversal every 200 episodes.
     Tests continual learning / adaptation.
+    Averaged over 3 seeds for robustness (standard RL benchmarking).
     """
 
     def test_adapts_after_shift(self):
-        env = ShiftingBanditEnv(shift_interval=200)
-        agent = make_agent(env)
+        pb_lates = []
+        for seed in range(3):
+            np.random.seed(seed * 7 + 1)
+            env = ShiftingBanditEnv(shift_interval=200)
+            agent = make_agent(env)
 
-        # Run 600 episodes total (3 phases: A, B, A)
-        all_rewards = run_episodes(agent, env, 600)
+            # Run 400 episodes: Phase A (0-199), Phase B (200-399)
+            all_rewards = run_episodes(agent, env, 400)
 
-        # Phase A (0-199): arm 0 is best (p=0.8)
-        phase_a = np.mean(all_rewards[150:200])
-        # Phase B (200-399): arm 1 is best (p=0.8)
-        phase_b_early = np.mean(all_rewards[200:250])
-        phase_b_late = np.mean(all_rewards[350:400])
+            pb_late = float(np.mean(all_rewards[350:400]))
+            pb_lates.append(pb_late)
+            print(f"\n[ShiftingBandit seed={seed}] Phase B late: {pb_late:.2f}")
 
-        print(f"\n[ShiftingBandit] Phase A late: {phase_a:.2f}, "
-              f"Phase B early: {phase_b_early:.2f}, "
-              f"Phase B late: {phase_b_late:.2f}")
+        mean_pb = float(np.mean(pb_lates))
+        print(f"[ShiftingBandit] Mean Phase B late: {mean_pb:.2f}")
 
-        # After reversal, performance should initially drop then recover
-        # Generous: just check phase B late is better than random (0.5)
-        assert phase_b_late > 0.45, (
-            f"No adaptation after shift: phase_b_late = {phase_b_late:.2f}"
+        # After reversal, mean performance across seeds should recover
+        assert mean_pb > 0.45, (
+            f"No adaptation after shift: mean_pb_late = {mean_pb:.2f} "
+            f"(per-seed: {[f'{x:.2f}' for x in pb_lates]})"
         )
 
 

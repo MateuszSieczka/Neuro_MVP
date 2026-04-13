@@ -130,18 +130,18 @@ class SNNAgent(Agent):
         # WM contribution arrives through graph sum — no concat.
         bg_input_size = bg_base_size
 
-        # ── Empirical mean input rate from population encoder ─────────
-        # GaussianPopulationEncoder produces continuous rates [0,1] which
-        # PoissonEncoder converts to binary spikes with P(spike) = rate.
-        # The expected number of active inputs = fan_in × mean(rate).
-        # We average over several sample points for robustness.
-        _rate_sum = 0.0
-        _n_samples = 0
-        for _val in [0.0, 0.5, -0.5, 1.0, -1.0]:
-            _sr = self._pop_encoder.encode(np.full(state_size, _val, dtype=np.float32))
-            _rate_sum += float(np.mean(_sr))
-            _n_samples += 1
-        _mean_input_rate = max(_rate_sum / _n_samples, 0.05)
+        # ── Analytical mean input rate from population encoder ─────────
+        # GaussianPopulationEncoder uses N tuning curves per dimension
+        # with sigma = sigma_factor × spacing (sigma_factor = 0.5).
+        # At any input value, the sum of all N Gaussian activations is
+        # approximately σ×√(2π)/spacing (integral of overlapping curves).
+        # Mean per neuron = sigma_factor × √(2π) / N.
+        # With N=15: mean_rate ≈ 0.5 × 2.507 / 15 ≈ 0.084.
+        # This is the expected fraction of active inputs after Poisson
+        # encoding, used to calibrate synaptic gain to AdEx rheobase.
+        _n_per_dim = wm_cfg.n_neurons_per_dim
+        _sigma_factor = 0.5  # matches GaussianPopulationEncoder._inv_2sigma2
+        _mean_input_rate = _sigma_factor * np.sqrt(2.0 * np.pi) / _n_per_dim
 
         # ── Create modules ────────────────────────────────────────────
         self.critic = SNNDeepCritic(bg_input_size, self._bg_config,
@@ -237,8 +237,19 @@ class SNNAgent(Agent):
         _actor_n = self._n_substeps
         _tau_c = self._bg_config.tau_m_critic
         _tau_a = self._bg_config.tau_m_msn_up
-        _headroom_c = 1.0 / max(1.0 - np.exp(-_critic_n * dt / _tau_c), 0.1)
-        _headroom_a = 1.0 / max(1.0 - np.exp(-_actor_n * dt / _tau_a), 0.1)
+        # Integration window must span at least ~10% of τ for meaningful
+        # membrane depolarisation.  If this fires, n_substeps or τ_m
+        # are misconfigured.
+        _denom_c = 1.0 - np.exp(-_critic_n * dt / _tau_c)
+        _denom_a = 1.0 - np.exp(-_actor_n * dt / _tau_a)
+        assert _denom_c > 0.05, (
+            f"Critic integration too short: {_critic_n}×{dt}ms vs τ={_tau_c}ms"
+        )
+        assert _denom_a > 0.05, (
+            f"Actor integration too short: {_actor_n}×{dt}ms vs τ={_tau_a}ms"
+        )
+        _headroom_c = 1.0 / _denom_c
+        _headroom_a = 1.0 / _denom_a
         # Recompute input gains with dynamic headroom
         from core.basal_ganglia import _derive_input_gain
         self.critic._input_gain = _derive_input_gain(
@@ -455,6 +466,18 @@ class SNNAgent(Agent):
         # (Wang 2002; Wickens et al. 2003).
         action = self.actor.get_action()
 
+        # ── STN-mediated exploration (Frank 2006; Wiecki & Frank 2013) ─
+        # Low tonic DA disinhibits STN → global GPi excitation → all
+        # thalamic channels suppressed → selection reverts to noise.
+        # Modelled as ε-greedy: ε = f(DA, 5-HT) from neuromodulatory
+        # state.  As DA rises with learning, ε → min_exploration.
+        _epsilon = self.bg.compute_exploration_noise(
+            serotonin=float(np.clip(self.neuromod.serotonin, 0.0, 1.0)),
+            tonic_da=float(np.clip(self.neuromod.dopamine, 0.0, 1.0)),
+        )
+        if np.random.random() < _epsilon:
+            action = int(np.random.randint(self.n_actions))
+
         return action
 
     # ------------------------------------------------------------------
@@ -493,33 +516,14 @@ class SNNAgent(Agent):
         # population activity for V(s'), then let VTA compute RPE
         # from E/I balance (Eshel et al. 2015).
 
-        # Freeze critic eligibility: the critic's eligibility trace
-        # (e_h) was accumulated during act(state) and must be preserved
-        # for the weight update below.  Without this, the V(s')
-        # integration loop overwrites critic eligibility with next_state
-        # STDP traces, causing dw = lr × td × activation(s') instead of
-        # activation(s).
-        _saved_e_h = self.critic.e_h.copy()
-        _saved_c_x_pre = self.critic._x_pre.copy()
-        _saved_c_x_post = self.critic._x_post.copy()
-        _saved_c_t_pre = self.critic._t_since_pre.copy()
-        _saved_c_t_post = self.critic._t_since_post.copy()
-
-        # Freeze actor eligibility: DA phasic burst arrives after the
-        # outcome event and must modulate the eligibility accumulated
-        # during the motor response period (Schultz 1997).  Without
-        # save/restore, 15 substeps of decay (τ_e_actor=20ms →
-        # 0.951^15 = 0.463) destroy 54% of the credit assignment
-        # signal.  The critic-only sensory below ensures the actor
-        # receives zero input, so no new meaningful traces form.
-        _saved_e_d1 = self.actor.e_d1.copy()
-        _saved_e_d2 = self.actor.e_d2.copy()
-        _saved_a_x_pre = self.actor._x_pre.copy()
-        _saved_a_x_post_d1 = self.actor._x_post_d1.copy()
-        _saved_a_x_post_d2 = self.actor._x_post_d2.copy()
-        _saved_a_t_pre = self.actor._t_since_pre.copy()
-        _saved_a_t_d1 = self.actor._t_since_d1_spike.copy()
-        _saved_a_t_d2 = self.actor._t_since_d2_spike.copy()
+        # Freeze eligibility: the critic's and actor's eligibility
+        # traces were accumulated during act(state) and must be
+        # preserved for the weight update below.  inference_mode
+        # makes forward() skip all plasticity-related state updates
+        # (pre/post traces, eligibility) while still running membrane
+        # dynamics and activation EMA normally.
+        self.critic._inference_mode = True
+        self.actor._inference_mode = True
 
         # Integrate over substeps to let the critic develop a
         # meaningful V(s') population activity.  Uses critic's own
@@ -550,22 +554,9 @@ class SNNAgent(Agent):
             n_substeps=self._n_substeps,
         )
 
-        # Restore critic eligibility to reflect only act(state) traces
-        self.critic.e_h = _saved_e_h
-        self.critic._x_pre = _saved_c_x_pre
-        self.critic._x_post = _saved_c_x_post
-        self.critic._t_since_pre = _saved_c_t_pre
-        self.critic._t_since_post = _saved_c_t_post
-
-        # Restore actor eligibility to reflect only act(state) traces
-        self.actor.e_d1 = _saved_e_d1
-        self.actor.e_d2 = _saved_e_d2
-        self.actor._x_pre = _saved_a_x_pre
-        self.actor._x_post_d1 = _saved_a_x_post_d1
-        self.actor._x_post_d2 = _saved_a_x_post_d2
-        self.actor._t_since_pre = _saved_a_t_pre
-        self.actor._t_since_d1_spike = _saved_a_t_d1
-        self.actor._t_since_d2_spike = _saved_a_t_d2
+        # Restore plasticity mode
+        self.critic._inference_mode = False
+        self.actor._inference_mode = False
 
         self._last_td_error = td_error_normed
 
@@ -592,7 +583,8 @@ class SNNAgent(Agent):
 
         # ── 5. World model + neuromodulator update ────────────────────
         if self._use_wm:
-            wm_m_t = max(self.neuromod.learning_rate_modulation, 0.1)
+            wm_m_t = max(self.neuromod.learning_rate_modulation,
+                         self.neuromod.config.baseline_da * 0.2)
             pred_error = self.world_model.update(
                 state_f32, action, next_f32, m_t=wm_m_t,
             )
@@ -777,6 +769,10 @@ class _BGFacade:
         tonic_da: float,
     ) -> float:
         min_exploration = self._agent_cfg.min_exploration
-        da_noise = max(0.3, 1.0 - tonic_da)
-        sero_noise = max(0.3, 1.0 - serotonin)
+        # DA and 5-HT suppress exploration proportionally.
+        # Floor = baseline level: even at maximum neuromodulator,
+        # exploration never drops below the resting-state noise.
+        # baseline_da=0.5, baseline_sero=0.6 from NeuromodulatorConfig.
+        da_noise = max(1.0 - tonic_da, 0.0)
+        sero_noise = max(1.0 - serotonin, 0.0)
         return max(min_exploration, da_noise * sero_noise)

@@ -317,6 +317,15 @@ class SNNDeepCritic:
         self._homeo_decay: float = config.ctx.decay(config.homeo_tau)
         self._homeo_counter: int = 0
 
+        # ── Inference mode ─────────────────────────────────────────────
+        # When True, forward() skips eligibility trace updates (pre/post
+        # synaptic traces, STDP eligibility).  Used during V(s')
+        # computation in observe() so that next-state integration does
+        # not corrupt the act()-phase eligibility needed for credit
+        # assignment.  Membrane dynamics and activation EMA still run
+        # normally — only plasticity-related state is frozen.
+        self._inference_mode: bool = False
+
     def set_astrocyte(
         self,
         astrocyte: AstrocyteField,
@@ -345,21 +354,25 @@ class SNNDeepCritic:
         h = cfg.hidden_size
 
         # ── Event-based pre-synaptic trace ────────────────────────────
-        self._x_pre *= self._pre_decay
-        pre_binary = (state_f32 > 0.5).astype(np.float32)
-        self._x_pre += pre_binary
-        self._t_since_pre += 1
-        self._t_since_pre[pre_binary > 0.5] = 0
+        if not self._inference_mode:
+            self._x_pre *= self._pre_decay
+            pre_binary = (state_f32 > 0.5).astype(np.float32)
+            self._x_pre += pre_binary
+            self._t_since_pre += 1
+            self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic current ──────────────────────────────────────────
         current = (state_f32 @ self.w_h) * self._input_gain * self._receptor_gain
 
         # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
         # Slow synaptic current: τ_NMDA=100ms extends effective integration
-        # window by ~4-5× beyond membrane τ=15ms.  AMPA:NMDA = 3:1.
+        # window by ~4-5× beyond membrane τ=15ms.
+        # AMPA:NMDA ratio from config (Myme et al. 2003).
+        _ampa_frac = cfg.ampa_nmda_ratio / (1.0 + cfg.ampa_nmda_ratio)
+        _nmda_frac = 1.0 - _ampa_frac
         _nmda_compl = 1.0 - self._nmda_decay
         self._i_nmda = self._i_nmda * self._nmda_decay + _nmda_compl * current
-        current = 0.75 * current + 0.25 * self._i_nmda
+        current = _ampa_frac * current + _nmda_frac * self._i_nmda
 
         # ── Single AdEx step ──────────────────────────────────────────
         in_refrac = self.refrac_hidden > 0
@@ -407,10 +420,11 @@ class SNNDeepCritic:
         self._homeo_counter += 1
 
         # ── Event-based post-synaptic trace ───────────────────────────
-        self._x_post *= self._post_decay
-        self._x_post[self.spikes_hidden] += 1.0
-        self._t_since_post += 1
-        self._t_since_post[self.spikes_hidden] = 0
+        if not self._inference_mode:
+            self._x_post *= self._post_decay
+            self._x_post[self.spikes_hidden] += 1.0
+            self._t_since_post += 1
+            self._t_since_post[self.spikes_hidden] = 0
 
         # ── Membrane potential normalisation ──────────────────────────
         # Continuous [0,1] signal: 0 = at rest, 1 = at threshold.
@@ -426,9 +440,10 @@ class SNNDeepCritic:
         # (1-decay) converts sum to bounded EMA — eligibility stays in
         # [-1, 1] independent of n_substeps.  Captures ALL neurons'
         # membrane state, not just spiking neurons (~25% of population).
-        _e_compl = 1.0 - self._trace_decay
-        _v_post_centered = v_normalized - float(np.mean(v_normalized))
-        self.e_h = self.e_h * self._trace_decay + _e_compl * np.outer(state_f32, _v_post_centered)
+        if not self._inference_mode:
+            _e_compl = 1.0 - self._trace_decay
+            _v_post_centered = v_normalized - float(np.mean(v_normalized))
+            self.e_h = self.e_h * self._trace_decay + _e_compl * np.outer(state_f32, _v_post_centered)
 
         # NOTE: Evidence accumulation and V(s) readout moved to VTA circuit.
         # VTA reads critic.activation via w_value (VP/PPTg pathways).
@@ -465,14 +480,18 @@ class SNNDeepCritic:
         # Biologically, silent AMPA synapses retain NMDA receptors and
         # undergo spontaneous potentiation via stochastic vesicle release
         # (Bhatt et al. 2009; Kerchner & Nicoll 2008).
+        # The correction is clipped to ±_HOMEO_CLIP to prevent single-step
+        # over-correction (maximum ±50% of target per τ_homeo).  Silent
+        # neurons receive the maximum positive correction = _HOMEO_CLIP.
+        _HOMEO_CLIP = 0.5  # max fractional correction per τ_homeo window
         _alpha_h = cfg.ctx.dt / cfg.homeo_tau
         target = cfg.homeo_target_rate
         rate_err = np.where(
             self._homeo_rate > target * 0.01,  # active neuron
             (target - self._homeo_rate) / max(target, 1e-8),
-            0.5,  # silent neuron: apply positive drift (metaplasticity)
+            _HOMEO_CLIP,  # silent neuron: max positive drift (metaplasticity)
         ).astype(np.float32)
-        np.clip(rate_err, -0.5, 0.5, out=rate_err)
+        np.clip(rate_err, -_HOMEO_CLIP, _HOMEO_CLIP, out=rate_err)
         scale = 1.0 + _alpha_h * rate_err
         self.w_h *= scale[np.newaxis, :]
 
@@ -772,6 +791,10 @@ class D1D2Actor:
         self._astrocyte: AstrocyteField | None = None
         self._zone_idx: NDArray[np.int32] | None = None
 
+        # ── Inference mode ─────────────────────────────────────────────
+        # See SNNDeepCritic._inference_mode for rationale.
+        self._inference_mode: bool = False
+
     def set_astrocyte(
         self,
         astrocyte: AstrocyteField,
@@ -824,11 +847,12 @@ class D1D2Actor:
         self._n_forward += 1
 
         # ── Event-based pre-synaptic trace ────────────────────────────
-        self._x_pre *= self._pre_decay
-        pre_binary = (state_f32 > 0.5).astype(np.float32)
-        self._x_pre += pre_binary
-        self._t_since_pre += 1
-        self._t_since_pre[pre_binary > 0.5] = 0
+        if not self._inference_mode:
+            self._x_pre *= self._pre_decay
+            pre_binary = (state_f32 > 0.5).astype(np.float32)
+            self._x_pre += pre_binary
+            self._t_since_pre += 1
+            self._t_since_pre[pre_binary > 0.5] = 0
 
         # ── Synaptic currents ─────────────────────────────────────────
         current_d1 = (state_f32 @ self.w_d1) * self._input_gain * self._receptor_gain
@@ -837,11 +861,14 @@ class D1D2Actor:
         # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
         # Slow synaptic current: τ_NMDA=100ms extends effective
         # integration window by ~4× beyond membrane τ=25ms.
+        # AMPA:NMDA ratio from config (Myme et al. 2003).
+        _ampa_frac = cfg.ampa_nmda_ratio / (1.0 + cfg.ampa_nmda_ratio)
+        _nmda_frac = 1.0 - _ampa_frac
         _nmda_compl = 1.0 - self._nmda_decay
         self._i_nmda_d1 = self._i_nmda_d1 * self._nmda_decay + _nmda_compl * current_d1
         self._i_nmda_d2 = self._i_nmda_d2 * self._nmda_decay + _nmda_compl * current_d2
-        current_d1 = 0.75 * current_d1 + 0.25 * self._i_nmda_d1
-        current_d2 = 0.75 * current_d2 + 0.25 * self._i_nmda_d2
+        current_d1 = _ampa_frac * current_d1 + _nmda_frac * self._i_nmda_d1
+        current_d2 = _ampa_frac * current_d2 + _nmda_frac * self._i_nmda_d2
 
         # ── DA pathway-specific modulation (Frank 2005; Surmeier 2007) ─
         # D1 (Go): DA activates D1 receptors → cAMP↑/PKA → NMDA
@@ -975,15 +1002,16 @@ class D1D2Actor:
 
         # ── Event-based post-synaptic traces (Bi & Poo 2001) ─────────
         # Required for the LTD arm of STDP in eligibility below.
-        self._x_post_d1 *= self._post_decay
-        self._x_post_d1[self.spikes_d1] += 1.0
-        self._t_since_d1_spike += 1
-        self._t_since_d1_spike[self.spikes_d1] = 0
+        if not self._inference_mode:
+            self._x_post_d1 *= self._post_decay
+            self._x_post_d1[self.spikes_d1] += 1.0
+            self._t_since_d1_spike += 1
+            self._t_since_d1_spike[self.spikes_d1] = 0
 
-        self._x_post_d2 *= self._post_decay
-        self._x_post_d2[self.spikes_d2] += 1.0
-        self._t_since_d2_spike += 1
-        self._t_since_d2_spike[self.spikes_d2] = 0
+            self._x_post_d2 *= self._post_decay
+            self._x_post_d2[self.spikes_d2] += 1.0
+            self._t_since_d2_spike += 1
+            self._t_since_d2_spike[self.spikes_d2] = 0
 
         # ── Evidence accumulation (Gold & Shadlen 2007) ───────────────
         # Spike counts over the decision window — integer-scale evidence
@@ -1013,14 +1041,19 @@ class D1D2Actor:
             self.motor_dim, self.n_per_action,
         ).sum(axis=1)
 
-        # ── GPi action competition via graded membrane potential ───────
-        # The SNr/GPi integrates D1 (direct) and D2 (indirect) input
-        # over the decision window.  Mean normalized membrane potential
-        # averaged across population and timesteps provides a graded
-        # competition signal (Cisek 2007; Erlhagen & Schöner 2002).
-        # Spike counts alone are too sparse in the 25-step window
-        # (many neurons don't reach v_spike_cutoff) — voltage captures
-        # the full sub-threshold competition dynamics.
+        # ── GPi/SNr action competition via spike-count evidence ────────
+        # GPi/SNr disinhibition is gated by MSN spike rate, not graded
+        # membrane potential (Mink 1996; Gurney, Prescott & Redgrave 2001).
+        # D1 (direct) spikes disinhibit thalamus → facilitate action (Go).
+        # D2 (indirect) spikes maintain STN→GPi inhibition → suppress (NoGo).
+        # Net evidence = D1 spike count − D2 spike count per action population.
+        #
+        # Exploration arises from intrinsic Poisson variability of spike
+        # counts (Gold & Shadlen 2007).  With N spikes from a population
+        # of n_per_action neurons × n_substeps timesteps, the coefficient
+        # of variation CV ≈ 1/√N provides natural stochastic exploration
+        # that decreases as evidence accumulates — no artificial softmax
+        # temperature parameter needed.
         d1_counts = self._spike_count_d1[:self._total_motor].reshape(
             self.motor_dim, self.n_per_action,
         ).sum(axis=1)
@@ -1028,32 +1061,13 @@ class D1D2Actor:
             self.motor_dim, self.n_per_action,
         ).sum(axis=1)
 
-        _n = max(self._n_forward, 1)
-        motor_d1_v = self._v_accum_d1[:self._total_motor].reshape(
-            self.motor_dim, self.n_per_action,
-        ).mean(axis=1) / _n
-        motor_d2_v = self._v_accum_d2[:self._total_motor].reshape(
-            self.motor_dim, self.n_per_action,
-        ).mean(axis=1) / _n
+        net_evidence = d1_counts - d2_counts
 
-        # Net evidence: D1(Go) − D2(NoGo) mean voltage per action
-        net_evidence = motor_d1_v - motor_d2_v
-
-        # ── Stochastic softmax selection (Bogacz et al. 2006;
-        # Daw et al. 2006) ─────────────────────────────────────────────
-        # Temperature = exploration_noise scales evidence → action
-        # probabilities.  Small temperature → exploit (near-argmax);
-        # large temperature → explore (near-uniform).  The value
-        # derives from cortical background noise at the GPi readout
-        # (Destexhe et al. 2003): σ_membrane ≈ 1 mV → normalized
-        # σ_v ≈ 0.07 → averaged over 32 neurons × 25 steps →
-        # σ_mean ≈ 0.002, scaled to effective decision noise.
-        temperature = max(float(cfg.exploration_noise), 0.01)
-        logits = net_evidence / temperature
-        logits = logits - np.max(logits)  # numerical stability
-        exp_logits = np.exp(logits.astype(np.float64))
-        probs = exp_logits / exp_logits.sum()
-        action = int(np.random.choice(self.motor_dim, p=probs))
+        # WTA: highest net evidence wins; ties broken randomly
+        # (equal D1−D2 balance = no preference → uniform selection).
+        max_ev = net_evidence.max()
+        winners = np.flatnonzero(net_evidence == max_ev)
+        action = int(np.random.choice(winners))
         self._last_action = action
         self._last_net_evidence = net_evidence.copy()
 
@@ -1065,9 +1079,10 @@ class D1D2Actor:
         # for active neurons.  Ratchet prevented by WTA-mediated
         # inhibition (suppresses losing actions' membrane → lower
         # eligibility) + column norm clipping + OpAL sign separation.
-        _e_compl = 1.0 - self._trace_decay
-        self.e_d1 = self.e_d1 * self._trace_decay + _e_compl * np.outer(state_f32, v_d1_norm)
-        self.e_d2 = self.e_d2 * self._trace_decay + _e_compl * np.outer(state_f32, v_d2_norm)
+        if not self._inference_mode:
+            _e_compl = 1.0 - self._trace_decay
+            self.e_d1 = self.e_d1 * self._trace_decay + _e_compl * np.outer(state_f32, v_d1_norm)
+            self.e_d2 = self.e_d2 * self._trace_decay + _e_compl * np.outer(state_f32, v_d2_norm)
 
         # ── Internal actions (WM gate) via MSN dynamics ─────────────
         # WM gate uses the same bistable MSN membrane state as motor
@@ -1144,6 +1159,7 @@ class D1D2Actor:
         # Per-step multiplicative correction derived from homeo_tau.
         # D2 naturally gets more upscaling because DA suppresses D2
         # firing (Frank 2005) — the rate error is larger for D2.
+        _HOMEO_CLIP = 0.5  # max fractional correction per τ_homeo window
         _alpha_h = cfg.ctx.dt / cfg.homeo_tau
         target = cfg.homeo_target_rate
         for w, hr in ((self.w_d1, self._homeo_rate_d1),
@@ -1151,9 +1167,9 @@ class D1D2Actor:
             rate_err = np.where(
                 hr > target * 0.01,  # active neuron
                 (target - hr) / max(target, 1e-8),
-                0.5,  # silent neuron: metaplasticity (Abraham & Bear 1996)
+                _HOMEO_CLIP,  # silent neuron: max positive drift (metaplasticity)
             ).astype(np.float32)
-            np.clip(rate_err, -0.5, 0.5, out=rate_err)
+            np.clip(rate_err, -_HOMEO_CLIP, _HOMEO_CLIP, out=rate_err)
             scale = 1.0 + _alpha_h * rate_err
             w *= scale[np.newaxis, :]
             np.maximum(w, 0.0, out=w)  # Maintain Dale's law

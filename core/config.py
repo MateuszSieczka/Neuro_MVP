@@ -1020,6 +1020,9 @@ class BasalGangliaConfig(BaseConfig):
     d2_ltd_activity_gate: bool = True
     # Synaptic degradation — protein turnover (Bhatt et al. 2009)
     readout_decay: float = 2e-5       # Compressed protein turnover (Bhatt 2009: τ~5days; compressed ~4000× → τ≈50000 steps)
+    # AMPA:NMDA conductance ratio (Myme et al. 2003: ~2:1 to 4:1 in cortex)
+    # 3:1 → AMPA fraction = 3/(3+1) = 0.75, NMDA fraction = 0.25.
+    ampa_nmda_ratio: float = 3.0
 
     def __post_init__(self) -> None:
         assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"

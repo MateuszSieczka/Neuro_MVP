@@ -39,7 +39,7 @@ class Environment(abc.ABC):
     """Gym-like environment interface.  State is always a 1-D float32 array."""
 
     @abc.abstractmethod
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         """Reset and return initial observation."""
 
     @abc.abstractmethod
@@ -55,6 +55,9 @@ class Environment(abc.ABC):
     @abc.abstractmethod
     def state_size(self) -> int:
         """Dimensionality of the observation vector."""
+
+    def close(self) -> None:
+        """Release resources (no-op for in-process environments)."""
 
 
 # =====================================================================
@@ -128,41 +131,6 @@ class TrainResult:
         if last_n is not None:
             rews = rews[-last_n:]
         return float(np.mean(rews)) if rews else 0.0
-
-    def learning_curve(self, window: int = 50) -> list[float]:
-        """Moving-average reward curve for plotting/analysis."""
-        rews = self.rewards
-        if len(rews) < window:
-            return [float(np.mean(rews))] if rews else []
-        return [
-            float(np.mean(rews[max(0, i - window):i]))
-            for i in range(window, len(rews) + 1)
-        ]
-
-    def is_improving(self, early_n: int = 100, late_n: int = 100) -> bool:
-        """True if late performance is significantly better than early."""
-        rews = self.rewards
-        if len(rews) < early_n + late_n:
-            return False
-        early = float(np.mean(rews[:early_n]))
-        late = float(np.mean(rews[-late_n:]))
-        return late > early + 0.05  # must improve by at least 0.05
-
-    def action_distribution(self, last_n: int | None = None) -> dict[int, float]:
-        """Fraction of each action across recent episodes."""
-        logs = self.episode_logs
-        if last_n is not None:
-            logs = logs[-last_n:]
-        all_actions = []
-        for ep in logs:
-            all_actions.extend(ep.actions)
-        if not all_actions:
-            return {}
-        counts: dict[int, int] = {}
-        for a in all_actions:
-            counts[a] = counts.get(a, 0) + 1
-        total = len(all_actions)
-        return {a: c / total for a, c in sorted(counts.items())}
 
 
 # =====================================================================

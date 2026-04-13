@@ -111,17 +111,20 @@ class VTACircuit:
         at decision time.  This represents "what I expected" and will
         inhibit VTA DA neurons during observe().
 
-        Also sets the eligibility trace for the value readout weight:
-        centered activation snapshot (neurons above/below average get
-        +/− eligibility for selective credit assignment).
+        Eligibility = raw activation (uncentered).  VP/PPTg neurons
+        receive total striatal firing (Eshel et al. 2015) — there is
+        no biological mean-subtraction across the population.  The
+        semi-gradient ∂V/∂w = φ(s) where V(s) = dot(φ, w), so the
+        eligibility must equal the raw feature vector for gradient
+        consistency (Sutton & Barto 2018, §9.4).
         """
         self._stored_activation = critic_activation.copy()
         self._stored_v = float(np.dot(critic_activation, self.w_value))
         self.last_v_s = self._stored_v
 
-        # Eligibility: centered critic activation snapshot.
-        # Matches the old e_v scale (v_centered, typical magnitude ~0.05).
-        self.e_value = critic_activation - float(np.mean(critic_activation))
+        # Raw activation as eligibility — gradient-consistent with
+        # V(s) = dot(activation, w_value).
+        self.e_value = critic_activation.copy()
 
     # ------------------------------------------------------------------
     # Compute RPE — called during observe()

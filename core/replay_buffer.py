@@ -41,6 +41,10 @@ class Experience:
     Spike-time representation: spike_trains capture temporal spike
     patterns (not raw float state vectors). Raw state/next_state
     retained for world model compatibility.
+
+    aug_state / aug_next_state: population-encoded versions of
+    state / next_state for critic replay (bypasses the population
+    encoder during offline sleep).
     """
     state: NDArray[np.float32]
     action: int
@@ -51,6 +55,7 @@ class Experience:
     spike_trains: list[NDArray[np.float32]]  # Per-layer spike trains
     synaptic_fingerprint: dict[str, NDArray[np.float32]]  # Per-layer eligibility snapshot
     aug_state: NDArray[np.float32] | None = None
+    aug_next_state: NDArray[np.float32] | None = None
     salience: float = 0.0
     recorded_da: float = 0.0
     curiosity: float = 0.0
@@ -66,6 +71,8 @@ class Experience:
         }
         if self.aug_state is not None:
             self.aug_state = self.aug_state.copy()
+        if self.aug_next_state is not None:
+            self.aug_next_state = self.aug_next_state.copy()
 
 
 # =====================================================================
@@ -76,8 +83,12 @@ class ReplayBuffer:
     """Fixed-capacity replay buffer with SWS + REM sleep phases.
 
     SWS (Slow-Wave Sleep):
-      Reverse replay (sharp-wave ripples) — consolidate declarative
-      memories. Critic/actor weight updates from TD returns.
+      Reverse replay (sharp-wave ripples) — consolidate value and
+      action representations.  Each experience is RE-RUN through the
+      critic network at a compressed integration window (swr_substeps).
+      The VTA circuit computes RPE from the replay-generated activations,
+      and three-factor STDP updates the BG weights.  No Monte Carlo
+      returns, no advantage normalization, no explicit gamma.
 
     REM (Rapid Eye Movement):
       Forward replay (theta sequences) — refine world model predictions.
@@ -112,8 +123,6 @@ class ReplayBuffer:
         bg: object,
         n_experiences: int | None = None,
         sequence_memories: dict[str, SequenceMemory] | None = None,
-        gamma: float | None = None,
-        sleep_gain: float = 1.0,
         oscillator: object | None = None,
     ) -> list[float]:
         """Two-phase sleep consolidation with biological SWS oscillation.
@@ -121,16 +130,19 @@ class ReplayBuffer:
         Phase 1 (SWS): Reverse replay → critic/actor consolidation.
           Oscillator enters ~1 Hz slow oscillation mode.
           InhibitoryPool gain elevated 2-3× (GABA surge).
-          Up phase: noise + SWR replay.
+          Up phase: SWR neural replay → VTA RPE → three-factor STDP.
           Down phase: global hyperpolarization.
         Phase 2 (REM): Forward replay → world model refinement.
+
+        No Monte Carlo returns, no advantage normalization, no gamma
+        parameter.  TD error emerges from VTA circuit (Eshel 2015)
+        operating on replay-generated activations.
 
         Returns per-experience world model MSE from SWS phase.
         """
         if len(self._buffer) == 0:
             return []
 
-        gamma = gamma if gamma is not None else self.config.gamma
         experiences = list(self._buffer)
         if n_experiences is not None:
             experiences = experiences[-n_experiences:]
@@ -159,7 +171,7 @@ class ReplayBuffer:
         # Phase 1: SWS — reverse replay (most recent first)
         sws_exps = experiences[-n_sws:]
         sws_errors = self._sws_phase(
-            sws_exps, world_model, bg, gamma, sleep_gain,
+            sws_exps, world_model, neuromodulator, bg,
             oscillator=oscillator,
         )
 
@@ -185,54 +197,44 @@ class ReplayBuffer:
         self,
         experiences: list[Experience],
         world_model: "SNNWorldModel",
+        neuromodulator: "NeuromodulatorSystem",
         bg: object,
-        gamma: float,
-        sleep_gain: float,
         oscillator: object | None = None,
     ) -> list[float]:
-        """Reverse-chronological replay for critic/actor consolidation.
+        """SWR neural replay for critic/actor consolidation.
+
+        Each experience is re-run through the critic at a compressed
+        integration window (swr_substeps), the VTA computes RPE from
+        the replay-generated activations, and three-factor STDP updates
+        the BG weights.  No Monte Carlo returns, no advantage
+        normalization, no explicit gamma — temporal discounting emerges
+        from VTA PPTg pathway dynamics (Schweighofer et al. 2008).
+
+        SWR replay is RECONSTRUCTION, not playback (Diba & Buzsáki
+        2007): the network regenerates spikes from current weights at
+        normal dt. The shortened integration window IS the temporal
+        compression, avoiding spurious STDP correlations from naive
+        time-scaling of stored spike trains.
 
         Gated by slow oscillation Up/Down states (~1 Hz):
-          Up phase: SWR replay — world model + BG weight updates.
+          Up phase:  SWR replay — VTA RPE drives weight updates.
           Down phase: global hyperpolarization — skip replay, reset LIF.
         Seizure brake: if mean critic activation >3× baseline → force Down.
-
-        Computes Monte Carlo returns backward, normalizes advantages,
-        then updates BG and world model. Uses V_trace for baseline.
         """
         wm_saved = world_model.snapshot_encoder()
+        n_swr = self.config.swr_substeps
 
-        # Cumulative returns backward
-        cumulative_returns: list[float] = []
-        g = 0.0
-        for exp in reversed(experiences):
-            if exp.done:
-                g = 0.0
-            sal_eff = max(0.0, exp.salience - 0.5) * 2.0
-            eff_gamma = gamma * (1.0 - sal_eff)
-            g = exp.reward + eff_gamma * g
-            cumulative_returns.append(g)
+        # Current serotonin level for VTA temporal discount during replay.
+        # During SWS, 5-HT is low (Pace-Schott & Hobson 2002), which
+        # naturally shortens the VTA discount horizon.
+        sero = float(neuromodulator.serotonin) if hasattr(neuromodulator, 'serotonin') else 0.0
 
-        # Batch-normalise advantages using V_trace
-        intrinsic_weight = 0.1
-        all_advantages: list[float] = []
-        for i, exp in enumerate(reversed(experiences)):
-            g_aug = cumulative_returns[i] + intrinsic_weight * exp.curiosity
-            # Use critic forward to get current V estimate (also updates activation)
-            aug = exp.aug_state if exp.aug_state is not None else exp.state
-            bg.critic.forward(aug)
-            vs = bg.last_v
-            all_advantages.append(g_aug - vs)
-
-        adv_arr = np.array(all_advantages, dtype=np.float32)
-        adv_std = float(np.std(adv_arr)) + 1e-8
-        max_abs = float(np.max(np.abs(adv_arr))) + 1e-8
-        variance_scale = float(np.clip(adv_std / 0.5, 0.1, 1.0))
-        adv_norm = (adv_arr / max_abs) * variance_scale
+        # VTA circuit reference (stored on the BG facade)
+        vta = bg.vta if hasattr(bg, 'vta') else None
 
         # Reverse replay — gated by slow oscillation Up/Down state
         errors: list[float] = []
-        for i, exp in enumerate(reversed(experiences)):
+        for exp in reversed(experiences):
             # ── Advance slow oscillation ──────────────────────────────
             if oscillator is not None and hasattr(oscillator, 'tick_sws'):
                 _up_onset, _down_onset = oscillator.tick_sws()
@@ -252,29 +254,76 @@ class ReplayBuffer:
                     errors.append(0.0)
                     continue
 
-            # ── Up state: SWR replay ──────────────────────────────────
-            # Restore synaptic fingerprint if available
+            # ── Up state: SWR neural replay ───────────────────────────
+            # Reset membrane state for fresh replay (each SWR event
+            # starts from a clean baseline — Buzsáki 2015).
+            bg.critic.reset_state()
+
+            # ── Replay V(s): integrate critic on stored state ─────────
+            # The network REGENERATES spikes from current weights.
+            # Compressed integration (n_swr substeps instead of 15-25
+            # online) — this IS the biological SWR time compression.
+            aug_s = exp.aug_state if exp.aug_state is not None else exp.state
+            for _ in range(n_swr):
+                bg.critic.forward(aug_s)
+
+            # VTA captures V(s) prediction from replay-generated
+            # activation (same VP pathway as online — Eshel 2015).
+            if vta is not None:
+                vta.store_prediction(bg.critic.activation)
+
+            # Save critic eligibility accumulated during V(s) replay.
+            # The V(s') integration below will overwrite e_h — we need
+            # to preserve the act-phase eligibility for the update
+            # (same pattern as online observe()).
+            _saved_e_h = bg.critic.e_h.copy()
+
+            # ── Replay V(s'): integrate critic on next_state ──────────
+            aug_ns = exp.aug_next_state if exp.aug_next_state is not None else exp.next_state
+            for _ in range(n_swr):
+                bg.critic.forward(aug_ns)
+
+            # ── VTA RPE from replay-generated activations ─────────────
+            # RPE = reward + γ_eff × V(s') − V(s), where γ_eff emerges
+            # from PPTg pathway τ with serotonin modulation.
+            if vta is not None:
+                rpe = vta.compute_rpe(
+                    critic_activation=bg.critic.activation,
+                    reward=exp.reward,
+                    is_terminal=exp.done,
+                    serotonin=sero,
+                    n_substeps=n_swr,
+                )
+            else:
+                rpe = 0.0
+
+            # Restore critic eligibility (credit goes to s, not s')
+            bg.critic.e_h = _saved_e_h
+
+            # ── VTA value weight update ───────────────────────────────
+            if vta is not None:
+                vta.update(rpe)
+
+            # ── Three-factor STDP update (same as online) ─────────────
+            # DA broadcast from VTA to both ventral (critic) and dorsal
+            # (actor) striatum (Schultz 1998).
+            bg.critic.update(rpe)
+            bg.actor.update(rpe)
+
+            # ── World model update (SWR-driven encoder STDP) ──────────
             if "encoder_e_bu" in exp.synaptic_fingerprint:
                 e_bu = exp.synaptic_fingerprint["encoder_e_bu"]
                 if e_bu.shape == world_model.encoder.e_bu.shape:
                     world_model.encoder.e_bu[:] = e_bu
             world_model.reset_state()
 
-            m_t = exp.recorded_da * max(abs(float(adv_norm[i])), 0.1)
+            # World model modulation: recorded DA level scales encoder
+            # plasticity during replay (Peyrache et al. 2009).
+            m_t = exp.recorded_da * max(abs(rpe), 0.1)
             world_error = world_model.update(
                 exp.state, exp.action, exp.next_state, m_t=m_t,
             )
             errors.append(float(np.mean(world_error ** 2)))
-
-            # Direct TD update scaled by advantage (no snapshot restore)
-            norm_adv = float(adv_norm[i])
-            n_exp = min(max(len(experiences), 1), 200)
-            pos_ratio = (0.5 * 200) / max(n_exp, 1)
-            neg_ratio = (0.1 * 200) / max(n_exp, 1)
-            ratio = pos_ratio if norm_adv >= 0 else neg_ratio
-            sleep_signal = norm_adv * ratio * sleep_gain
-            bg.critic.update(sleep_signal)
-            bg.actor.update(sleep_signal)
 
         world_model.restore_encoder(wm_saved)
         return errors

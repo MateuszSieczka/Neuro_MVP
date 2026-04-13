@@ -816,21 +816,33 @@ class SequenceMemoryConfig(BaseConfig):
 class ReplayBufferConfig(BaseConfig):
     """Sleep consolidation parameters.
 
-    Reference: Walker & Stickgold (2006), Diekelmann & Born (2010)
+    Reference: Walker & Stickgold (2006), Diekelmann & Born (2010),
+               Buzsáki (2015), Diba & Buzsáki (2007)
 
     Two-phase sleep:
-      SWS: Reverse replay (sharp-wave ripples), cortical consolidation
-      REM: Forward replay (theta sequences), world model refinement
+      SWS: Reverse replay (sharp-wave ripples), cortical consolidation.
+           Each experience is re-run through the critic network with a
+           short integration window (swr_substeps) — NOT by replaying
+           stored spike trains at compressed speed.  The network
+           REGENERATES spikes from current weights; STDP operates on
+           these fresh spikes at normal dt, avoiding spurious temporal
+           correlations from naive time-compression.
+      REM: Forward replay (theta sequences), world model refinement.
     """
     capacity: int = 1000
     sws_replay_fraction: float = 0.7  # Fraction of sleep budget for SWS
     rem_replay_fraction: float = 0.3  # Fraction for REM
-    gamma: float = 0.99
+    # SWR integration window (substeps per replayed experience).
+    # Biological SWR events last ~50-100ms (Buzsáki 2015) vs ~200-500ms
+    # awake processing.  With dt=1ms, 5 substeps = 5ms integration per
+    # replay event — a ~3-5× compression ratio.  The shorter window
+    # IS the compression mechanism (not sped-up stored spikes).
+    swr_substeps: int = 5
 
     def __post_init__(self) -> None:
         assert self.capacity > 0, f"capacity must be positive, got {self.capacity}"
         assert 0 < self.sws_replay_fraction + self.rem_replay_fraction <= 1, "replay fractions must sum to <= 1"
-        assert 0 < self.gamma <= 1, f"gamma must be in (0, 1], got {self.gamma}"
+        assert self.swr_substeps > 0, f"swr_substeps must be positive, got {self.swr_substeps}"
 
 
 # =====================================================================
@@ -885,17 +897,13 @@ class AgentConfig(BaseConfig):
     These control reward shaping, plasticity gating, exploration dynamics,
     and sleep scheduling — previously hardcoded in SNNAgent.observe().
     """
-    intrinsic_reward_weight: float = 0.1       # curiosity weight in effective_reward
     td_clip: float = 50.0                      # gradient clipping on TD error
     noise_smoothing: float = 0.8               # EMA coefficient for exploration noise
     min_exploration: float = 0.15              # exploration noise floor
-    sleep_gain_scale: float = 0.5              # quality → sleep_gain multiplier
-    sleep_gain_max: float = 2.5                # sleep_gain ceiling
 
     def __post_init__(self) -> None:
         assert self.td_clip > 0, f"td_clip must be positive, got {self.td_clip}"
         assert 0 < self.min_exploration < 1, f"min_exploration must be in (0, 1), got {self.min_exploration}"
-        assert self.sleep_gain_max > 0, f"sleep_gain_max must be positive, got {self.sleep_gain_max}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -919,11 +927,24 @@ class BasalGangliaConfig(BaseConfig):
     # signal.  actor_lr > critic_lr violates this requirement and
     # causes noisy, non-stationary TD errors.
     # Ratio 10:1 (critic:actor) prevents premature actor exploitation
-    # of noise before the critic develops state discrimination.
-    # With pure OpAL (D1/D2 sign-gated), slow actor lr prevents
-    # noise-driven pathway divergence during the critic warm-up period.
-    critic_lr: float = 3e-3
-    actor_lr: float = 1e-3
+    # Critic and actor learning rates for three-factor STDP.
+    #
+    # Per-trial effective learning rate: α = lr × ||e||².
+    # With sparse SNN features (2% spike rate), eligibility norms are:
+    #   ||e_h|| ≈ 0.7 → ||e_h||² ≈ 0.5  (critic, centered voltage)
+    #   ||e_d1|| ≈ 4.5 → ||e_d1||² ≈ 20  (actor, uncentered voltage)
+    #
+    # For Rescorla-Wagner style convergence (~100-200 trials):
+    #   Critic: α_c = 0.03 × 0.5 = 0.015 → converge in ~67 trials
+    #   Actor:  α_a = 0.003 × 20 = 0.06  → converge in ~17 trials
+    # Ratio α_c/α_a = 0.25 — within two-timescale bounds
+    # (Konda & Tsitsiklis 2003: α_a = O(α_c) suffices).
+    #
+    # Per-synapse weight change ~1-3% per episode at td=1, matching
+    # single-pairing LTP magnitudes (Bi & Poo 1998: 5-15% per pairing
+    # over 60 pre-post events, ≈ 0.1-0.25% per event).
+    critic_lr: float = 0.03
+    actor_lr: float = 3e-3
     # Eligibility trace time constants
     tau_e_actor: float = 30.0    # Short tau for responsive EMA eligibility
     tau_e_critic: float = 100.0   # Ventral striatum: moderate integration
@@ -948,7 +969,7 @@ class BasalGangliaConfig(BaseConfig):
     # rate estimates for spike-based action selection.
     neurons_per_action: int = 32
     # Exploration
-    exploration_noise: float = 0.3
+    exploration_noise: float = 0.05
     # DA pathway-specific modulation (Frank 2005; Surmeier et al. 2007)
     # D1 receptors (Go pathway): DA excites via cAMP↑/PKA → NMDA potentiation
     # D2 receptors (NoGo pathway): DA inhibits via cAMP↓ → reduced excitability
@@ -973,9 +994,7 @@ class BasalGangliaConfig(BaseConfig):
     # firing rate.  Prevents weight erosion and runaway excitation
     # without task-specific clip values.
     homeo_target_rate: float = 0.01    # Target firing rate per neuron (Planert et al. 2010: MSN 1-10 Hz → 0.001-0.01 at dt=1ms)
-    homeo_tau: float = 5000.0         # Slow rate-averaging τ (ms)
-    homeo_interval: int = 500         # Forward steps between scaling events (Turrigiano: hours → compressed ~0.5s biological time)
-    homeo_max_change: float = 0.005   # Max fractional change per event (Turrigiano 2004: 50% in 48h → ~0.0005 compressed 10×)
+    homeo_tau: float = 5000.0         # Slow rate-averaging τ (ms); also sets continuous correction rate α = dt/τ
     # Bidirectional DA modulation (Shen et al. 2008)
     ltd_ratio: float = 0.7            # LTD/LTP magnitude ratio (Shen et al. 2008)
     # D2 LTD protection: D2-MSNs resist depotentiation via stronger
@@ -1063,9 +1082,14 @@ class VTAConfig(BaseConfig):
     reward_gain: float = 1.0     # Reward → VTA excitatory conductance
 
     # ── Value readout learning rate ───────────────────────────────
-    # Three-factor Hebbian: dw = lr × RPE × critic_activation.
-    # Matches critic_lr for two-timescale convergence (Konda 2003).
-    value_lr: float = 3e-3
+    # Semi-gradient TD: dw = lr × RPE × φ(s).  Effective per-trial
+    # learning rate α_eff = lr × ||φ||².  With critic activation
+    # φ ≈ 0.02 per neuron (2% spike rate), ||φ||² ≈ h × 0.02² ≈ 0.05
+    # for h=128.  Target α_eff ≈ 0.005 per trial → value convergence
+    # in ~200 trials (Rescorla & Wagner 1972, Gallistel & Gibbon 2000).
+    # Stability criterion (Bertsekas & Tsitsiklis 1996): lr × ||φ||² < 2
+    # → lr < 40.  Our lr=0.1 gives α_eff=0.005, margin = 400×.
+    value_lr: float = 0.1
 
     # ── D2 autoreceptor (Tobler et al. 2005) ─────────────────────
     # Slow adaptation of DA coding gain to recent RPE statistics.
@@ -1087,10 +1111,22 @@ class VTAConfig(BaseConfig):
 # Weight Initialization Utilities
 # =====================================================================
 
+# Feldmeyer et al. (2002): unitary EPSPs in cortex span 0.15–5.5 mV.
+# Derived from conductance-based biophysics (Magee & Cook 2000):
+#   EPSP = g_syn × (E_AMPA − V_rest) / g_L
+#         = 0.4 nS × (0 − (−70.6 mV)) / 30 nS ≈ 0.94 mV
+#
+# Half-normal weight distribution:  E[|w|] = σ × √(2/π) ≈ 0.80 σ.
+# To set E[|w|] = unitary_EPSP for a single active synapse:
+#   psp_target = unitary_EPSP / √(2/π)
+_UNITARY_EPSP_MV: float = 0.4 * 70.6 / 30.0  # ≈ 0.94 mV
+_PSP_TARGET_DEFAULT: float = float(_UNITARY_EPSP_MV / np.sqrt(2.0 / np.pi))  # ≈ 1.18 mV
+
+
 def compute_weight_std(
     fan_in: int,
     fan_out: int,
-    psp_target: float = 2.0,
+    psp_target: float = _PSP_TARGET_DEFAULT,
     target_rate: float = 0.05,
 ) -> float:
     """Derive weight initialization std from desired PSP amplitude.
@@ -1099,6 +1135,10 @@ def compute_weight_std(
 
     Ensures that under expected input (fan_in × target_rate active inputs),
     the total PSP approximates psp_target mV.
+
+    Default psp_target derived from Feldmeyer et al. (2002) unitary
+    EPSP biophysics: g_syn=0.4nS, E_AMPA=0mV, V_rest=−70.6mV,
+    g_L=30nS → EPSP≈0.94 mV → psp_target≈1.18 mV.
 
     Args:
         fan_in:      Number of input connections.
@@ -1116,7 +1156,7 @@ def compute_weight_std(
 def init_weights(
     fan_in: int,
     fan_out: int,
-    psp_target: float = 2.0,
+    psp_target: float = _PSP_TARGET_DEFAULT,
     target_rate: float = 0.05,
     excitatory: bool = True,
 ) -> np.ndarray:
@@ -1124,6 +1164,8 @@ def init_weights(
 
     Feedforward: w ~ |N(0, σ²)| if excitatory (Dale's law)
     Inhibitory:  w ~ -|N(0, σ²)| (Dale's law: w ≤ 0)
+
+    Default psp_target from unitary EPSP biophysics (Feldmeyer 2002).
 
     Args:
         fan_in:      Input dimension.

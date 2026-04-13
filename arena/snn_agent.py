@@ -124,10 +124,11 @@ class SNNAgent(Agent):
 
         # ── Compute layer sizes ───────────────────────────────────────
         self._wm_num_neurons = max(8, state_size)
-        if self._use_working_memory:
-            bg_input_size = bg_base_size + self._wm_num_neurons
-        else:
-            bg_input_size = bg_base_size
+        # Biologically: all afferent currents sum at the dendrite
+        # (Alexander et al. 1986; Haber 2003).  WM→BG and cortex→BG
+        # converge on the same MSN population via separate synapses.
+        # WM contribution arrives through graph sum — no concat.
+        bg_input_size = bg_base_size
 
         # ── Empirical mean input rate from population encoder ─────────
         # GaussianPopulationEncoder produces continuous rates [0,1] which
@@ -206,7 +207,6 @@ class SNNAgent(Agent):
 
         # ── Transient state ───────────────────────────────────────────
         self._last_td_error: float = 0.0
-        self._step_count: int = 0
         self._last_curiosity: float = 0.0
         self._last_encoded_state: NDArray[np.float32] | None = None
 
@@ -294,19 +294,20 @@ class SNNAgent(Agent):
 
         # ── Columnar: assoc → BG via feedforward ─────────────────────
         if self._use_columnar:
-            agg = "concat" if self._use_working_memory else "sum"
             net.connect(self._assoc_name, "critic",
-                        aggregation_mode=agg)
+                        aggregation_mode="sum")
             net.connect(self._assoc_name, "actor",
-                        aggregation_mode=agg)
+                        aggregation_mode="sum")
 
         if self._use_working_memory:
             net.add_layer("working_memory", self.working_memory,
                           receptor_profile=PFC_RECEPTORS)
+            # Dendritic summation: PFC afferents add to cortical input
+            # via separate synapses on the same MSN population.
             net.connect("working_memory", "critic",
-                        aggregation_mode="concat")
+                        aggregation_mode="sum")
             net.connect("working_memory", "actor",
-                        aggregation_mode="concat")
+                        aggregation_mode="sum")
 
         if self._use_wm:
             net.add_layer("encoder", self.world_model.encoder,
@@ -336,22 +337,16 @@ class SNNAgent(Agent):
             )
             sensory.update(col_sensory)
 
-            # WM still receives full encoded state
+            # WM receives Poisson-encoded raw state (matching state_size)
             if self._use_working_memory:
-                sensory["working_memory"] = encoded
+                sensory["working_memory"] = self._poisson.encode(raw_state)
         else:
             # Flat mode: BG receives encoded state directly
+            # WM contribution arrives through graph sum (no padding).
+            sensory["critic"] = encoded
+            sensory["actor"] = encoded
             if self._use_working_memory:
-                sensory["working_memory"] = encoded
-                padded = np.zeros(
-                    self._encoded_size + self._wm_num_neurons, dtype=np.float32,
-                )
-                padded[self._wm_num_neurons:] = encoded
-                sensory["critic"] = padded
-                sensory["actor"] = padded
-            else:
-                sensory["critic"] = encoded
-                sensory["actor"] = encoded
+                sensory["working_memory"] = self._poisson.encode(raw_state)
 
         if self._use_wm:
             sensory["encoder"] = self.world_model._build_input(
@@ -382,17 +377,11 @@ class SNNAgent(Agent):
             )
             sensory.update(col_sensory)
             if self._use_working_memory:
-                sensory["working_memory"] = encoded
+                sensory["working_memory"] = self._poisson.encode(raw_state)
         else:
+            sensory["critic"] = encoded
             if self._use_working_memory:
-                sensory["working_memory"] = encoded
-                padded = np.zeros(
-                    self._encoded_size + self._wm_num_neurons, dtype=np.float32,
-                )
-                padded[self._wm_num_neurons:] = encoded
-                sensory["critic"] = padded
-            else:
-                sensory["critic"] = encoded
+                sensory["working_memory"] = self._poisson.encode(raw_state)
             # Actor explicitly receives zeros — no next-state processing
             actor_size = self.actor.num_inputs
             sensory["actor"] = np.zeros(actor_size, dtype=np.float32)
@@ -489,18 +478,16 @@ class SNNAgent(Agent):
         is_terminal = done and not is_truncated
 
         # ── 1. Pre-update curiosity ───────────────────────────────────
+        # Curiosity drives exploration via NE/ACh pathways (Hasselmo
+        # 2006), NOT as additive reward shaping (Pathak et al. 2017).
+        # The world model prediction error flows through NE (surprise)
+        # and ACh (novelty) pathways in neuromod.update() below.
         if self._use_wm:
             self._last_curiosity = self.world_model.curiosity_signal()
         else:
             self._last_curiosity = 0.0
 
-        # ── 2. Intrinsic reward ───────────────────────────────────────
-        acfg = self._agent_cfg
-        intrinsic_weight = acfg.intrinsic_reward_weight * (1.0 - self.neuromod.learning_rate_modulation)
-        intrinsic_r = max(intrinsic_weight, 0.0) * self._last_curiosity
-        effective_reward = reward + intrinsic_r
-
-        # ── 3. Critic step on next_state → VTA RPE ──────────────────
+        # ── 2. Critic step on next_state → VTA RPE ──────────────────
         # V(s) was captured in VTA VP trace during act() via
         # vta.store_prediction().  Now integrate critic on s' to get
         # population activity for V(s'), then let VTA compute RPE
@@ -553,9 +540,11 @@ class SNNAgent(Agent):
         # VTA DA neuron output ∝ reward + γ_eff×V(s') − V(s)
         # where γ_eff emerges from PPTg pathway τ (serotonin-modulated)
         # and gain adaptation from D2 autoreceptors (Tobler 2005).
+        # Raw environmental reward only — curiosity modulates exploration
+        # through NE/ACh pathways, not reward shaping.
         td_error_normed = self.vta.compute_rpe(
             critic_activation=self.critic.activation,
-            reward=effective_reward,
+            reward=reward,
             is_terminal=is_terminal,
             serotonin=self.neuromod.serotonin,
             n_substeps=self._n_substeps,
@@ -590,6 +579,15 @@ class SNNAgent(Agent):
         # from VTA to both ventral (critic) and dorsal (actor) striatum.
         # Both receive the same Tobler-normalized signal.
         self.critic.update(td_error_normed)
+
+        # Action-channel eligibility gating (Redgrave et al. 2010;
+        # Schultz 2006): DA modifies corticostriatal synapses only
+        # at the selected action channel.  The BG circuit organizes
+        # D1/D2-MSNs in action-specific populations, and the
+        # thalamocortical feedback loop re-excites only the winning
+        # channel during the post-decision window.  Without gating,
+        # DA equally strengthens all actions → no action discrimination.
+        self.actor.gate_eligibility(action)
         self.actor.update(td_error_normed)
 
         # ── 5. World model + neuromodulator update ────────────────────
@@ -652,15 +650,12 @@ class SNNAgent(Agent):
 
         # ── 9. Store experience ───────────────────────────────────────
         if self._use_wm:
-            # Reconstruct critic's effective input from graph outputs.
-            if self._use_working_memory:
-                wm_spikes = outputs.get(
-                    "working_memory",
-                    np.zeros(self._wm_num_neurons, dtype=np.float32),
-                )
-                aug_state = np.concatenate([wm_spikes, next_encoded])
-            else:
-                aug_state = next_encoded.copy()
+            # Store population-encoded states for sleep replay.
+            # WM contribution is not included — sleep replay runs
+            # the critic directly without the graph, and WM is
+            # inactive during SWS.
+            aug_state = self._last_encoded_state.copy()
+            aug_next_state = next_encoded.copy()
 
             exp = Experience(
                 state=state_f32,
@@ -677,6 +672,7 @@ class SNNAgent(Agent):
                     "encoder_e_td": self.world_model.encoder.e_td.copy(),
                 },
                 aug_state=aug_state,
+                aug_next_state=aug_next_state,
                 salience=self.neuromod.competition_sharpness,
                 recorded_da=self.neuromod.learning_rate_modulation,
                 curiosity=self._last_curiosity,
@@ -699,25 +695,18 @@ class SNNAgent(Agent):
             )
 
         # ── 10. Sleep phase (end of episode) ──────────────────────────
+        # Consolidation vigor modulated by neuromodulatory state:
+        # VTA D2 autoreceptor adapts RPE gain, serotonin modulates
+        # temporal discount, oscillator gates Up/Down states.
+        # No arbitrary sleep_gain formula — the VTA's intrinsic
+        # dynamics handle adaptation (Tobler et al. 2005).
         if done and self._use_wm and len(self.replay_buffer) > 0:
-            # sleep_gain derived from tonic_da: high tonic_da → good recent
-            # performance → more vigorous consolidation.
-            acfg = self._agent_cfg
-            sleep_gain = float(np.clip(
-                1.0 + acfg.sleep_gain_scale * self.neuromod.tonic_da,
-                1.0,
-                acfg.sleep_gain_max,
-            ))
-
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,
                 neuromodulator=self.neuromod,
                 bg=self.bg,
-                sleep_gain=sleep_gain,
                 oscillator=self.network.oscillator,
             )
-
-        self._step_count += 1
 
     # ------------------------------------------------------------------
     # Episode reset
@@ -761,6 +750,11 @@ class _BGFacade:
         self.config = config
         self._agent_cfg = agent_cfg or AgentConfig()
         self._vta = vta
+
+    @property
+    def vta(self) -> VTACircuit | None:
+        """VTA circuit for sleep-phase RPE computation."""
+        return self._vta
 
     @property
     def last_v(self) -> float:

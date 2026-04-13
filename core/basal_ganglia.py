@@ -254,10 +254,10 @@ class SNNDeepCritic:
             if col_norm > config.w_clip_critic:
                 self.w_h[:, j] *= config.w_clip_critic / col_norm
 
-        # ── LIF state (warm start near threshold) ─────────────────────
-        self.v_hidden: NDArray[np.float32] = np.random.uniform(
-            config.v_rest, config.v_thresh, h,
-        ).astype(np.float32)
+        # ── LIF state (Down state at rest) ────────────────────────────
+        self.v_hidden: NDArray[np.float32] = np.full(
+            h, config.v_rest, dtype=np.float32,
+        )
         self.spikes_hidden: NDArray[np.bool_] = np.zeros(h, dtype=bool)
         self.refrac_hidden: NDArray[np.int32] = np.zeros(h, dtype=np.int32)
 
@@ -454,33 +454,36 @@ class SNNDeepCritic:
         dw_h = effective_lr * td * self.e_h
         self.w_h += dw_h
 
-        # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
-        # Multiplicative correction targeting stable per-neuron rate.
-        # Replaces hard column-norm clipping — task/scale-agnostic.
-        if self._homeo_counter > 0 and self._homeo_counter % cfg.homeo_interval == 0:
-            target = cfg.homeo_target_rate
-            for j in range(cfg.hidden_size):
-                actual = max(float(self._homeo_rate[j]), 1e-6)
-                if actual < target * 0.01:
-                    continue  # silent neuron — no transmission to scale
-                error = (target - actual) / target
-                error = float(np.clip(error, -0.5, 0.5))
-                scale = 1.0 + cfg.homeo_max_change * error
-                self.w_h[:, j] *= scale
-
-        # Column norm bound (homeostatic ceiling, Turrigiano 2008)
-        wc = cfg.w_clip_critic
-        for j in range(cfg.hidden_size):
-            col_norm = float(np.linalg.norm(self.w_h[:, j]))
-            if col_norm > wc:
-                self.w_h[:, j] *= wc / col_norm
+        # Continuous homeostatic synaptic scaling (Turrigiano 2004, 2008)
+        # Per-step multiplicative correction: dw/dt = -(1/τ_homeo) × (rate - target)/target × w
+        # Discretized: scale = 1 + (dt/τ_homeo) × (target - rate)/target
+        # Removes the periodic counter/modulo pattern — homeostasis is
+        # a continuous biophysical process operating on every timestep.
+        #
+        # Silent neurons (homeo_rate < 1% of target) get a fixed
+        # upscaling factor — metaplasticity (Abraham & Bear 1996).
+        # Biologically, silent AMPA synapses retain NMDA receptors and
+        # undergo spontaneous potentiation via stochastic vesicle release
+        # (Bhatt et al. 2009; Kerchner & Nicoll 2008).
+        _alpha_h = cfg.ctx.dt / cfg.homeo_tau
+        target = cfg.homeo_target_rate
+        rate_err = np.where(
+            self._homeo_rate > target * 0.01,  # active neuron
+            (target - self._homeo_rate) / max(target, 1e-8),
+            0.5,  # silent neuron: apply positive drift (metaplasticity)
+        ).astype(np.float32)
+        np.clip(rate_err, -0.5, 0.5, out=rate_err)
+        scale = 1.0 + _alpha_h * rate_err
+        self.w_h *= scale[np.newaxis, :]
 
     def reset_state(self) -> None:
         """Reset transient state between episodes. Weights preserved."""
         cfg = self.config
-        self.v_hidden[:] = np.random.uniform(
-            cfg.v_rest, cfg.v_thresh, cfg.hidden_size,
-        ).astype(np.float32)
+        # Neurons start in Down state at v_rest (Wilson & Kawaguchi 1996).
+        # Transition to Up state requires cortical input.  Random uniform
+        # initialization [-70, -55] adds 15mV noise that drowns the learned
+        # weight signal — biologically unrealistic.
+        self.v_hidden[:] = cfg.v_rest
         self.spikes_hidden.fill(False)
         self.refrac_hidden.fill(0)
         self.w_adapt_hidden.fill(0.0)
@@ -623,9 +626,9 @@ class D1D2Actor:
         self._d2_gain_comp: float = 1.0 / _d2_net_mod
 
         # ── D1-MSN membrane state ────────────────────────────────────
-        self.v_d1: NDArray[np.float32] = np.random.uniform(
-            config.v_rest, config.v_thresh, self.action_dim,
-        ).astype(np.float32)
+        self.v_d1: NDArray[np.float32] = np.full(
+            self.action_dim, config.v_rest, dtype=np.float32,
+        )
         self.spikes_d1: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
         self.refrac_d1: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
         self.rate_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
@@ -637,9 +640,9 @@ class D1D2Actor:
         self._nmda_decay: float = config.ctx.decay(100.0)  # τ_NMDA=100ms
 
         # ── D2-MSN membrane state ────────────────────────────────────
-        self.v_d2: NDArray[np.float32] = np.random.uniform(
-            config.v_rest, config.v_thresh, self.action_dim,
-        ).astype(np.float32)
+        self.v_d2: NDArray[np.float32] = np.full(
+            self.action_dim, config.v_rest, dtype=np.float32,
+        )
         self.spikes_d2: NDArray[np.bool_] = np.zeros(self.action_dim, dtype=bool)
         self.refrac_d2: NDArray[np.int32] = np.zeros(self.action_dim, dtype=np.int32)
         self.rate_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
@@ -1010,28 +1013,47 @@ class D1D2Actor:
             self.motor_dim, self.n_per_action,
         ).sum(axis=1)
 
-        # ── Net evidence: D1 − D2 per action (Go − NoGo) ─────────────
-        # Population MEAN membrane voltage replaces sum/norm.
-        # Gold & Shadlen (2007): evidence = mean signal across
-        # population, not divided by sqrt(time).  Mean across neurons
-        # and time gives a natural [-1, 1] scale for voltage-based
-        # evidence, independent of population size or window length.
-        _n = max(self._n_forward, 1)
-        motor_d1 = self._v_accum_d1[:self._total_motor].reshape(
+        # ── GPi action competition via graded membrane potential ───────
+        # The SNr/GPi integrates D1 (direct) and D2 (indirect) input
+        # over the decision window.  Mean normalized membrane potential
+        # averaged across population and timesteps provides a graded
+        # competition signal (Cisek 2007; Erlhagen & Schöner 2002).
+        # Spike counts alone are too sparse in the 25-step window
+        # (many neurons don't reach v_spike_cutoff) — voltage captures
+        # the full sub-threshold competition dynamics.
+        d1_counts = self._spike_count_d1[:self._total_motor].reshape(
             self.motor_dim, self.n_per_action,
-        ).mean(axis=1) / _n  # mean voltage per action, time-averaged
-        motor_d2 = self._v_accum_d2[:self._total_motor].reshape(
+        ).sum(axis=1)
+        d2_counts = self._spike_count_d2[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).sum(axis=1)
+
+        _n = max(self._n_forward, 1)
+        motor_d1_v = self._v_accum_d1[:self._total_motor].reshape(
             self.motor_dim, self.n_per_action,
         ).mean(axis=1) / _n
-        net_evidence = motor_d1 - motor_d2  # Scale: ~[-0.3, 0.3] naturally
+        motor_d2_v = self._v_accum_d2[:self._total_motor].reshape(
+            self.motor_dim, self.n_per_action,
+        ).mean(axis=1) / _n
 
-        # ── Action selection via WTA (Wang 2002; Usher & McClelland 2001)
-        # Winner-take-all: the most depolarised action channel IS the
-        # action.  Ties broken by membrane noise already present in
-        # the AdEx dynamics above.  NE modulates exploration by scaling
-        # noise amplitude upstream (cfg.membrane_noise_std × g_L_eff),
-        # not through an external temperature on a softmax.
-        action = int(np.argmax(net_evidence))
+        # Net evidence: D1(Go) − D2(NoGo) mean voltage per action
+        net_evidence = motor_d1_v - motor_d2_v
+
+        # ── Stochastic softmax selection (Bogacz et al. 2006;
+        # Daw et al. 2006) ─────────────────────────────────────────────
+        # Temperature = exploration_noise scales evidence → action
+        # probabilities.  Small temperature → exploit (near-argmax);
+        # large temperature → explore (near-uniform).  The value
+        # derives from cortical background noise at the GPi readout
+        # (Destexhe et al. 2003): σ_membrane ≈ 1 mV → normalized
+        # σ_v ≈ 0.07 → averaged over 32 neurons × 25 steps →
+        # σ_mean ≈ 0.002, scaled to effective decision noise.
+        temperature = max(float(cfg.exploration_noise), 0.01)
+        logits = net_evidence / temperature
+        logits = logits - np.max(logits)  # numerical stability
+        exp_logits = np.exp(logits.astype(np.float64))
+        probs = exp_logits / exp_logits.sum()
+        action = int(np.random.choice(self.motor_dim, p=probs))
         self._last_action = action
         self._last_net_evidence = net_evidence.copy()
 
@@ -1071,27 +1093,41 @@ class D1D2Actor:
         cfg = self.config
         effective_lr = cfg.actor_lr * self._receptor_lr
 
-        # ── Pure OpAL model (Frank 2005, Collins & Frank 2014) ────────
-        # D1 (Go): ONLY learns from positive RPE (DA burst).
-        #   Positive TD → D1 LTP for selected action → "do this again"
-        # D2 (NoGo): ONLY learns from negative RPE (DA dip).
-        #   Negative TD → D2 LTP for selected action → "avoid this"
-        # Cross-pathway plasticity blocked: D1 LTD on dips requires
-        # prolonged DA depletion (Shen et al. 2008); D2 LTD on bursts
-        # requires eCB signaling minimal at resting rates (Kreitzer &
-        # Malenka 2007).  Pure separation prevents pathway collapse
-        # when reward is persistently positive (CartPole: reward=+1
-        # every step, terminal TD is negative only after V(s) grows).
+        # ── Bidirectional DA-modulated STDP (Shen et al. 2008) ─────────
+        # D1 (Go):  LTP on DA burst (positive TD);
+        #           LTD on DA dip  (negative TD).
+        # D2 (NoGo): LTP on DA dip  (negative TD).
+        #
+        # Shen et al. 2008 (Fig. 3, Table 1) demonstrated bidirectional
+        # plasticity in BOTH D1- and D2-MSNs: spike-timing with DA
+        # pause → D1 LTD (25% depression vs 35% LTP, ratio ≈ 0.7).
+        # The earlier pure-OpAL model blocked D1 LTD citing "prolonged
+        # depletion", but Shen et al. used brief 10-min antagonist
+        # application — matching phasic DA dips, not chronic depletion.
+        #
+        # D1 LTD is critical for reversal learning: without it, D1
+        # weights for a previously-rewarded action never decrease,
+        # preventing exploration of alternatives after contingency
+        # shift (Kravitz et al. 2012; Tai et al. 2012).
+        #
+        # D2 LTD on DA burst is NOT included: Shen et al. showed it
+        # requires eCB signaling (Kreitzer & Malenka 2007) that is
+        # minimal at resting rates.  Omitting D2 LTD is conservative
+        # and preserves NoGo learning stability.
 
-        # D1 (Go): only LTP on positive TD (DA burst)
+        # D1 (Go): LTP on positive TD (DA burst)
         if td > 0:
             dw_d1 = effective_lr * td * self.e_d1
             self.w_d1 += dw_d1
 
-        # D2 (NoGo): only LTP on negative TD (DA dip)
+        # D2 (NoGo): LTP on negative TD (DA dip)
+        # D1 (Go):  LTD on negative TD (DA dip) — Shen et al. 2008
         if td < 0:
             dw_d2 = effective_lr * (-td) * self.e_d2
             self.w_d2 += dw_d2
+
+            dw_d1_ltd = effective_lr * cfg.ltd_ratio * td * self.e_d1
+            self.w_d1 += dw_d1_ltd
 
         # Synaptic protein turnover removed: voltage-based EMA
         # eligibility inherently bounds updates via (1-decay) factor,
@@ -1104,39 +1140,23 @@ class D1D2Actor:
         np.maximum(self.w_d1, 0.0, out=self.w_d1)
         np.maximum(self.w_d2, 0.0, out=self.w_d2)
 
-        # Homeostatic synaptic scaling (Turrigiano 2004, 2008)
-        # Per-pathway scaling: D2 gets more upscaling because it fires
-        # less (DA suppresses D2 in Go states, Frank 2005).  This is
-        # biologically correct: D2 homeostasis maintains the NoGo
-        # pathway against DA-driven suppression, preventing premature
-        # action commitment and supporting exploration.
-        # CAPS: (1) Silent neurons (rate < 1% of target) do not get
-        # upscaled — homeostasis requires some baseline synaptic
-        # transmission to detect the mismatch (Turrigiano 2004).
-        # (2) Upward error capped at 0.25 to prevent runaway inflation
-        # when neurons are chronically below target.
-        if self._homeo_counter > 0 and self._homeo_counter % cfg.homeo_interval == 0:
-            target = cfg.homeo_target_rate
-            for w, hr in ((self.w_d1, self._homeo_rate_d1),
-                          (self.w_d2, self._homeo_rate_d2)):
-                for j in range(self.action_dim):
-                    actual = max(float(hr[j]), 1e-6)
-                    # Silent neuron gate: no scaling without transmission
-                    if actual < target * 0.01:
-                        continue
-                    error = (target - actual) / target
-                    # Symmetric bound (Turrigiano 2008)
-                    error = float(np.clip(error, -0.5, 0.5))
-                    scale = 1.0 + cfg.homeo_max_change * error
-                    w[:, j] *= scale
-                np.maximum(w, 0.0, out=w)  # Maintain Dale's law
-
-        # Column norm bound (homeostatic ceiling, Turrigiano 2008)
-        for w in (self.w_d1, self.w_d2):
-            for j in range(self.action_dim):
-                col_norm = float(np.linalg.norm(w[:, j]))
-                if col_norm > cfg.w_clip:
-                    w[:, j] *= cfg.w_clip / col_norm
+        # Continuous homeostatic synaptic scaling (Turrigiano 2004, 2008)
+        # Per-step multiplicative correction derived from homeo_tau.
+        # D2 naturally gets more upscaling because DA suppresses D2
+        # firing (Frank 2005) — the rate error is larger for D2.
+        _alpha_h = cfg.ctx.dt / cfg.homeo_tau
+        target = cfg.homeo_target_rate
+        for w, hr in ((self.w_d1, self._homeo_rate_d1),
+                      (self.w_d2, self._homeo_rate_d2)):
+            rate_err = np.where(
+                hr > target * 0.01,  # active neuron
+                (target - hr) / max(target, 1e-8),
+                0.5,  # silent neuron: metaplasticity (Abraham & Bear 1996)
+            ).astype(np.float32)
+            np.clip(rate_err, -0.5, 0.5, out=rate_err)
+            scale = 1.0 + _alpha_h * rate_err
+            w *= scale[np.newaxis, :]
+            np.maximum(w, 0.0, out=w)  # Maintain Dale's law
 
     def get_action(self) -> int:
         return self._last_action
@@ -1174,12 +1194,9 @@ class D1D2Actor:
     def reset_state(self) -> None:
         """Reset transient state. Weights preserved."""
         cfg = self.config
-        self.v_d1[:] = np.random.uniform(
-            cfg.v_rest, cfg.v_thresh, self.action_dim,
-        ).astype(np.float32)
-        self.v_d2[:] = np.random.uniform(
-            cfg.v_rest, cfg.v_thresh, self.action_dim,
-        ).astype(np.float32)
+        # Start in Down state at v_rest (Wilson & Kawaguchi 1996).
+        self.v_d1[:] = cfg.v_rest
+        self.v_d2[:] = cfg.v_rest
         self.spikes_d1.fill(False)
         self.spikes_d2.fill(False)
         self.refrac_d1.fill(0)

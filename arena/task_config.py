@@ -42,7 +42,15 @@ class TaskConfig:
     reward_scale: float = 1.0
     use_world_model: bool = True
     use_working_memory: bool = True
+    env_class: type | None = None     # Custom arena.Environment class (None = GymEnv)
     description: str = ""
+
+
+from arena.environments import (
+    ShiftingBanditEnv,
+    TMazeEnv,
+    PunishmentAvoidanceEnv,
+)
 
 
 # =====================================================================
@@ -50,21 +58,46 @@ class TaskConfig:
 # =====================================================================
 
 REGISTRY: dict[str, TaskConfig] = {
-    "CartPole-v1": TaskConfig(
-        env_id="CartPole-v1",
-        n_episodes=250,
-        max_steps=500,
-        solved_threshold=450.0,
-        eval_window=20,
-        obs_bounds=(
-            np.array([-2.4, -3.0, -0.21, -3.0], dtype=np.float32),
-            np.array([2.4, 3.0, 0.21, 3.0], dtype=np.float32),
-        ),
+    "ShiftingBandit": TaskConfig(
+        env_id="ShiftingBandit",
+        env_class=ShiftingBanditEnv,
+        n_episodes=600,
+        max_steps=1,
+        solved_threshold=0.7,
+        eval_window=50,
         use_world_model=False,
         use_working_memory=False,
         description=(
-            "Dense reward, velocity in obs. "
-            "World model disabled — no curiosity benefit in dense reward."
+            "3-armed bandit with payoff reversal every 200 episodes. "
+            "Tests continual learning / plasticity after distribution shift."
+        ),
+    ),
+    "TMaze": TaskConfig(
+        env_id="TMaze",
+        env_class=TMazeEnv,
+        n_episodes=500,
+        max_steps=10,
+        solved_threshold=7.0,
+        eval_window=30,
+        use_world_model=True,
+        use_working_memory=True,
+        description=(
+            "T-maze with cue at start, delayed choice. "
+            "Tests working memory for cue maintenance through corridor."
+        ),
+    ),
+    "PunishmentAvoidance": TaskConfig(
+        env_id="PunishmentAvoidance",
+        env_class=PunishmentAvoidanceEnv,
+        n_episodes=400,
+        max_steps=1,
+        solved_threshold=0.8,
+        eval_window=30,
+        use_world_model=False,
+        use_working_memory=False,
+        description=(
+            "Context-dependent punishment avoidance. "
+            "Tests inhibitory D2/NoGo pathway learning."
         ),
     ),
     "MountainCar-v0": TaskConfig(

@@ -26,7 +26,7 @@ class SingleButtonEnv(Environment):
     State:    [1.0] (constant — there is only one state).
     """
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         return np.array([1.0], dtype=np.float32)
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
@@ -62,7 +62,7 @@ class StochasticButtonEnv(Environment):
     State:    [1.0] (constant).
     """
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         return np.array([1.0], dtype=np.float32)
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, dict[str, Any]]:
@@ -109,7 +109,7 @@ class TwoButtonEnv(Environment):
     def __init__(self) -> None:
         self._context: int = 0
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._context = int(np.random.random() < 0.5)
         return self._make_state()
 
@@ -159,7 +159,7 @@ class CorridorEnv(Environment):
         self._length = corridor_length
         self._pos: int = 0
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._pos = 0
         return self._make_state()
 
@@ -220,7 +220,7 @@ class ShiftingBanditEnv(Environment):
             [0.2, 0.8, 0.5],  # Phase B
         ]
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._phase = (self._episode_count // self._shift_interval) % 2
         self._episode_count += 1
         return self._make_state()
@@ -269,7 +269,7 @@ class RiskRewardEnv(Environment):
     def __init__(self) -> None:
         self._context: int = 0
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._context = int(np.random.random() * 3) % 3
         return self._make_state()
 
@@ -329,7 +329,7 @@ class TMazeEnv(Environment):
         self._cue: int = 0       # 0=left is correct, 1=right is correct
         self._pos: int = 0       # 0=start, 1-2=corridor, 3=junction
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._cue = int(np.random.random() < 0.5)
         self._pos = 0
         return self._make_state()
@@ -384,7 +384,7 @@ class PunishmentAvoidanceEnv(Environment):
     def __init__(self) -> None:
         self._context: int = 0
 
-    def reset(self) -> np.ndarray:
+    def reset(self, *, seed: int | None = None) -> np.ndarray:
         self._context = int(np.random.random() < 0.5)
         return self._make_state()
 

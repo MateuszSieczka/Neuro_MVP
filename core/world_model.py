@@ -144,9 +144,6 @@ class SNNWorldModel:
         self.prediction_error_scalar: float = 0.0
         self.error_history: list[float] = []
 
-        self._curiosity_history: list[float] = []
-        self._curiosity_history_maxlen: int = 2000
-
         # ── Rehearsal depth (modulated by 5-HT at runtime) ────────────
         self._current_rehearsal_depth: int = cfg.max_rehearsal_depth
 
@@ -321,10 +318,16 @@ class SNNWorldModel:
         self,
         prediction_error: NDArray[np.float32] | None = None,
     ) -> float:
-        """Precision-weighted curiosity (replaces hardcoded 0.7/0.3).
+        """Precision-weighted curiosity from raw prediction error.
 
         curiosity = precision_decoder × decoder_error + precision_encoder × encoder_error
-        Precision from astrocyte field. Slow z-score normalization.
+
+        No z-score normalization — the error neuron rate IS the curiosity
+        signal (Friston 2010).  Normalization happens naturally through
+        homeostatic adaptation of error neuron thresholds.  Precision
+        weighting from astrocyte field provides biophysical gain control.
+
+        Clipped to [0, 2] as a physiological bound on firing rate.
         """
         if prediction_error is None:
             prediction_error = self.prediction_error
@@ -338,18 +341,7 @@ class SNNWorldModel:
         encoder_precision = 1.0 / (1.0 + encoder_error)
         raw = decoder_precision * decoder_error + encoder_precision * encoder_error
 
-        self._curiosity_history.append(raw)
-        if len(self._curiosity_history) > self._curiosity_history_maxlen:
-            self._curiosity_history = self._curiosity_history[-self._curiosity_history_maxlen:]
-
-        if len(self._curiosity_history) < 10:
-            return float(np.clip(raw * 2.0, 0.0, 2.0))
-
-        hist = np.array(self._curiosity_history)
-        mu = float(np.mean(hist))
-        sigma = float(np.std(hist)) + 1e-8
-        z = (raw - mu) / sigma
-        return float(np.clip(1.0 + 0.5 * z, 0.0, 2.0))
+        return float(np.clip(raw * 2.0, 0.0, 2.0))
 
     def set_rehearsal_depth(self, serotonin: float) -> None:
         """5-HT modulates planning horizon (Doya 2002).

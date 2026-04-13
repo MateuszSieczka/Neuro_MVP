@@ -41,7 +41,6 @@ from arena.task_config import TaskConfig, get as get_task
 class BenchmarkConfig:
     """Benchmark evaluation parameters (previously hardcoded)."""
     default_seeds: tuple[int, ...] = (1, 17, 42, 99, 145, 256, 500)
-    solve_rate_threshold: float = 0.5
 
 
 _DEFAULT_BENCHMARK_CFG = BenchmarkConfig()
@@ -163,12 +162,15 @@ class Benchmark:
     def _run_seed(cls, task: TaskConfig, seed: int, verbose: bool) -> SeedResult:
         np.random.seed(seed)
 
-        env = GymEnv(
-            task.env_id,
-            normalize=True,
-            fixed_bounds=task.obs_bounds,
-            reward_scale=task.reward_scale,
-        )
+        if task.env_class is not None:
+            env = task.env_class()
+        else:
+            env = GymEnv(
+                task.env_id,
+                normalize=True,
+                fixed_bounds=task.obs_bounds,
+                reward_scale=task.reward_scale,
+            )
         env.reset(seed=seed)
 
         # make_agent receives only dimensions + configs — no env_id

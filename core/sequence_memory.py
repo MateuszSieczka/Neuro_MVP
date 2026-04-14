@@ -156,25 +156,37 @@ class HierarchicalSequenceMemory:
     Level 2 (episode ~seconds): Episode-level macro-transitions
 
     Theta-level learning gated by oscillator encoding phase
-    (π/2 < φ_theta < 3π/2, Lisman & Jensen 2013).
-    Pooling window computed dynamically from current theta frequency.
+    (0 < φ_theta < π, Hasselmo 2005).
+    Pooling windows derived from oscillator frequency and dt.
     """
+
+    # Episode-scale pooling spans ~5 seconds of theta cycles
+    # (Buzsáki & Moser 2013 — hippocampal episode ~3-10s)
+    _EPISODE_DURATION_S: float = 5.0
 
     def __init__(
         self,
         num_neurons: int,
         config: SequenceMemoryConfig | None = None,
         salience_threshold: float = 0.5,
-        theta_window: int = 8,
-        episode_window: int = 50,
+        theta_freq_hz: float = 6.0,
         dt_ms: float = 1.0,
     ) -> None:
         cfg = config or SequenceMemoryConfig()
         self.num_neurons = num_neurons
         self.salience_threshold = salience_threshold
-        self.theta_window = theta_window
-        self.episode_window = episode_window
         self._dt_ms = dt_ms
+
+        # Derive pooling windows from oscillator periods (CLN 2):
+        # theta_window = ticks per theta cycle = 1 / (f_theta × dt_s)
+        # episode_window = theta cycles per episode = duration_s × f_theta
+        dt_s = dt_ms / 1000.0
+        self.theta_window: int = max(
+            1, round(1.0 / (theta_freq_hz * dt_s)),
+        )
+        self.episode_window: int = max(
+            1, round(self._EPISODE_DURATION_S * theta_freq_hz),
+        )
 
         # Level 0: gamma-scale raw transitions
         self.level0 = SequenceMemory(num_neurons, cfg)
@@ -212,7 +224,7 @@ class HierarchicalSequenceMemory:
             salience: NE-driven salience signal for level-1 gating.
             theta_phase: Current theta oscillator phase (radians).
                 If provided, theta-level learning is gated to encoding
-                window (π/2 < φ < 3π/2, Lisman & Jensen 2013).
+                window (0 ≤ φ < π, Hasselmo 2005).
             theta_reset: True if theta cycle just completed.
                 Forces theta pooling flush regardless of buffer length.
         """
@@ -237,11 +249,11 @@ class HierarchicalSequenceMemory:
             self._theta_buffer.clear()
 
             # Gate theta-level learning by encoding phase
+            # Hasselmo (2005): encoding at theta peak (0 → π),
+            # retrieval at theta trough (π → 2π).
             in_encoding_phase = True
             if theta_phase is not None:
-                in_encoding_phase = (
-                    np.pi / 2 < theta_phase < 3 * np.pi / 2
-                )
+                in_encoding_phase = theta_phase < np.pi
 
             if in_encoding_phase and salience >= self.salience_threshold:
                 self.level1.observe(pooled_theta)
@@ -268,6 +280,9 @@ class HierarchicalSequenceMemory:
         n0 = self.level0.novelty_signal()
         n1 = self.level1.novelty_signal()
         n2 = self.level2.novelty_signal()
+        # Multi-scale weighting: faster oscillations carry more
+        # immediate novelty (Lisman & Jensen 2013, θ-γ nesting).
+        # Gamma (∼40Hz): 60%, theta (∼8Hz): 30%, episode (∼0.2Hz): 10%.
         return float(np.clip(0.6 * n0 + 0.3 * n1 + 0.1 * n2, 0.0, 1.0))
 
     def reset_state(self) -> None:

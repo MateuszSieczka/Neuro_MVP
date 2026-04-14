@@ -380,6 +380,16 @@ class NetworkGraph:
                 )
             self._output_history[name].append(spike_array.copy())
 
+        # ── 8b. Astrocyte update (De Pittà et al. 2011) ──────────────
+        # Feed spike rates to each layer's astrocyte for Ca²⁺/ATP
+        # dynamics.  Threshold_shift and leak_gain are applied
+        # continuously on each layer's next forward() call.
+        for name, spike_array in outputs.items():
+            layer = self._layers[name]
+            astro = getattr(layer, '_astrocyte', None)
+            if astro is not None:
+                astro.update(spike_array)
+
         # ── 9. Attention update ───────────────────────────────────────
         if attention is not None:
             # Find association layer output (prefer explicit assoc_name)
@@ -556,9 +566,19 @@ class NetworkGraph:
         outputs: dict[str, NDArray[np.float32]],
         baseline_rate: float = 0.05,
     ) -> bool:
-        """Check mean firing rate; if >3× baseline, force Down state.
+        """Seizure response via astrocyte ATP depletion pathway.
 
-        Returns True if seizure was detected and Down state was forced.
+        When mean rate exceeds 3× baseline, burst firing overloads
+        Na⁺/K⁺-ATPase pumps → rapid ATP depletion → threshold_shift
+        rises → neurons silenced on next forward() (Kann & Kovács 2007).
+
+        Burst cost uses cooperative Hill kinetics (n=2) reflecting
+        Na⁺/K⁺-ATPase K⁺ binding cooperativity:
+          burst_cost = spike_cost × excess^hill_n × seizure_duration
+
+        All layers must have astrocytes attached — no algorithmic fallback.
+
+        Returns True if seizure was detected and ATP depleted.
         """
         if not outputs:
             return False
@@ -573,14 +593,27 @@ class NetworkGraph:
         mean_rate = total_spikes / max(total_neurons, 1)
 
         if self.oscillator.check_seizure(mean_rate, baseline_rate):
-            # Force global hyperpolarization: zero all layer outputs
+            # Biophysical response: burst firing → acute ATP depletion.
+            # Na⁺/K⁺-ATPase saturates during seizure (cooperative
+            # binding kinetics, Kann & Kovács 2007). Effective cost
+            # scales with excess^hill_n (cooperative K⁺ binding).
+            threshold = self.oscillator._SEIZURE_THRESHOLD_MULT * max(
+                baseline_rate, 0.01,
+            )
+            excess = mean_rate / max(threshold, 1e-6)
             for name, layer in self._layers.items():
-                if hasattr(layer, 'v_hidden'):
-                    layer.v_hidden[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
-                if hasattr(layer, 'v_d1'):
-                    layer.v_d1[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
-                if hasattr(layer, 'v_d2'):
-                    layer.v_d2[:] = layer.config.v_reset if hasattr(layer, 'config') else -75.0
+                astro = getattr(layer, '_astrocyte', None)
+                if astro is not None:
+                    cfg = astro.config
+                    # Hill cooperative kinetics: cost ∝ excess^n
+                    burst_cost = (
+                        cfg.atp_spike_cost
+                        * excess ** cfg.atp_seizure_hill_n
+                        * cfg.atp_seizure_duration
+                    )
+                    astro.atp = np.clip(
+                        astro.atp - burst_cost, 0.0, cfg.atp_max,
+                    )
             return True
         return False
 
@@ -729,6 +762,10 @@ class NetworkGraph:
         for layer in self._layers.values():
             if hasattr(layer, "reset_state"):
                 layer.reset_state()
+            # Reset astrocyte ATP/Ca²⁺ between episodes
+            astro = getattr(layer, '_astrocyte', None)
+            if astro is not None:
+                astro.reset_state()
         for sm in self._sequence_memories.values():
             sm.reset_state()
         self.timestep = 0

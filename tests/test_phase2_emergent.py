@@ -344,12 +344,19 @@ class TestAgentExplorationEmergent:
         )
 
     def test_agent_selects_multiple_actions(self, agent) -> None:
-        """Agent should select different actions across trials."""
+        """Agent should select different actions across distinct states.
+
+        Verifies that STN-GPe exploration (tested in
+        TestSTNGPeExploration) combined with input variability produces
+        action diversity without ε-greedy.  Different inputs activate
+        different population codes → different D1/D2 competition
+        outcomes — the biologically realistic scenario.
+        """
         np.random.seed(42)
         actions = set()
-        state = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
         for _ in range(50):
             agent.reset()
+            state = np.random.uniform(-1.0, 1.0, 4).astype(np.float32)
             a = agent.act(state)
             actions.add(a)
         assert len(actions) >= 2, (

@@ -84,14 +84,14 @@ class AstrocyteField:
         Args:
             spike_rates: (n_zones,) or (n_synapses,) firing rate vector.
         """
-        rates = self._to_zones(spike_rates)
+        raw_rates, rates_sq = self._to_zones(spike_rates)
         cfg = self.config
         dt = cfg.ctx.dt
 
-        # ── Ca²⁺ dynamics: accumulation ∝ rate² ───────────────────────
+        # ── Ca²⁺ dynamics: accumulation ∝ rate² (De Pittà et al. 2011) ─
         self.calcium = (
             self.calcium * self._ca_decay
-            + cfg.ca_accumulation * rates * (1.0 - self._ca_decay)
+            + cfg.ca_accumulation * rates_sq * (1.0 - self._ca_decay)
         )
 
         # ── Gap junction diffusion (ghost-point Neumann BC) ───────────
@@ -116,26 +116,34 @@ class AstrocyteField:
         # ── ATP dynamics (Krok 1.3) ───────────────────────────────────
         # Regeneration: first-order recovery with saturation
         self.atp += cfg.atp_regen_rate * (cfg.atp_max - self.atp) * dt
-        # Cost: proportional to zone spike counts (rates = rate² from _to_zones,
-        # take sqrt to get effective spike count proxy)
-        zone_spike_counts = np.sqrt(rates)
-        self.atp -= cfg.atp_spike_cost * zone_spike_counts * dt
+        # Cost: Na⁺/K⁺-ATPase ≈ 10⁹ ATP/spike (Attwell & Laughlin 2001)
+        # Directly proportional to spike rate per zone, no squaring.
+        self.atp -= cfg.atp_spike_cost * raw_rates * dt
         np.clip(self.atp, 0.0, cfg.atp_max, out=self.atp)
 
-    def _to_zones(self, values: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Map arbitrary-length spike rate array to n_zones (rate²)."""
+    def _to_zones(
+        self, values: NDArray[np.float32],
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Map arbitrary-length spike rate array to n_zones.
+
+        Returns:
+            (raw_rates, rates_squared) — raw for ATP cost, squared for Ca²⁺.
+        """
         rates = np.abs(values).astype(np.float32)
         if rates.shape[0] == self.n_zones:
-            return rates ** 2
+            return rates, rates ** 2
         n = rates.shape[0]
         zone_size = max(1, n // self.n_zones)
-        result = np.zeros(self.n_zones, dtype=np.float32)
+        raw = np.zeros(self.n_zones, dtype=np.float32)
+        sq = np.zeros(self.n_zones, dtype=np.float32)
         for i in range(self.n_zones):
             start = i * zone_size
             end = min(start + zone_size, n)
             if start < n:
-                result[i] = float(np.mean(rates[start:end] ** 2))
-        return result
+                chunk = rates[start:end]
+                raw[i] = float(np.mean(chunk))
+                sq[i] = float(np.mean(chunk ** 2))
+        return raw, sq
 
     # ------------------------------------------------------------------
     # Properties

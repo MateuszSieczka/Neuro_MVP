@@ -25,8 +25,10 @@ from core.basal_ganglia import (
     SNNDeepCritic,
 )
 from core.columnar import build_columnar_network, split_input
+from core.astrocyte import AstrocyteField
 from core.config import (
     AgentConfig,
+    AstrocyteConfig,
     AttentionConfig,
     BasalGangliaConfig,
     EpisodicMemoryConfig,
@@ -164,6 +166,30 @@ class SNNAgent(Agent):
 
         self.neuromod = NeuromodulatorSystem(nm_config)
 
+        # ── Astrocyte fields (De Pittà et al. 2011) ────────────────────
+        # One AstrocyteField per neural region provides continuous ATP
+        # budget, Ca²⁺ precision estimation, and D-Serine NMDA modulation.
+        # Zone count derived from neuron count (1 zone per ~8 neurons,
+        # matching astrocyte territorial domain ~50 µm / Bushong 2002).
+        _astro_cfg = AstrocyteConfig(ctx=self._bg_config.ctx)
+        _critic_zones = max(1, self._bg_config.hidden_size // 8)
+        _actor_zones = max(1, n_actions // 2)  # 1 zone per 2 action channels
+        self._critic_astro = AstrocyteField(
+            n_zones=_critic_zones, config=_astro_cfg,
+        )
+        self._actor_astro = AstrocyteField(
+            n_zones=_actor_zones, config=_astro_cfg,
+        )
+        self.critic.set_astrocyte(self._critic_astro)
+        self.actor.set_astrocyte(self._actor_astro)
+
+        if self._use_working_memory:
+            _wm_zones = max(1, self._wm_num_neurons // 8)
+            self._wm_astro = AstrocyteField(
+                n_zones=_wm_zones, config=_astro_cfg,
+            )
+        # Encoder astrocyte is managed by SNNWorldModel (already wired).
+
         if self._use_wm:
             self.world_model = SNNWorldModel(
                 state_size=state_size,
@@ -250,9 +276,7 @@ class SNNAgent(Agent):
         )
         _headroom_c = 1.0 / _denom_c
         _headroom_a = 1.0 / _denom_a
-        # Update forward-time conductance scale for dynamic headroom.
-        # Scale is applied in forward(), not baked into weights, so
-        # simply overwriting _cond_scale suffices (no weight rescaling).
+        # Recompute conductance scale with dynamic headroom
         from core.basal_ganglia import _derive_conductance_scale
         self.critic._cond_scale = _derive_conductance_scale(
             bg_input_size, self.critic._ncfg,
@@ -277,6 +301,28 @@ class SNNAgent(Agent):
     def use_world_model(self) -> bool:
         """Whether the world model is active."""
         return self._use_wm
+
+    # ------------------------------------------------------------------
+    # ATP-triggered sleep (Kann & Kovács 2007)
+    # ------------------------------------------------------------------
+
+    def _needs_sleep(self) -> bool:
+        """Check if mean ATP across all layer astrocytes is below threshold.
+
+        When continuous activity depletes metabolic reserves, the network
+        triggers consolidation independently of episode boundaries.
+        This enables continuous learning (P2) with thermodynamic
+        constraints (P3) driving the sleep-wake cycle.
+        """
+        atp_values: list[float] = []
+        for astro in (self._critic_astro, self._actor_astro):
+            atp_values.append(float(np.mean(astro.atp)))
+        if self._use_working_memory:
+            atp_values.append(float(np.mean(self._wm_astro.atp)))
+        if not atp_values:
+            return False
+        mean_atp = sum(atp_values) / len(atp_values)
+        return mean_atp < self._agent_cfg.sleep_atp_threshold
 
     # ------------------------------------------------------------------
     # Graph construction
@@ -315,6 +361,7 @@ class SNNAgent(Agent):
                         aggregation_mode="sum")
 
         if self._use_working_memory:
+            self.working_memory.set_astrocyte(self._wm_astro)
             net.add_layer("working_memory", self.working_memory,
                           receptor_profile=PFC_RECEPTORS)
             # Dendritic summation: PFC afferents add to cortical input
@@ -424,7 +471,6 @@ class SNNAgent(Agent):
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
         da_level = float(np.clip(self.neuromod.dopamine, 0.0, 1.0))
         self.actor.set_da_level(da_level)
-        self.actor.set_tonic_da_level(self.neuromod.tonic_da)
 
         if self._use_wm:
             self.actor.set_epistemic_drive(
@@ -464,10 +510,11 @@ class SNNAgent(Agent):
         # inhibit VTA DA neurons during observe() (Eshel et al. 2015).
         self.vta.store_prediction(self.critic.activation)
 
-        # WTA dynamics bias eligibility toward the winning action,
-        # and explicit action gating in D1D2Actor.update() ensures
-        # only the responding MSN population receives three-factor
-        # plasticity (Frank 2005; Wickens et al. 2003).
+        # WTA dynamics naturally gate eligibility: the winning action's
+        # MSNs are most depolarised → highest voltage-based eligibility.
+        # Losing actions are suppressed by the InhibitoryPool → near-rest
+        # membrane → near-zero eligibility.  No explicit zeroing needed
+        # (Wang 2002; Wickens et al. 2003).
         action = self.actor.get_action()
 
         # Exploration is emergent from STN-GPe pathway (Frank 2006):
@@ -567,9 +614,10 @@ class SNNAgent(Agent):
         # Both receive the same Tobler-normalized signal.
         self.critic.update(td_error_normed)
 
-        # Action-gated eligibility (Frank 2005; Wickens et al. 2003):
-        # update() masks eligibility to the chosen action's MSNs before
-        # applying three-factor STDP weight changes.
+        # Voltage-based eligibility (Clopath et al. 2010) naturally
+        # gates credit to the winning action: InhibitoryPool suppresses
+        # losing channels' membrane → near-rest voltage → near-zero
+        # eligibility.  No explicit zeroing needed (Phase 2 HACK B).
         self.actor.update(td_error_normed)
 
         # ── 5. World model + neuromodulator update ────────────────────
@@ -583,7 +631,6 @@ class SNNAgent(Agent):
                 prediction_error=pred_error,
                 td_error=td_error_normed,
                 novelty=self._last_curiosity,
-                reward=reward,
             )
 
             # WM plasticity
@@ -612,7 +659,6 @@ class SNNAgent(Agent):
                 prediction_error=np.array([norm_pe], dtype=np.float32),
                 td_error=td_error_normed,
                 novelty=sensory_novelty,
-                reward=reward,
             )
 
         # ── 6. Tonic DA now updated per-step inside neuromod.update() ──
@@ -679,13 +725,16 @@ class SNNAgent(Agent):
                 aug_state=aug_state,
             )
 
-        # ── 10. Sleep phase (end of episode) ──────────────────────────
+        # ── 10. Sleep phase (end of episode OR ATP depletion) ──────────
         # Consolidation vigor modulated by neuromodulatory state:
         # VTA D2 autoreceptor adapts RPE gain, serotonin modulates
         # temporal discount, oscillator gates Up/Down states.
         # No arbitrary sleep_gain formula — the VTA's intrinsic
         # dynamics handle adaptation (Tobler et al. 2005).
-        if done and self._use_wm and len(self.replay_buffer) > 0:
+        # ATP-triggered sleep enables continuous learning without
+        # episode boundaries (Kann & Kovács 2007; plan step 4.5).
+        _should_sleep = done or self._needs_sleep()
+        if _should_sleep and self._use_wm and len(self.replay_buffer) > 0:
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,
                 neuromodulator=self.neuromod,

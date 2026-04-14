@@ -606,12 +606,18 @@ class NeuromodulatorConfig(BaseConfig):
     # Biological: minutes scale; sim: τ ≈ 10s = 10000 steps
     da_rms_decay: float = 0.9999
 
+    # ACC error neuron integration time constant (Behrens et al. 2007)
+    # ACC tracks volatility via sustained prediction error.
+    # τ ≈ 30s: slow enough to detect persistent error vs transient bursts.
+    tau_acc: float = 30_000.0
+
     # ── Derived ───────────────────────────────────────────────────────
     da_decay: float = field(init=False, default=0.0)
     ach_decay: float = field(init=False, default=0.0)
     ne_decay: float = field(init=False, default=0.0)
     sero_decay: float = field(init=False, default=0.0)
     tonic_da_decay: float = field(init=False, default=0.0)
+    acc_pe_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_da > 0, f"tau_da must be positive, got {self.tau_da}"
@@ -619,11 +625,13 @@ class NeuromodulatorConfig(BaseConfig):
         assert self.tau_ne > 0, f"tau_ne must be positive, got {self.tau_ne}"
         assert self.tau_sero > 0, f"tau_sero must be positive, got {self.tau_sero}"
         assert self.tau_tonic_da > 0, f"tau_tonic_da must be positive, got {self.tau_tonic_da}"
+        assert self.tau_acc > 0, f"tau_acc must be positive, got {self.tau_acc}"
         object.__setattr__(self, 'da_decay', self.ctx.decay(self.tau_da))
         object.__setattr__(self, 'ach_decay', self.ctx.decay(self.tau_ach))
         object.__setattr__(self, 'ne_decay', self.ctx.decay(self.tau_ne))
         object.__setattr__(self, 'sero_decay', self.ctx.decay(self.tau_sero))
         object.__setattr__(self, 'tonic_da_decay', self.ctx.decay(self.tau_tonic_da))
+        object.__setattr__(self, 'acc_pe_decay', self.ctx.decay(self.tau_acc))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -709,7 +717,8 @@ class OscillatorConfig(BaseConfig):
       Period ≈ 10-33ms.
 
     Phase-amplitude coupling (PAC):
-      gamma_amplitude = base + modulation_depth × cos(theta_phase)
+      Gamma phase-resets at theta trough (Lisman & Jensen 2013).
+      gamma_amplitude = base + pac_depth * (1 - cos(theta_phase)) / 2
     """
     # Theta rhythm
     theta_freq_hz: float = 6.0   # Center frequency (Hz)
@@ -724,6 +733,8 @@ class OscillatorConfig(BaseConfig):
     # NE/5-HT modulation of theta frequency
     ne_theta_shift: float = 2.0   # Hz added at NE=1
     sero_theta_shift: float = -1.0  # Hz subtracted at 5-HT=1 (longer cycles)
+    # SWS slow oscillation (Steriade et al. 1993): ~0.5-1.5 Hz
+    sws_freq_hz: float = 1.0
 
     def __post_init__(self) -> None:
         assert 0 < self.theta_min_hz <= self.theta_freq_hz <= self.theta_max_hz, "theta freq range invalid"
@@ -763,11 +774,26 @@ class AstrocyteConfig(BaseConfig):
     gap_junction_D: float = 0.01  # Diffusion coefficient between zones
 
     # ── ATP Energy Budget ─────────────────────────────────────────────
+    # Derived from Attwell & Laughlin (2001): Na⁺/K⁺-ATPase ≈ 10⁹ ATP/spike.
+    # Normalised model: at baseline rate 0.05, ATP equilibrium ~0.85
+    # (threshold shift ~1.5 mV, barely noticeable).
+    # At elevated rate 0.15 (pre-seizure): ATP eq ~0.55, shift ~4.5 mV.
+    # τ_ATP = 1/regen = 200 s (gradual wake-cycle depletion).
+    # Equilibrium: regen×(1 - ATP_eq) = cost×rate
+    #   → ATP_eq = 1 - cost×rate/regen
+    #   → 0.85 = 1 - 1.5e-5×0.05/5e-6 ✓
     atp_max: float = 1.0            # Normalised ceiling
-    atp_regen_rate: float = 0.001   # Recovery per ms (~1 s to full)
-    atp_spike_cost: float = 0.02    # Cost per spike per zone per step
+    atp_regen_rate: float = 5e-6    # Recovery per ms (τ_ATP ≈ 200 s)
+    atp_spike_cost: float = 1.5e-5  # Cost per spike per zone per ms
     atp_threshold_shift: float = 10.0  # Max V_T shift (mV) at zero ATP
     atp_leak_gain: float = 0.5      # Max g_L multiplier increase at zero ATP
+
+    # ── Seizure response (Kann & Kovács 2007) ─────────────────────────
+    # Na⁺/K⁺-ATPase cooperative saturation: Hill n=2 for K⁺ binding.
+    # Burst cost = spike_cost × excess^hill_n × seizure_duration.
+    # At 5× baseline (excess≈3.3): cost ≈ 1.5e-5 × 11 × 200 = 0.033.
+    atp_seizure_hill_n: float = 2.0    # Cooperative binding exponent
+    atp_seizure_duration: float = 200.0  # K⁺ clearance window (ms)
 
     # ── Derived ───────────────────────────────────────────────────────
     ca_decay: float = field(init=False, default=0.0)
@@ -790,33 +816,42 @@ class AstrocyteConfig(BaseConfig):
 class AttentionConfig(BaseConfig):
     """Spatial attention system with bottom-up saliency and IOR.
 
-    Reference: Reynolds & Heeger (2009), Posner & Cohen (1984)
+    Reference: Reynolds & Heeger (2009) normalization model of attention,
+               Posner & Cohen (1984) inhibition of return,
+               Aston-Jones & Cohen (2005) NE and attentional gain.
 
-    Temperature modulated by NE (inverse-U, Usher & Damasio):
-      T = T_base × (1 + |NE - NE_optimal|²)
+    Top-down normalization via divisive inhibition (Reynolds & Heeger 2009):
+      R_i = c_i^2 / (sigma^2 + sum(c_j^2))
+    where sigma is the semi-saturation constant controlling contrast
+    vs response gain regimes.
+
+    NE modulates multiplicative gain (Aston-Jones & Cohen 2005):
+      gain = 1 + ne_gain_strength × max(0, 1 - (NE - NE_optimal)^2)
+    Inverse-U: optimal NE → maximal gain (focused), extremes → low gain.
     """
     gain_strength: float = 2.0
-    base_temperature: float = 1.0
-    ne_optimal: float = 0.5      # Optimal NE for focused attention
+    # Divisive normalization semi-saturation (Reynolds & Heeger 2009).
+    # Controls transition between contrast gain (large sigma) and
+    # response gain (small sigma) regimes.  Units: squared activity.
+    divisive_sigma: float = 1.0
+    # NE modulates top-down gain (Aston-Jones & Cohen 2005)
+    ne_optimal: float = 0.5        # Optimal NE for focused attention
+    ne_gain_strength: float = 2.0  # Max gain boost at optimal NE
     learning_rate: float = 0.005
     decay: float = 0.9           # Temporal smoothing
     # Bottom-up saliency weight (vs top-down)
-    bottom_up_weight: float = 0.4  # α for saliency mix
+    bottom_up_weight: float = 0.4  # alpha for saliency mix
     # Inhibition of Return (Posner & Cohen 1984)
-    ior_tau: float = 400.0         # IOR decay τ (ms)
+    ior_tau: float = 400.0         # IOR decay tau (ms)
     ior_strength: float = 0.3      # IOR inhibition magnitude
 
     # ── Derived ───────────────────────────────────────────────────────
     ior_decay: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
-        assert self.base_temperature > 0, f"base_temperature must be positive, got {self.base_temperature}"
+        assert self.divisive_sigma > 0, f"divisive_sigma must be positive, got {self.divisive_sigma}"
         assert self.ior_tau > 0, f"ior_tau must be positive, got {self.ior_tau}"
         object.__setattr__(self, 'ior_decay', self.ctx.decay(self.ior_tau))
-
-    def ne_modulated_temperature(self, ne: float) -> float:
-        """Inverse-U relationship: NE at optimal → low T (focused)."""
-        return self.base_temperature * (1.0 + (ne - self.ne_optimal) ** 2)
 
 
 # =====================================================================
@@ -1050,15 +1085,24 @@ class WorldModelConfig(BaseConfig):
 class ActiveInferenceConfig(BaseConfig):
     """Active Inference action selection parameters.
 
-    Reference: Friston (2010), Bromberg-Martin et al. (2010)
+    Reference: Friston (2010), Bromberg-Martin et al. (2010),
+               Pezzulo et al. (2018) "Hierarchical active inference"
+
+    EFE scores are converted to D1 MSN conductance bias via
+    efe_drive_fraction × g_L.  Top-down cortical projections to
+    striatum carry ~10-30% of total excitatory drive
+    (Sherman & Guillery 2002; Larkum 2013).
     """
     epistemic_weight: float = 0.5
     ne_epistemic_boost: float = 0.5
-    pragmatic_temperature: float = 1.0
+    # Fraction of leak conductance used as max EFE-driven top-down
+    # conductance.  Sherman & Guillery (2002): corticostriatal
+    # top-down inputs provide ~20% of total excitatory drive.
+    efe_drive_fraction: float = 0.2
     uncertainty_method: str = "novelty"
 
     def __post_init__(self) -> None:
-        assert self.pragmatic_temperature > 0, f"pragmatic_temperature must be positive, got {self.pragmatic_temperature}"
+        assert self.efe_drive_fraction > 0, f"efe_drive_fraction must be positive, got {self.efe_drive_fraction}"
         assert self.uncertainty_method in ("novelty", "entropy", "variance"), (
             f"uncertainty_method must be one of novelty/entropy/variance, got {self.uncertainty_method}"
         )
@@ -1077,8 +1121,17 @@ class AgentConfig(BaseConfig):
     """
     td_clip: float = 50.0                      # gradient clipping on TD error
 
+    # ATP-triggered sleep: when mean astrocyte ATP across all regions
+    # drops below this threshold, consolidation is triggered
+    # independently of episode boundaries.  Default 0.3 means ~70%
+    # of maximum metabolic capacity consumed (Kann & Kovács 2007).
+    sleep_atp_threshold: float = 0.3
+
     def __post_init__(self) -> None:
         assert self.td_clip > 0, f"td_clip must be positive, got {self.td_clip}"
+        assert 0.0 < self.sleep_atp_threshold < 1.0, (
+            f"sleep_atp_threshold must be in (0, 1), got {self.sleep_atp_threshold}"
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

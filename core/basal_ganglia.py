@@ -370,7 +370,7 @@ class SNNDeepCritic:
         else:
             n = self.config.hidden_size
             self._zone_idx = np.linspace(
-                0, astrocyte.config.n_zones - 1, n,
+                0, astrocyte.n_zones - 1, n,
             ).astype(np.int32)
 
     def forward(self, state_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
@@ -519,9 +519,10 @@ class SNNDeepCritic:
         # undergo spontaneous potentiation via stochastic vesicle release
         # (Bhatt et al. 2009; Kerchner & Nicoll 2008).
         # The correction is clipped to ±_HOMEO_CLIP to prevent single-step
-        # over-correction (maximum ±50% of target per τ_homeo).  Silent
-        # neurons receive the maximum positive correction = _HOMEO_CLIP.
-        _HOMEO_CLIP = 0.5  # max fractional correction per τ_homeo window
+        # over-correction (maximum ±50% of target per τ_homeo; Turrigiano
+        # 2008 — gradual scaling prevents runaway oscillation).
+        # Silent neurons receive the maximum positive correction = _HOMEO_CLIP.
+        _HOMEO_CLIP = 0.5
         _alpha_h = cfg.ctx.dt / cfg.homeo_tau
         target = cfg.homeo_target_rate
         rate_err = np.where(
@@ -769,9 +770,6 @@ class D1D2Actor:
         # overwritten by set_tonic_da_level() before first forward().
         self._tonic_da_level: float = config.baseline_da
 
-        # ── NE level for temperature modulation (Usher & Damasio 2000) ─
-        self._ne_level: float = 0.3  # Baseline from NeuromodulatorConfig
-
         # ── Eligibility traces (DA-modulated Hebbian STDP, Frank 2005) ─
         self.e_d1: NDArray[np.float32] = np.zeros(
             (state_size, self.action_dim), dtype=np.float32,
@@ -846,6 +844,14 @@ class D1D2Actor:
         # ── Fast epistemic drive (error neuron → D1 excitability) ─────
         self._epistemic_drive: float = 0.0
 
+        # ── Per-action EFE conductance (Pezzulo et al. 2018) ─────────
+        # Prefrontal → striatal projection carrying expected free energy
+        # scores.  Per-action conductance (nS) injected as excitatory
+        # current I = g_efe × (E_exc − V_d1) in forward().
+        self._efe_g: NDArray[np.float32] = np.zeros(
+            self._total_motor, dtype=np.float32,
+        )
+
         # ── Receptor dose-response modulation (D2) ───────────────────
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
@@ -880,7 +886,7 @@ class D1D2Actor:
         else:
             n = self.action_dim
             self._zone_idx = np.linspace(
-                0, astrocyte.config.n_zones - 1, n,
+                0, astrocyte.n_zones - 1, n,
             ).astype(np.int32)
 
     def set_da_level(self, da: float) -> None:
@@ -899,12 +905,8 @@ class D1D2Actor:
         self._tonic_da_level = float(np.clip(tonic_da, 0.0, 1.0))
 
     def set_ne_level(self, ne: float) -> None:
-        """Set NE level for temperature-modulated action selection.
-
-        Reference: Humphries, Stewart & Gurney (2006); Usher & Damasio (2000).
-        NE at 0.5 → focused exploitation; extremes → exploration.
-        """
-        self._ne_level = float(np.clip(ne, 0.0, 1.0))
+        """NE interface stub — NE effect handled in set_plasticity_timescales()."""
+        pass
 
     def set_epistemic_drive(self, error_rate: NDArray[np.float32]) -> None:
         """Fast epistemic path: error neuron error_rate → D1 excitability boost.
@@ -912,6 +914,23 @@ class D1D2Actor:
         High prediction error → explore novel states → boost Go pathway.
         """
         self._epistemic_drive = float(np.clip(np.mean(error_rate), 0.0, 1.0))
+
+    def set_efe_conductance(self, per_action_g: NDArray[np.float32]) -> None:
+        """Set per-action EFE-derived conductance (nS) for D1 bias.
+
+        Prefrontal → striatal projection carrying active inference
+        expected free energy scores (Pezzulo et al. 2018).  Each
+        action's EFE is mapped to excitatory conductance applied
+        uniformly across that action's MSN subpopulation.  The
+        resulting current I = g × (E_exc - V) follows Ohm's law,
+        identical to regular synaptic input.
+
+        Args:
+            per_action_g: (motor_dim,) conductance in nS per action.
+        """
+        g = np.clip(per_action_g[:self.motor_dim], 0.0, None).astype(np.float32)
+        expanded = np.repeat(g, self.n_per_action)
+        self._efe_g[:len(expanded)] = expanded
 
     def forward(
         self,
@@ -1013,6 +1032,15 @@ class D1D2Actor:
         # High prediction error boosts Go pathway (explore novel states)
         if self._epistemic_drive > 0.01:
             current_d1 *= 1.0 + self._epistemic_drive
+
+        # ── Per-action EFE conductance (Pezzulo et al. 2018) ─────────
+        # Prefrontal → striatal top-down bias from active inference.
+        # Ohm's law: I = g_efe × (E_exc − V_d1).  Only affects D1 (Go):
+        # actions with higher EFE get more excitation → WTA selects.
+        tm = self._total_motor
+        if np.any(self._efe_g > 1e-6):
+            efe_I = self._efe_g * (self._e_exc - self.v_d1[:tm])
+            current_d1[:tm] += efe_I
 
         # ── Bistable MSN decay (Wilson & Kawaguchi 1996) ──────────────
         # Competitive threshold: median cortical drive gives natural
@@ -1116,9 +1144,12 @@ class D1D2Actor:
         # Self-limiting: as V → E_inh, driving force → 0 (Brunel & Wang 2003).
         _E_INH = -75.0   # GABA-A reversal (Buhl et al. 1995)
         _DF_INH = cfg.v_thresh - _E_INH  # 20 mV driving force at threshold
-        _G_LAT_D1 = 0.14 * 0.14 / _DF_INH  # ≈ 0.00098 — D1→D1
-        _G_LAT_D2 = 0.11 * 0.12 / _DF_INH  # ≈ 0.00066 — D2→D2
-        _G_LAT_X  = 0.06 * 0.10 / _DF_INH  # ≈ 0.00030 — D1→D2 cross
+        # Lateral iPSP conductances from striatal patch-clamp
+        # (Taverna, Ilijic & Bhardwaj 2008, Table 1):
+        #   g_lat = p_connect × mean_iPSP_mV / driving_force
+        _G_LAT_D1 = 0.14 * 0.14 / _DF_INH  # p=14%, iPSP=0.14mV — D1→D1
+        _G_LAT_D2 = 0.11 * 0.12 / _DF_INH  # p=11%, iPSP=0.12mV — D2→D2
+        _G_LAT_X  = 0.06 * 0.10 / _DF_INH  # p=6%,  iPSP=0.10mV — D1→D2 cross
         if self.motor_dim > 1:
             npa = self.n_per_action
             tm = self._total_motor
@@ -1374,7 +1405,8 @@ class D1D2Actor:
         # Per-step multiplicative correction derived from homeo_tau.
         # D2 naturally gets more upscaling because DA suppresses D2
         # firing (Frank 2005) — the rate error is larger for D2.
-        _HOMEO_CLIP = 0.5  # max fractional correction per τ_homeo window
+        # Clip ±50%: prevents oscillatory instability (Turrigiano 2008).
+        _HOMEO_CLIP = 0.5
         _alpha_h = cfg.ctx.dt / cfg.homeo_tau
         target = cfg.homeo_target_rate
         for w, hr in ((self.w_d1, self._homeo_rate_d1),
@@ -1455,13 +1487,13 @@ class D1D2Actor:
         self._v_accum_d1.fill(0.0)
         self._v_accum_d2.fill(0.0)
         self._n_forward = 0
+        self._efe_g.fill(0.0)
         self.inh_pool_d1.reset_state()
         self.inh_pool_d2.reset_state()
 
     def set_plasticity_timescales(self, ne: float) -> None:
-        """NE modulates policy trace decay and exploration temperature."""
+        """NE modulates policy trace decay via tau compression."""
         ne = float(np.clip(ne, 0.0, 1.0))
-        self._ne_level = ne  # used by softmax temperature in forward()
         ne_factor = 1.0 + ne * (self.config.tau_ne_compression - 1.0)
         eff_tau = self.config.tau_e_actor / ne_factor
         self._trace_decay = float(np.exp(-self.config.ctx.dt / eff_tau))
@@ -1598,23 +1630,69 @@ class ActiveInferenceModule:
         actor: D1D2Actor | None = None,
         ne_level: float = 0.3,
     ) -> int:
-        """Select action minimizing expected free energy G(a).
+        """Select action by injecting EFE bias into D1 MSNs.
 
-        If actor is provided, uses D1/D2 rates as pragmatic/cost values.
+        Computes expected free energy G(a) per candidate action, then
+        converts to conductance bias on actor D1 MSN subpopulations.
+        Actual selection occurs via WTA in actor.forward() during
+        subsequent integration substeps (Pezzulo et al. 2018).
+
+        If no actor, falls back to argmax on -G(a).
         """
+        total, prag_dict = self._compute_efe_values(
+            state_spikes, candidate_actions, actor, ne_level,
+        )
+        self.last_pragmatic_values = prag_dict
+        self.last_total_values = total
+
+        # Inject EFE as D1 conductance bias (replaces softmax)
+        if actor is not None:
+            self._inject_efe_to_actor(total, actor)
+            selected = actor.get_action()
+        else:
+            selected = max(total, key=lambda k: total[k])
+
+        self.last_selected_action = selected
+        return selected
+
+    def select_action_greedy(
+        self,
+        state_spikes: NDArray[np.float32],
+        candidate_actions: list[int],
+        actor: D1D2Actor | None = None,
+        ne_level: float = 0.3,
+    ) -> int:
+        """Greedy variant: injects EFE bias, returns argmax of -G(a)."""
+        total, _ = self._compute_efe_values(
+            state_spikes, candidate_actions, actor, ne_level,
+        )
+        self.last_total_values = total
+
+        if actor is not None:
+            self._inject_efe_to_actor(total, actor)
+
+        self.last_selected_action = max(total, key=lambda k: total[k])
+        return self.last_selected_action
+
+    def _compute_efe_values(
+        self,
+        state_spikes: NDArray[np.float32],
+        candidate_actions: list[int],
+        actor: D1D2Actor | None,
+        ne_level: float,
+    ) -> tuple[dict[int, float], dict[int, float]]:
+        """Compute -G(a) and pragmatic values for all candidates."""
         epistemic, ambiguity = self.compute_epistemic_values(
             state_spikes, candidate_actions,
         )
         self.last_epistemic_values = epistemic
         self.last_ambiguity_values = ambiguity
 
-        # NE-modulated epistemic weight
         beta = (
             self.config.epistemic_weight
             + ne_level * self.config.ne_epistemic_boost
         )
 
-        # Build G(a) per action
         total: dict[int, float] = {}
         prag_dict: dict[int, float] = {}
         for action in candidate_actions:
@@ -1632,54 +1710,36 @@ class ActiveInferenceModule:
                 ambiguity=amb,
                 epistemic_weight=beta,
             )
-            total[action] = -g  # Higher = better (negate for selection)
+            total[action] = -g
             prag_dict[action] = pragmatic - cost
 
-        self.last_pragmatic_values = prag_dict
-        self.last_total_values = total
+        return total, prag_dict
 
-        # Softmax selection
-        actions = list(total.keys())
-        values = np.array([total[a] for a in actions], dtype=np.float32)
-        shifted = values - np.max(values)
-        temp = max(self.config.pragmatic_temperature, 1e-6)
-        exp_vals = np.exp(shifted / temp)
-        probs = exp_vals / (np.sum(exp_vals) + 1e-8)
-
-        selected = int(np.random.choice(actions, p=probs))
-        self.last_selected_action = selected
-        return selected
-
-    def select_action_greedy(
+    def _inject_efe_to_actor(
         self,
-        state_spikes: NDArray[np.float32],
-        candidate_actions: list[int],
-        actor: D1D2Actor | None = None,
-        ne_level: float = 0.3,
-    ) -> int:
-        """Greedy (argmax) variant for evaluation."""
-        epistemic, ambiguity = self.compute_epistemic_values(
-            state_spikes, candidate_actions,
-        )
-        beta = (
-            self.config.epistemic_weight
-            + ne_level * self.config.ne_epistemic_boost
-        )
-        total: dict[int, float] = {}
-        for action in candidate_actions:
-            if actor is not None and action < actor.motor_dim:
-                pragmatic = float(actor.pragmatic_values[action])
-                cost = float(actor.cost_values[action])
-            else:
-                pragmatic = 0.0
-                cost = 0.0
-            g = expected_free_energy(
-                pragmatic_value=pragmatic - cost,
-                epistemic_value=epistemic.get(action, 0.0),
-                ambiguity=ambiguity.get(action, 0.0),
-                epistemic_weight=beta,
-            )
-            total[action] = -g
-        self.last_total_values = total
-        self.last_selected_action = max(total, key=lambda k: total[k])
-        return self.last_selected_action
+        total: dict[int, float],
+        actor: D1D2Actor,
+    ) -> None:
+        """Convert -G(a) scores to D1 conductance bias.
+
+        Normalized to [0, 1] then scaled by g_L × efe_drive_fraction.
+        Sherman & Guillery (2002): top-down cortical projections provide
+        ~10-30% of total excitatory drive to striatum.
+        """
+        actions = sorted(total.keys())
+        values = np.array([total[a] for a in actions], dtype=np.float32)
+
+        v_min = values.min()
+        v_range = values.max() - v_min
+        if v_range > 1e-8:
+            normalized = (values - v_min) / v_range
+        else:
+            normalized = np.zeros_like(values)
+
+        g_ref = actor._ncfg.g_L * self.config.efe_drive_fraction
+        efe_g = np.zeros(actor.motor_dim, dtype=np.float32)
+        for i, a in enumerate(actions):
+            if a < actor.motor_dim:
+                efe_g[a] = normalized[i] * g_ref
+
+        actor.set_efe_conductance(efe_g)

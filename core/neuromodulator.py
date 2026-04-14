@@ -54,8 +54,10 @@ class NeuromodulatorSystem:
         # ── DA RMS with proper τ (config.da_rms_decay) ────────────────
         self._da_rms: float = cfg.baseline_da
 
-        # ── Stagnation detector (ACC) ─────────────────────────────────
-        self._tda_history: deque[float] = deque(maxlen=30)
+        # ── ACC error neuron persistence trace (Behrens et al. 2007) ──
+        # Leaky integrator of PE magnitude. Persistent elevated PE →
+        # high stagnation signal → attenuate consolidation.
+        self._acc_pe_trace: float = 0.0
         self._stagnation_factor: float = 0.0
 
         # ── Per-region NE/ACh (Schultz 1998: DA/5-HT global;
@@ -161,21 +163,14 @@ class NeuromodulatorSystem:
             + reward_signal * (1.0 - cfg.tonic_da_decay)
         )
 
-        # ── Stagnation tracking (ACC) ─────────────────────────────────
-        self._tda_history.append(self.tonic_da)
-        if len(self._tda_history) >= 10 and len(self._td_history) >= 10:
-            # Coefficient of variation of recent TD errors:
-            # low CV → predictable outcomes → stagnation signal
-            td_arr = np.array(list(self._td_history))
-            td_cv = float(np.std(td_arr) / (np.mean(np.abs(td_arr)) + 1e-6))
-            raw_stag = float(np.clip(1.0 - td_cv, 0.0, 1.0))
-            # Smoothing τ = 10 × mean_episode_length ≈ 200 steps.
-            # decay = exp(-1/200) ≈ 0.995 (replace ad-hoc 0.9/0.1)
-            stag_decay = 0.995
-            self._stagnation_factor = (
-                stag_decay * self._stagnation_factor
-                + (1.0 - stag_decay) * raw_stag
-            )
+        # ── ACC error neuron persistence (Behrens et al. 2007) ────────
+        # Leaky integrator over PE magnitude. High sustained PE = agent
+        # not learning = stagnation. τ from config (30s default).
+        self._acc_pe_trace = (
+            cfg.acc_pe_decay * self._acc_pe_trace
+            + (1.0 - cfg.acc_pe_decay) * error_mag
+        )
+        self._stagnation_factor = float(np.clip(self._acc_pe_trace, 0.0, 1.0))
 
         self._clamp_all()
 
@@ -197,6 +192,9 @@ class NeuromodulatorSystem:
         gating is the correct conjunction (Doya 2002).
         """
         raw = float(self.tonic_da * self.serotonin)
+        # ACC stagnation only in exploitation band. Below 0.3: agent
+        # already exploring (low DA). Above 0.7: agent performing well
+        # (high DA). Range from D1/D2 balance crossover (Frank 2005).
         if 0.3 < self.tonic_da < 0.7:
             # ACC stagnation attenuates consolidation multiplicatively.
             # stagnation_factor ∈ [0,1] directly scales consolidation.
@@ -308,7 +306,7 @@ class NeuromodulatorSystem:
         self._error_history.clear()
         self._td_history.clear()
         self._da_rms = cfg.baseline_da
-        self._tda_history.clear()
+        self._acc_pe_trace = 0.0
         self._stagnation_factor = 0.0
         # Reset per-region to baselines
         for name in self._region_names:

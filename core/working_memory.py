@@ -17,10 +17,15 @@ Changes from legacy:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import NDArray
 
 from .config import WorkingMemoryConfig, init_weights
+
+if TYPE_CHECKING:
+    from .astrocyte import AstrocyteField
 
 
 class WorkingMemoryModule:
@@ -140,6 +145,10 @@ class WorkingMemoryModule:
         # ── Receptor dose-response modulation (D2) ───────────────────
         self._receptor_gain: float = 1.0
         self._receptor_lr: float = 1.0
+
+        # ── Astrocyte field (De Pittà et al. 2011) ──────────────────
+        self._astrocyte: AstrocyteField | None = None
+        self._zone_idx: NDArray[np.int32] | None = None
 
     # ------------------------------------------------------------------
     # Dual gating (O'Reilly & Frank 2006)
@@ -273,17 +282,26 @@ class WorkingMemoryModule:
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1
 
+        # Astrocyte ATP modulation: threshold rises + leak increases
+        # as ATP depletes (Na⁺/K⁺-ATPase slowdown, Kann & Kovács 2007).
+        eff_v_thresh = cfg.v_thresh
+        eff_g_L = cfg.g_L
+        if self._astrocyte is not None:
+            zc = self._zone_idx
+            eff_v_thresh = cfg.v_thresh + self._astrocyte.threshold_shift[zc]
+            eff_g_L = cfg.g_L * self._astrocyte.leak_gain[zc]
+
         inv_Cm = 1.0 / cfg.C_m
         exp_term = np.exp(np.clip(
-            (self.v - cfg.v_thresh) / cfg.delta_t,
+            (self.v - eff_v_thresh) / cfg.delta_t,
             -20.0, 10.0,
         ))
         F = inv_Cm * (
-            -cfg.g_L * (self.v - cfg.v_rest)
-            + cfg.g_L * cfg.delta_t * exp_term
+            -eff_g_L * (self.v - cfg.v_rest)
+            + eff_g_L * cfg.delta_t * exp_term
             + I_syn - self.w_adapt
         )
-        J = inv_Cm * (-cfg.g_L + cfg.g_L * exp_term)
+        J = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
 
         # Exponential Euler step (same integrator as rest of network)
         dt = ctx.dt
@@ -334,6 +352,20 @@ class WorkingMemoryModule:
     def set_ach_level(self, ach: float) -> None:
         """ACh level for gating (re-evaluated on next gate() call)."""
         self._ach_level = float(ach)
+
+    def set_astrocyte(
+        self,
+        astrocyte: AstrocyteField,
+        zone_idx: NDArray[np.int32] | None = None,
+    ) -> None:
+        """Attach astrocyte for ATP-based threshold/leak modulation."""
+        self._astrocyte = astrocyte
+        if zone_idx is not None:
+            self._zone_idx = zone_idx
+        else:
+            self._zone_idx = np.linspace(
+                0, astrocyte.n_zones - 1, self.num_neurons,
+            ).astype(np.int32)
 
     def set_ne_level(self, ne: float) -> None:
         """NE level — no direct effect on WM dynamics."""

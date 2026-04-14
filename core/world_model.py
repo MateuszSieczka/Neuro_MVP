@@ -132,7 +132,9 @@ class SNNWorldModel:
         self.w_decode: NDArray[np.float32] = np.random.normal(
             0.0, 0.01, (self.hidden_size, state_size),
         ).astype(np.float32)
-        self._vesicle_p: float = 0.8  # Release probability (Pr)
+        # Synaptic vesicle release probability (Markram et al. 1997).
+        # Pr ≈ 0.1–0.9; 0.8 = reliable synapse (mature cortical).
+        self._vesicle_p: float = 0.8
 
         # ── Running state ─────────────────────────────────────────────
         self.last_prediction: NDArray[np.float32] = np.zeros(
@@ -257,13 +259,18 @@ class SNNWorldModel:
         """Multi-step epistemic evaluation (Friston et al. 2015).
 
         For each action: simulate D forward steps through encoder,
-        accumulate discounted epistemic value (prediction error +
-        vesicle-noise variance). Depth D = self._current_rehearsal_depth.
+        accumulate epistemic value (prediction error + vesicle-noise
+        variance).  Depth D = self._current_rehearsal_depth.
+
+        No explicit temporal discount (gamma).  Prediction error
+        naturally increases with depth as compounding model
+        inaccuracy degrades forecasts -- further-out steps are
+        inherently more uncertain, providing implicit temporal
+        weighting without an RL discount factor.
         """
         saved = self.snapshot_encoder()
         baseline_precision = self.astrocyte.mean_precision
         depth = max(1, self._current_rehearsal_depth)
-        gamma = 0.99
 
         raw_results: list[tuple[int, float, float, NDArray[np.float32]]] = []
 
@@ -288,8 +295,8 @@ class SNNWorldModel:
 
                 # Epistemic value: combined error + ambiguity + (1 − precision)
                 step_epistemic = encoder_pe + amb + (1.0 - baseline_precision)
-                total_epistemic += (gamma ** step) * step_epistemic
-                total_ambiguity += (gamma ** step) * amb
+                total_epistemic += step_epistemic
+                total_ambiguity += amb
 
                 # For multi-step: feed predicted state back as input
                 if step < depth - 1:
@@ -303,6 +310,8 @@ class SNNWorldModel:
 
         results: dict[int, RehearsalResult] = {}
         for action, raw_ep, raw_amb, pred in raw_results:
+            # Clip at 2.0: DA neuron burst firing saturates
+            # at ~20 Hz ≈ 2× baseline (Grace 1991).
             novelty = float(np.clip(raw_ep / max_epist, 0.0, 2.0))
             results[action] = RehearsalResult(
                 predicted_state=pred,
@@ -341,6 +350,8 @@ class SNNWorldModel:
         encoder_precision = 1.0 / (1.0 + encoder_error)
         raw = decoder_precision * decoder_error + encoder_precision * encoder_error
 
+        # Scale × 2 maps mean precision-weighted PE² to ~[0, 2] range
+        # (DA neuron burst ceiling ≈ 2× baseline; Grace 1991).
         return float(np.clip(raw * 2.0, 0.0, 2.0))
 
     def set_rehearsal_depth(self, serotonin: float) -> None:

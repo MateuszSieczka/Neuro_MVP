@@ -1,16 +1,17 @@
 """
-Spatial Attention — top-down + bottom-up saliency with IOR.
+Spatial Attention -- top-down + bottom-up saliency with IOR.
 
 Reference:
   Reynolds & Heeger (2009)  Normalization model of attention
   Posner & Cohen (1984)     Inhibition of return
-  Usher & Damasio (2000)    NE inverse-U / locus coeruleus
+  Aston-Jones & Cohen (2005) NE and attentional gain (inverse-U)
 
 Changes from legacy:
   1. Bottom-up saliency (prediction error magnitude per column)
-  2. Inhibition of Return (IOR): τ_IOR ≈ 400ms inhibitory trace
-  3. Adaptive temperature modulated by NE (inverse-U)
-  4. Uses AttentionConfig from config.py (derived IOR decay)
+  2. Inhibition of Return (IOR): tau_IOR ~ 400ms inhibitory trace
+  3. Divisive normalization replaces softmax (Reynolds & Heeger 2009)
+  4. NE modulates multiplicative gain, not softmax temperature
+  5. Uses AttentionConfig from config.py (derived IOR decay)
 """
 
 from __future__ import annotations
@@ -24,10 +25,11 @@ from .config import AttentionConfig
 class SpatialAttentionController:
     """Per-column attention gains from top-down + bottom-up signals.
 
-    Total saliency = α × bottom_up + (1-α) × top_down
-    α modulated by task engagement (tonic DA).
-    Temperature modulated by NE (inverse-U).
+    Total saliency = alpha x bottom_up + (1-alpha) x top_down
+    alpha modulated by task engagement (tonic DA).
+    NE modulates multiplicative gain (Aston-Jones & Cohen 2005).
     IOR suppresses previously attended columns.
+    Top-down normalization via divisive inhibition (Reynolds & Heeger 2009).
     """
 
     def __init__(
@@ -87,7 +89,7 @@ class SpatialAttentionController:
         Args:
             assoc_activity:    Association layer activity (assoc_neurons,).
             global_ach:        ACh level scales overall attention effect.
-            ne_level:          NE level modulates softmax temperature.
+            ne_level:          NE level modulates top-down gain (inverse-U).
             bottom_up_errors:  Per-column prediction error magnitude (n_columns,).
         """
         act = assoc_activity.astype(np.float32)
@@ -96,6 +98,21 @@ class SpatialAttentionController:
         # ── Top-down saliency ─────────────────────────────────────────
         td_raw = act @ self.w_attn  # (n_columns,)
 
+        # ── NE gain modulation (Aston-Jones & Cohen 2005) ─────────────
+        # Inverse-U: NE at optimal → maximal gain (focused attention).
+        # At extremes (low or high NE) → reduced gain (diffuse mode).
+        ne_proximity = max(0.0, 1.0 - (ne_level - cfg.ne_optimal) ** 2)
+        ne_gain = 1.0 + cfg.ne_gain_strength * ne_proximity
+        td_gained = td_raw * ne_gain
+
+        # ── Divisive normalization (Reynolds & Heeger 2009) ───────────
+        # R_i = c_i^2 / (sigma^2 + sum(c_j^2))
+        # Rectify: neurons cannot have negative firing rates.
+        td_rect = np.maximum(td_gained, 0.0)
+        td_sq = td_rect ** 2
+        sigma_sq = cfg.divisive_sigma ** 2
+        td_norm = td_sq / (sigma_sq + np.sum(td_sq) + 1e-8)
+
         # ── Bottom-up saliency (surprise) ─────────────────────────────
         if bottom_up_errors is not None:
             self._bu_saliency = np.abs(bottom_up_errors).astype(np.float32)
@@ -103,13 +120,8 @@ class SpatialAttentionController:
         else:
             bu_norm = np.zeros(self.n_columns, dtype=np.float32)
 
-        # ── Mix: α × bottom_up + (1 - α) × top_down ──────────────────
+        # ── Mix: alpha x bottom_up + (1 - alpha) x top_down ──────────
         alpha = cfg.bottom_up_weight
-        td_shifted = td_raw - np.max(td_raw)
-        temperature = cfg.ne_modulated_temperature(ne_level)
-        td_exp = np.exp(td_shifted / max(temperature, 1e-6))
-        td_norm = td_exp / (np.sum(td_exp) + 1e-8)
-
         combined = alpha * bu_norm + (1.0 - alpha) * td_norm
 
         # ── Apply IOR suppression ─────────────────────────────────────

@@ -90,7 +90,7 @@ class TestATPProperties:
 class TestATPDepletion:
     def test_atp_monotonically_decreases(self, ctx: SimulationContext) -> None:
         """Under constant high activity, ATP falls monotonically."""
-        cfg = AstrocyteConfig(ctx=ctx, n_zones=4, atp_regen_rate=0.0)
+        cfg = AstrocyteConfig(ctx=ctx, n_zones=4, atp_regen_rate=0.0, atp_spike_cost=0.02)
         astro = AstrocyteField(config=cfg)
         high_rates = np.ones(4, dtype=np.float32)
         prev_atp = astro.atp.copy()
@@ -103,7 +103,7 @@ class TestATPDepletion:
 
     def test_threshold_rises_monotonically(self, ctx: SimulationContext) -> None:
         """threshold_shift rises monotonically as ATP depletes."""
-        cfg = AstrocyteConfig(ctx=ctx, n_zones=4, atp_regen_rate=0.0)
+        cfg = AstrocyteConfig(ctx=ctx, n_zones=4, atp_regen_rate=0.0, atp_spike_cost=0.02)
         astro = AstrocyteField(config=cfg)
         high_rates = np.ones(4, dtype=np.float32)
         prev_shift = astro.threshold_shift.copy()

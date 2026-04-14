@@ -25,8 +25,9 @@ class WorkingMemoryModule:
     Dual gating (O'Reilly & Frank 2006):
       ACh gates sensory input (bottom-up relevance)
       DA gates update signal (reward PE → new context important)
-      Gate signal = σ(gain×(ACh-thresh)) × σ(gain×(DA-thresh))
-      Soft gating scales feedforward current, not binary on/off.
+      Gate = spiking MSN population: ACh and DA modulate excitability
+      via receptor-like dynamics.  Both must exceed threshold for the
+      gate neurons to fire → conjunction gate from biophysics.
     """
 
     # ── NetworkGraph layer interface ─────────────────────────────
@@ -79,9 +80,39 @@ class WorkingMemoryModule:
         self._post_decay: float = cfg.ctx.decay(cfg.tau_post)
         self._content_decay: float = cfg.content_decay
 
-        # ── Gate state (soft sigmoid) ────────────────────────────────
+        # ── Gate state: striosomal MSN population (O'Reilly & Frank 2006) ─
+        # Population of AdEx MSN-like gate neurons.  ACh and DA each
+        # provide excitatory drive; conjunction arises because neither
+        # alone exceeds firing threshold.
+        # Population size from config (default 32, same as BG action
+        # channel — gate is a binary action: open/close).
+        ng = cfg.n_gate
+        self._n_gate: int = ng
+        self._gate_v: NDArray[np.float32] = np.full(
+            ng, cfg.v_rest, dtype=np.float32,
+        )
+        self._gate_spikes: NDArray[np.bool_] = np.zeros(ng, dtype=bool)
+        self._gate_refrac: NDArray[np.int32] = np.zeros(ng, dtype=np.int32)
+        self._gate_rate: NDArray[np.float32] = np.zeros(ng, dtype=np.float32)
+        # AdEx adaptation current for gate neurons
+        self._gate_w_adapt: NDArray[np.float32] = np.zeros(
+            ng, dtype=np.float32,
+        )
+        # Gate membrane/rate decays from config (derived from gate_tau)
+        self._gate_mem_decay: float = cfg.gate_mem_decay
+        self._gate_rate_decay: float = cfg.gate_rate_decay
+        # Drive calibration: at both thresholds, total synaptic current
+        # should just reach AdEx rheobase.
+        # AdEx rheobase ≈ g_L × (V_T - E_L - Δ_T) (Brette & Gerstner 2005)
+        # where the -Δ_T accounts for the exponential spike initiation
+        # lowering the effective threshold.
+        _g_L_eff = cfg.gate_C_m / cfg.gate_tau
+        _gap = cfg.v_thresh - cfg.v_rest  # 15 mV
+        _i_rheo = _g_L_eff * (_gap - cfg.gate_delta_t)
+        self._gate_drive: float = _i_rheo / (
+            max(cfg.ach_gate_threshold, 0.01) * max(cfg.da_gate_threshold, 0.01)
+        )
         self._gate_signal: float = 0.0
-        self._gate_gain: float = 8.0  # sigmoid steepness
         self._ach_level: float = 0.0
         self._da_level: float = 0.0
 
@@ -104,18 +135,91 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
 
     def gate(self, ach_level: float, da_level: float = 1.0) -> None:
-        """Dual ACh+DA soft conjunction gate (O'Reilly & Frank 2006).
+        """AdEx MSN conjunction gate (O'Reilly & Frank 2006).
 
-        gate_signal = σ(gain×(ACh-thresh)) × σ(gain×(DA-thresh))
-        Smooth sigmoid replaces binary threshold for gradient-friendly dynamics.
+        Gate neuron population receives ACh and DA as excitatory drives.
+        Both must be above threshold for total current to reach rheobase
+        and produce spikes → conjunction from biophysics, not sigmoid.
+        Gate signal = population firing rate normalised by MSN max rate.
+
+        Uses AdEx neuron model (Brette & Gerstner 2005) consistent with
+        the rest of the network — same equations as D1D2Actor MSNs.
         """
         cfg = self.config
         self._ach_level = float(ach_level)
         self._da_level = float(da_level)
-        g = self._gate_gain
-        ach_sig = 1.0 / (1.0 + np.exp(-g * (ach_level - cfg.ach_gate_threshold)))
-        da_sig = 1.0 / (1.0 + np.exp(-g * (da_level - cfg.da_gate_threshold)))
-        self._gate_signal = float(ach_sig * da_sig)
+
+        # Multiplicative conjunction: ACh × DA × drive.
+        # At thresholds: current ≈ gap → barely fires.
+        # Above: fires reliably.  Below: no spikes.
+        gate_current = float(ach_level * da_level) * self._gate_drive
+
+        ng = self._n_gate
+
+        # ── AdEx integration for gate neurons (Brette & Gerstner 2005) ─
+        in_refrac = self._gate_refrac > 0
+        self._gate_refrac[in_refrac] -= 1
+
+        # Effective g_L for MSN Up-state (τ = gate_tau)
+        g_L_eff = cfg.gate_C_m / cfg.gate_tau
+        inv_Cm = 1.0 / cfg.gate_C_m
+
+        # Current noise: g_L × σ_V (Destexhe et al. 2003)
+        noise = np.random.normal(
+            0, g_L_eff * cfg.gate_noise_std, ng,
+        ).astype(np.float32)
+
+        # AdEx membrane dynamics:
+        # C dV/dt = -g_L(V-E_L) + g_L Δ_T exp((V-V_T)/Δ_T) + I - w
+        exp_term = np.exp(np.clip(
+            (self._gate_v - cfg.v_thresh) / cfg.gate_delta_t,
+            -20.0, 10.0,
+        ))
+        F = inv_Cm * (
+            -g_L_eff * (self._gate_v - cfg.v_rest)
+            + g_L_eff * cfg.gate_delta_t * exp_term
+            + gate_current + noise - self._gate_w_adapt
+        )
+        J = inv_Cm * (-g_L_eff + g_L_eff * exp_term)
+        # Exponential Euler step (same integrator as D1D2Actor)
+        # Clip J×dt to prevent overflow in exp(): |J×dt| > 20 means
+        # the linearisation has broken down and we fall back to forward Euler.
+        dt = cfg.ctx.dt
+        Jdt = J * dt
+        Jdt_clipped = np.clip(Jdt, -20.0, 20.0)
+        integrated = np.where(
+            np.abs(Jdt) > 1e-6,
+            self._gate_v + F / J * (np.exp(Jdt_clipped) - 1.0),
+            self._gate_v + F * dt,
+        )
+        self._gate_v = np.where(in_refrac, cfg.v_reset, integrated)
+
+        # Spike detection at v_spike_cutoff (above V_T)
+        self._gate_spikes = (
+            (self._gate_v >= cfg.gate_v_spike_cutoff) & ~in_refrac
+        )
+        self._gate_v[self._gate_spikes] = cfg.v_reset
+        self._gate_refrac[self._gate_spikes] = cfg.refrac_period
+
+        # Adaptation current (w): τ_w dw/dt = a(V-E_L) - w; w += b on spike
+        self._gate_w_adapt[self._gate_spikes] += cfg.gate_b
+        self._gate_w_adapt = (
+            self._gate_w_adapt * cfg.gate_w_decay
+            + cfg.gate_a * (self._gate_v - cfg.v_rest) * cfg.gate_w_gain
+        )
+
+        # Rate EMA → smooth gate signal
+        rc = 1.0 - self._gate_rate_decay
+        self._gate_rate = (
+            self._gate_rate * self._gate_rate_decay
+            + self._gate_spikes.astype(np.float32) * rc
+        )
+        # Normalise: population mean rate / max sustained MSN rate
+        # (Humphries et al. 2006; Planert et al. 2010: up-state MSN 40 Hz)
+        raw_signal = float(np.mean(self._gate_rate))
+        self._gate_signal = float(np.clip(
+            raw_signal / cfg.gate_max_rate_per_step, 0.0, 1.0,
+        ))
 
     # ------------------------------------------------------------------
     # Core dynamics
@@ -246,3 +350,9 @@ class WorkingMemoryModule:
         self._gate_signal = 0.0
         self._ach_level = 0.0
         self._da_level = 0.0
+        # Reset gate neuron state
+        self._gate_v.fill(self.config.v_rest)
+        self._gate_spikes.fill(False)
+        self._gate_refrac.fill(0)
+        self._gate_rate.fill(0.0)
+        self._gate_w_adapt.fill(0.0)

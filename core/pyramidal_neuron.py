@@ -76,11 +76,13 @@ class PyramidalLayer(CompetitiveLIFLayer):
         # Store homeo config for local management
         self._pyr_homeo = hcfg
 
-        # ── Apical compartment weights ────────────────────────────────
+        # ── Apical compartment weights (nS conductance) ──────────────
         self.w_apical: NDArray[np.float32] = init_weights(
             num_inputs, num_neurons,
             psp_target=0.5,
             excitatory=True,
+            g_L=ncfg.g_L,
+            driving_force=ncfg.driving_force_exc,
         )
 
         # ── Apical membrane state ─────────────────────────────────────
@@ -161,8 +163,9 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.in_plateau = self.plateau_timer > 0
         self.plateau_timer[self.in_plateau] -= 1
 
-        # ── 3. Feedforward drive ──────────────────────────────────────
-        ff_drive = pre_f32 @ self.w  # (num_neurons,)
+        # ── 3. Feedforward drive: conductance-based ─────────────────
+        g_ff = pre_f32 @ self.w          # total excitatory conductance (nS)
+        ff_drive = g_ff * (ncfg.e_exc - self.v)  # pA = nS × mV
 
         # ── 4. Proactive k-WTA inhibition ─────────────────────────────
         self._apply_proactive_inhibition()

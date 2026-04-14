@@ -43,6 +43,7 @@ from .config import (
     ActiveInferenceConfig,
     InhibitoryPoolConfig,
     NeuronConfig,
+    SynapseConfig,
     init_weights,
 )
 from .free_energy import expected_free_energy
@@ -86,49 +87,68 @@ def _msn_decay(
     return np.exp(-cfg.ctx.dt / tau).astype(np.float32)
 
 
-def _derive_input_gain(
+def _derive_conductance_scale(
     fan_in: int,
     ncfg: NeuronConfig,
     w_clip: float,
     target_rate: float = 0.05,
     mean_input_rate: float | None = None,
     headroom: float = 1.0,
+    actual_mean_w: float | None = None,
 ) -> float:
-    """Derive synaptic gain from AdEx rheobase — proper pA-scale current.
+    """Derive weight scaling factor so that expected input reaches rheobase.
 
-    The AdEx membrane equation (Brette & Gerstner 2005) is:
-      C_m dV/dt = -g_L(V - E_L) + g_L Δ_T exp((V - V_T)/Δ_T) + I_syn - w
+    Weights are in nS (conductance).  At runtime: I = g × (E_exc − V).
 
-    At the saddle-node bifurcation, the minimum constant current for
-    spiking (rheobase) is:
-      I_rheo = g_L × (V_T - E_L - Δ_T) = g_L × (gap - delta_t)
+    The AdEx rheobase (Brette & Gerstner 2005):
+      I_rheo = g_L × (gap − Δ_T)  [pA]
 
-    Gain scales I_syn so that expected_active inputs produce ~I_rheo,
-    accounting for homeostatic column normalization (Turrigiano 2008)
-    that clips weight column L2 norms to ``w_clip``.  After clipping,
-    the effective per-synapse weight is approximately
-    ``w_clip / sqrt(fan_in)``.
+    Ohm's law correction: the driving force (E_exc − V) decreases as V
+    rises toward V_thresh, reducing current at the very moment the neuron
+    needs it most.  We calibrate at V_thresh (worst-case driving force)
+    so the expected synaptic current still exceeds rheobase there.
+
+    Required (at V = V_thresh):
+      expected_active × mean_g × effective_df × ampa_eff × headroom ≈ I_rheo
 
     Parameters
     ----------
-    mean_input_rate : float, optional
-        Actual mean input firing rate from the upstream population encoder.
-        If provided, overrides target_rate for expected_active computation.
     headroom : float
-        Multiplicative factor ensuring neurons reach threshold within the
-        finite integration window despite DA modulation and Poisson variance.
-        Accounts for: (a) finite n_substeps × dt vs τ_m, and
-        (b) DA-pathway suppression at baseline for D1D2Actor.
+        Factor ≥ 1 compensating for finite integration window and
+        Poisson input variance.  1/(1−e^{−1}) ≈ 1.58 for one-τ window.
+    actual_mean_w : float | None
+        Mean weight from init_weights (before scaling).  If provided,
+        used as the per-synapse conductance estimate instead of the
+        heuristic w_clip / √fan_in.
 
-    Returns gain in pA per unit input, matching the AdEx current scale.
+    Returns:
+        Multiplicative scaling factor (dimensionless) for weight matrices.
     """
     gap = abs(ncfg.v_thresh - ncfg.v_rest)
-    i_rheo = ncfg.g_L * (gap - ncfg.delta_t)  # pA (Brette & Gerstner 2005)
+    # Use driving force at V_thresh (the bottleneck): as V rises toward
+    # threshold, both driving force and NMDA Mg²⁺ block change, and the
+    # product ampa_eff × df is LOWEST at V_thresh (self-limiting).
+    # Calibrating at this worst-case point ensures reliable spiking.
+    effective_df = ncfg.e_exc - ncfg.v_thresh  # E_exc − V_thresh ≈ 55 mV
+    i_rheo = ncfg.g_L * (gap - ncfg.delta_t)  # pA
+
+    # AMPA/NMDA effective fraction at threshold (Mg²⁺ partly unblocked)
+    ampa_ratio = 3.0  # AMPA:NMDA peak conductance ratio (Myme et al. 2003)
+    ampa_frac = ampa_ratio / (1.0 + ampa_ratio)  # 0.75
+    nmda_frac = 1.0 - ampa_frac                  # 0.25
+    mg_block = SynapseConfig.nmda_mg_block(ncfg.v_thresh)  # B(V_thresh)
+    ampa_eff = ampa_frac + nmda_frac * mg_block   # ~0.78 at V_thresh
+
     rate = mean_input_rate if mean_input_rate is not None else target_rate
     expected_active = max(1.0, fan_in * rate)
-    # Effective per-synapse weight after homeostatic column normalization
-    effective_w = w_clip / np.sqrt(max(1.0, float(fan_in)))
-    return float(headroom * i_rheo / (expected_active * effective_w))
+    if actual_mean_w is not None and actual_mean_w > 0:
+        effective_g = actual_mean_w
+    else:
+        effective_g = w_clip / np.sqrt(max(1.0, float(fan_in)))  # nS
+    return float(
+        headroom * i_rheo
+        / (expected_active * effective_g * effective_df * ampa_eff)
+    )
 
 
 def _adex_step_bg(
@@ -234,25 +254,34 @@ class SNNDeepCritic:
         # ── Precomputed membrane decay ────────────────────────────────
         self._mem_decay: float = config.ctx.decay(config.tau_m_critic)
 
-        # ── Input gain from biophysics (AdEx rheobase) ─────────────────
-        # Integration headroom: with n_substeps = τ/dt, neurons reach
-        # ~63% of steady-state.  Factor 1/(1-e^{-1}) ≈ 1.58 ensures
-        # reliable spiking despite Poisson input variance.
-        self._input_gain: float = _derive_input_gain(
+        # ── Weights in nS via principled init ─────────────────────────
+        # init_weights outputs nS; _cond_scale adjusts for rheobase.
+        self.w_h: NDArray[np.float32] = init_weights(
+            state_size, h, excitatory=True,
+            g_L=self._ncfg.g_L,
+            driving_force=self._ncfg.e_exc - self._ncfg.v_rest,
+        )
+        self._init_mean_w: float = float(self.w_h.mean())
+
+        # ── Conductance scale from biophysics (AdEx rheobase) ──────────
+        # Applied at forward-time (like the old _input_gain), NOT baked
+        # into weights: STDP operates on the init-scale weights so that
+        # critic_lr doesn't need rescaling after the nS conversion.
+        _cond_scale: float = _derive_conductance_scale(
             state_size, self._ncfg, config.w_clip_critic,
             mean_input_rate=mean_input_rate,
             headroom=1.58,
+            actual_mean_w=float(self.w_h.mean()),
         )
+        self._cond_scale: float = _cond_scale
 
-        # ── Weights via principled init ───────────────────────────────
-        self.w_h: NDArray[np.float32] = init_weights(state_size, h, excitatory=True)
-        # Pre-normalize to homeostatic clip so the first update() does
-        # not destructively rescale the weight distribution.  Column
-        # normalization (Turrigiano 2008) then maintains this scale.
+        # Column-norm clip (homeostatic target, Turrigiano 2008).
+        _w_clip: float = config.w_clip_critic
+        _init_col_norms = np.linalg.norm(self.w_h, axis=0)
+        self._w_clip_nS: float = float(1.5 * _init_col_norms.mean())
         for j in range(h):
-            col_norm = float(np.linalg.norm(self.w_h[:, j]))
-            if col_norm > config.w_clip_critic:
-                self.w_h[:, j] *= config.w_clip_critic / col_norm
+            if _init_col_norms[j] > self._w_clip_nS:
+                self.w_h[:, j] *= self._w_clip_nS / _init_col_norms[j]
 
         # ── LIF state (Down state at rest) ────────────────────────────
         self.v_hidden: NDArray[np.float32] = np.full(
@@ -272,9 +301,12 @@ class SNNDeepCritic:
         self.activation: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
         self._rate_decay: float = config.ctx.decay(config.tau_m_critic)
 
-        # ── NMDA slow synaptic current trace (Wang 2002) ─────────────
-        self._i_nmda: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
+        # ── NMDA slow synaptic conductance trace (Wang 2002) ──────────
+        self._g_nmda: NDArray[np.float32] = np.zeros(h, dtype=np.float32)
         self._nmda_decay: float = config.ctx.decay(100.0)  # τ_NMDA=100ms
+
+        # ── Excitatory reversal potential (for I = g × (E_exc − V)) ──
+        self._e_exc: float = self._ncfg.e_exc  # 0.0 mV
 
         # ── NOTE: Value readout (w_v, b_v) moved to VTA circuit ──────
         # The VTA's VTACircuit.w_value replaces the old w_v linear readout.
@@ -361,18 +393,24 @@ class SNNDeepCritic:
             self._t_since_pre += 1
             self._t_since_pre[pre_binary > 0.5] = 0
 
-        # ── Synaptic current ──────────────────────────────────────────
-        current = (state_f32 @ self.w_h) * self._input_gain * self._receptor_gain
+        # ── Synaptic conductance (nS) ─────────────────────────────────
+        # _cond_scale converts init-scale weights → nS at forward time
+        # (preserves STDP operating on the smaller init scale).
+        g_total = (state_f32 @ self.w_h) * np.float32(self._cond_scale) * self._receptor_gain
 
-        # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
-        # Slow synaptic current: τ_NMDA=100ms extends effective integration
-        # window by ~4-5× beyond membrane τ=15ms.
-        # AMPA:NMDA ratio from config (Myme et al. 2003).
+        # ── NMDA temporal integration + Mg²⁺ block (Wang 2002; Jahr & Stevens 1990)
+        # AMPA: fast conductance, no voltage gating.
+        # NMDA: slow τ=100ms EMA of conductance, with voltage-dependent
+        #   Mg²⁺ block B(V) applied at current conversion (not on g).
+        # AMPA:NMDA ratio (3:1) is PEAK conductance (Myme et al. 2003).
         _ampa_frac = cfg.ampa_nmda_ratio / (1.0 + cfg.ampa_nmda_ratio)
         _nmda_frac = 1.0 - _ampa_frac
         _nmda_compl = 1.0 - self._nmda_decay
-        self._i_nmda = self._i_nmda * self._nmda_decay + _nmda_compl * current
-        current = _ampa_frac * current + _nmda_frac * self._i_nmda
+        self._g_nmda = self._g_nmda * self._nmda_decay + _nmda_compl * g_total
+        # Ohm's law: I = g × (E_exc − V), with Mg²⁺ block on NMDA
+        driving_force = self._e_exc - self.v_hidden
+        mg_block = SynapseConfig.nmda_mg_block(self.v_hidden)
+        current = (_ampa_frac * g_total + _nmda_frac * self._g_nmda * mg_block) * driving_force
 
         # ── Single AdEx step ──────────────────────────────────────────
         in_refrac = self.refrac_hidden > 0
@@ -508,7 +546,7 @@ class SNNDeepCritic:
         self.w_adapt_hidden.fill(0.0)
         self.activation.fill(0.0)
         self.e_h.fill(0.0)
-        self._i_nmda.fill(0.0)
+        self._g_nmda.fill(0.0)
         self._x_pre.fill(0.0)
         self._x_post.fill(0.0)
         self._t_since_pre.fill(1000)
@@ -578,28 +616,10 @@ class D1D2Actor:
         self.action_dim = self._total_motor + internal_dim
         self.motor_dim = motor_dim
 
-        # ── D1 pathway weights (cortex → D1-MSN) ─────────────────────
-        self.w_d1: NDArray[np.float32] = init_weights(
-            state_size, self.action_dim, excitatory=True,
-        )
-        # ── D2 pathway weights (cortex → D2-MSN) ─────────────────────
-        # D1 and D2 MSNs are separate neuronal populations.  While they
-        # share cortical afferents, individual synaptic strengths are
-        # independently established during synaptogenesis (Gerfen &
-        # Surmeier 2011).  Independent random initialization provides
-        # symmetry breaking so net evidence (D1-D2) is non-zero from
-        # the start, enabling Go/NoGo learning immediately.
-        self.w_d2: NDArray[np.float32] = init_weights(
-            state_size, self.action_dim, excitatory=True,
-        )
-        # Pre-normalize to homeostatic clip (same rationale as critic)
-        for w_mat in (self.w_d1, self.w_d2):
-            for j in range(self.action_dim):
-                col_norm = float(np.linalg.norm(w_mat[:, j]))
-                if col_norm > config.w_clip:
-                    w_mat[:, j] *= config.w_clip / col_norm
-
         # ── AdEx NeuronConfig for MSN (Up-state defaults) ────────────
+        # Must be created BEFORE weight init so g_L and driving_force
+        # are available for conductance scaling.
+        #
         # Biophysical consistency: τ_m = C_m / g_L ⇒ g_L = C_m / τ_m
         # MSN Up-state τ=25ms with C_m=281pF → g_L=11.24nS
         # (Wilson & Kawaguchi 1996).  Forward pass overrides g_L per
@@ -624,25 +644,74 @@ class D1D2Actor:
             b=80.5 * _adapt_scale,
         )
 
-        # ── Input gain from biophysics (AdEx rheobase) ─────────────────
-        # Integration headroom: with n_substeps × dt ≈ τ_m, the neuron
-        # only reaches 63 % of steady-state voltage → multiply by
-        # 1/(1−e^{-1}) ≈ 1.58 so mean input ≈ I_rheo within the window.
-        self._input_gain: float = _derive_input_gain(
+        # ── Excitatory reversal potential (for I = g × (E_exc − V)) ──
+        self._e_exc: float = self._ncfg.e_exc  # 0.0 mV
+
+        # ── D1 pathway weights (cortex → D1-MSN, in nS) ──────────────
+        self.w_d1: NDArray[np.float32] = init_weights(
+            state_size, self.action_dim, excitatory=True,
+            g_L=self._ncfg.g_L,
+            driving_force=self._ncfg.driving_force_exc,
+        )
+        # ── D2 pathway weights (cortex → D2-MSN, in nS) ──────────────
+        # D1 and D2 MSNs are separate neuronal populations.  While they
+        # share cortical afferents, individual synaptic strengths are
+        # independently established during synaptogenesis (Gerfen &
+        # Surmeier 2011).  Independent random initialization provides
+        # symmetry breaking so net evidence (D1-D2) is non-zero from
+        # the start, enabling Go/NoGo learning immediately.
+        self.w_d2: NDArray[np.float32] = init_weights(
+            state_size, self.action_dim, excitatory=True,
+            g_L=self._ncfg.g_L,
+            driving_force=self._ncfg.driving_force_exc,
+        )
+        # ── Conductance scale from biophysics (AdEx rheobase) ──────────
+        # Integration headroom: 1/(1-e^{-1}) ≈ 1.58 for one-τ window.
+        # Driving force reduction and NMDA Mg²⁺ block are handled
+        # inside _derive_conductance_scale.
+        self._init_mean_w: float = float(
+            (self.w_d1.mean() + self.w_d2.mean()) / 2.0
+        )
+        _cond_scale: float = _derive_conductance_scale(
             state_size, self._ncfg, config.w_clip,
             mean_input_rate=mean_input_rate,
             headroom=1.58,
+            actual_mean_w=self._init_mean_w,
         )
+        self._cond_scale: float = _cond_scale
+        # Scale applied at forward-time (preserves STDP operating on
+        # the smaller init scale, same rationale as critic).
+        # Column-norm clip on init-scale weights
+        _all_col_norms = np.concatenate([
+            np.linalg.norm(self.w_d1, axis=0),
+            np.linalg.norm(self.w_d2, axis=0),
+        ])
+        self._w_clip_nS: float = float(1.5 * _all_col_norms.mean())
+        for w_mat in (self.w_d1, self.w_d2):
+            for j in range(self.action_dim):
+                col_norm = float(np.linalg.norm(w_mat[:, j]))
+                if col_norm > self._w_clip_nS:
+                    w_mat[:, j] *= self._w_clip_nS / col_norm
+
         # D2-MSN gain compensation: at baseline DA the D2-receptor
-        # Hill suppression reduces current to d2_net_mod ≈ 0.52 × I.
-        # Without compensation D2 sits below rheobase and never fires,
-        # killing NoGo learning.  Exact compensation — no safety margin.
+        # Hill suppression reduces current to d2_net_mod ≈ 0.52 × I,
+        # while D1 receptors BOOST D1 current (d1_mod ≈ 1.53).
+        # Without compensation D2 sits far below D1 and NoGo learning
+        # fails because D2 eligibility traces are too weak.
+        #
+        # Planert et al. (2010) showed D1 and D2 MSN firing rates are
+        # similar in vivo at tonic DA.  Day et al. (2008) confirmed
+        # balanced baseline excitability.  To match this, compensate
+        # D2 to equal D1's boosted drive at baseline DA — not just to
+        # reach the unmodulated level.
         _baseline_da = config.baseline_da
+        _d1_resp = hill_response(_baseline_da, config.d1_ec50, config.d1_hill_n)
+        _d1_mod_base = 1.0 + config.d1_receptor_density * _d1_resp
         _d2_resp = hill_response(_baseline_da, config.d2_ec50, config.d2_hill_n)
         _d2_mod = 1.0 - config.d2_receptor_density * _d2_resp
         _d2_tonic = 1.0 + config.d2_tonic_boost_max * (1.0 - _baseline_da)
         _d2_net_mod = max(_d2_mod * _d2_tonic, 0.1)
-        self._d2_gain_comp: float = 1.0 / _d2_net_mod
+        self._d2_gain_comp: float = _d1_mod_base / _d2_net_mod
 
         # ── D1-MSN membrane state ────────────────────────────────────
         self.v_d1: NDArray[np.float32] = np.full(
@@ -653,9 +722,9 @@ class D1D2Actor:
         self.rate_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
         self.w_adapt_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
 
-        # ── NMDA slow synaptic current traces (Wang 2002) ─────────────
-        self._i_nmda_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
-        self._i_nmda_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        # ── NMDA slow synaptic conductance traces (Wang 2002) ─────────
+        self._g_nmda_d1: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
+        self._g_nmda_d2: NDArray[np.float32] = np.zeros(self.action_dim, dtype=np.float32)
         self._nmda_decay: float = config.ctx.decay(100.0)  # τ_NMDA=100ms
 
         # ── D2-MSN membrane state ────────────────────────────────────
@@ -695,6 +764,10 @@ class D1D2Actor:
 
         # ── DA modulation state ───────────────────────────────────────
         self._da_level: float = 0.5
+        # Tonic DA level for high-affinity D2 receptor modulation
+        # (Dreyer et al. 2010).  Initialised at phasic baseline;
+        # overwritten by set_tonic_da_level() before first forward().
+        self._tonic_da_level: float = config.baseline_da
 
         # ── NE level for temperature modulation (Usher & Damasio 2000) ─
         self._ne_level: float = 0.3  # Baseline from NeuromodulatorConfig
@@ -811,8 +884,19 @@ class D1D2Actor:
             ).astype(np.int32)
 
     def set_da_level(self, da: float) -> None:
-        """Set DA modulation: high DA → D1 excitation, D2 suppression."""
+        """Set phasic DA: high DA → D1 excitation, D2 suppression."""
         self._da_level = float(np.clip(da, 0.0, 1.0))
+
+    def set_tonic_da_level(self, tonic_da: float) -> None:
+        """Set tonic DA for high-affinity D2 receptor modulation.
+
+        Tonic DA tracks average reward rate (Niv et al. 2007).
+        High tonic DA (rich environment) → D2 suppressed → exploitation.
+        Low tonic DA (poor/novel environment) → D2 boosted → caution.
+        Operates on minute-scale (τ ≈ 60 s, Grace 1991), independent
+        of phasic DA transients (τ ≈ 200 ms).
+        """
+        self._tonic_da_level = float(np.clip(tonic_da, 0.0, 1.0))
 
     def set_ne_level(self, ne: float) -> None:
         """Set NE level for temperature-modulated action selection.
@@ -854,21 +938,27 @@ class D1D2Actor:
             self._t_since_pre += 1
             self._t_since_pre[pre_binary > 0.5] = 0
 
-        # ── Synaptic currents ─────────────────────────────────────────
-        current_d1 = (state_f32 @ self.w_d1) * self._input_gain * self._receptor_gain
-        current_d2 = (state_f32 @ self.w_d2) * self._input_gain * self._receptor_gain * self._d2_gain_comp
+        # ── Synaptic conductances (nS) ─────────────────────────────────
+        # _cond_scale applied at forward time (same as critic)
+        _cs = np.float32(self._cond_scale)
+        g_d1 = (state_f32 @ self.w_d1) * _cs * self._receptor_gain
+        g_d2 = (state_f32 @ self.w_d2) * _cs * self._receptor_gain * self._d2_gain_comp
 
-        # ── NMDA temporal integration (Wang 2002; Jahr & Stevens 1990) ─
-        # Slow synaptic current: τ_NMDA=100ms extends effective
-        # integration window by ~4× beyond membrane τ=25ms.
-        # AMPA:NMDA ratio from config (Myme et al. 2003).
+        # ── NMDA temporal integration + Mg²⁺ block (Wang 2002; Jahr & Stevens 1990)
+        # AMPA:NMDA ratio (3:1) is peak conductance (Myme et al. 2003).
+        # NMDA slow EMA on conductance; Mg²⁺ block applied at current conversion.
         _ampa_frac = cfg.ampa_nmda_ratio / (1.0 + cfg.ampa_nmda_ratio)
         _nmda_frac = 1.0 - _ampa_frac
         _nmda_compl = 1.0 - self._nmda_decay
-        self._i_nmda_d1 = self._i_nmda_d1 * self._nmda_decay + _nmda_compl * current_d1
-        self._i_nmda_d2 = self._i_nmda_d2 * self._nmda_decay + _nmda_compl * current_d2
-        current_d1 = _ampa_frac * current_d1 + _nmda_frac * self._i_nmda_d1
-        current_d2 = _ampa_frac * current_d2 + _nmda_frac * self._i_nmda_d2
+        self._g_nmda_d1 = self._g_nmda_d1 * self._nmda_decay + _nmda_compl * g_d1
+        self._g_nmda_d2 = self._g_nmda_d2 * self._nmda_decay + _nmda_compl * g_d2
+        # Ohm's law: I = g × (E_exc − V), with Mg²⁺ block on NMDA
+        df_d1 = self._e_exc - self.v_d1  # driving force D1 (mV)
+        df_d2 = self._e_exc - self.v_d2  # driving force D2 (mV)
+        mg_d1 = SynapseConfig.nmda_mg_block(self.v_d1)
+        mg_d2 = SynapseConfig.nmda_mg_block(self.v_d2)
+        current_d1 = (_ampa_frac * g_d1 + _nmda_frac * self._g_nmda_d1 * mg_d1) * df_d1
+        current_d2 = (_ampa_frac * g_d2 + _nmda_frac * self._g_nmda_d2 * mg_d2) * df_d2
 
         # ── DA pathway-specific modulation (Frank 2005; Surmeier 2007) ─
         # D1 (Go): DA activates D1 receptors → cAMP↑/PKA → NMDA
@@ -886,13 +976,38 @@ class D1D2Actor:
         # D2: inhibitory Hill response — high DA → less D2 current
         d2_resp = hill_response(da, cfg.d2_ec50, cfg.d2_hill_n)
         d2_mod = 1.0 - cfg.d2_receptor_density * d2_resp
-        # D2 tonic boost: low tonic DA → high-affinity D2 tonically
-        # activated → D2 more excitable (Dreyer et al. 2010).
-        # When DA is high, D2 is suppressed (d2_mod < 1) AND no tonic
-        # boost.  When DA is low, D2 is released AND gets tonic boost.
-        d2_tonic = 1.0 + cfg.d2_tonic_boost_max * (1.0 - da)
+        # D2 tonic boost: HIGH-AFFINITY D2 receptors respond to the
+        # slow background DA level, not phasic transients (Dreyer et al.
+        # 2010).  _tonic_da_level tracks average reward rate via
+        # minute-scale integration (Niv et al. 2007; Grace 1991).
+        #
+        # Low tonic DA (unknown/poor environment) → high-affinity D2
+        # tonically active → D2 excitable → NoGo/caution bias.
+        # High tonic DA (rich environment) → D2 saturated → reduced
+        # tonic boost → Go/exploitation bias.
+        #
+        # The _d2_gain_comp (computed at init using phasic baseline_da)
+        # calibrates D1≈D2 at the equilibrium point (Planert et al.
+        # 2010).  Since baseline_tonic_da (0.0) < baseline_da (0.5),
+        # the initial D2 boost exceeds the calibration → natural
+        # "caution prior" without any explicit bias parameter.
+        da_tonic = float(np.clip(self._tonic_da_level, 0.0, 1.0))
+        d2_tonic = 1.0 + cfg.d2_tonic_boost_max * (1.0 - da_tonic)
         current_d1 *= d1_mod
         current_d2 *= d2_mod * d2_tonic
+
+        # ── STN-GPe hyperdirect pathway (Frank 2006; Bogacz & Gurney 2007)
+        # Low DA → STN disinhibited → global GPi excitation → raises
+        # effective threshold for ALL action channels.  Multiplicative
+        # suppression relative to tonic DA baseline: only active when DA
+        # drops below baseline (phasic dip).  At DA=baseline → stn_factor=1
+        # (no suppression).  At DA=0 → stn_factor = 1 - stn_strength × baseline_da.
+        # This ensures exploration is driven by DA dips (reward omission),
+        # not by the normal tonic state.
+        da_deficit = max(cfg.baseline_da - da, 0.0)
+        stn_factor = max(1.0 - cfg.stn_strength * da_deficit, 0.0)
+        current_d1 *= stn_factor
+        current_d2 *= stn_factor
 
         # ── Fast epistemic drive: error neurons → D1 excitability ─────
         # High prediction error boosts Go pathway (explore novel states)
@@ -983,6 +1098,51 @@ class D1D2Actor:
         )
         self.refrac_d2[self.spikes_d2] = cfg.refrac_period
 
+        # ── Cross-action lateral inhibition (Taverna et al. 2008) ─────
+        # D1 and D2 MSNs inhibit each other through lateral GABAergic
+        # collaterals.  Connection probabilities and unitary iPSPs
+        # from Taverna et al. (2008, J Neurosci, Fig 5):
+        #
+        #   D1→D1: p=14%, iPSP=0.14 mV
+        #   D2→D2: p=11%, iPSP=0.12 mV
+        #   D1→D2: p= 6%, iPSP=0.10 mV (weakest cross-pathway)
+        #
+        # The model sums spikes from the competing population and
+        # applies uniform lateral inhibition to the target channel.
+        # Since actual connectivity is sparse (~14%), g_lat must
+        # account for connection probability (mean-field scaling):
+        #   g_lat = p_conn × iPSP / (V_thresh − E_inh)
+        #
+        # Self-limiting: as V → E_inh, driving force → 0 (Brunel & Wang 2003).
+        _E_INH = -75.0   # GABA-A reversal (Buhl et al. 1995)
+        _DF_INH = cfg.v_thresh - _E_INH  # 20 mV driving force at threshold
+        _G_LAT_D1 = 0.14 * 0.14 / _DF_INH  # ≈ 0.00098 — D1→D1
+        _G_LAT_D2 = 0.11 * 0.12 / _DF_INH  # ≈ 0.00066 — D2→D2
+        _G_LAT_X  = 0.06 * 0.10 / _DF_INH  # ≈ 0.00030 — D1→D2 cross
+        if self.motor_dim > 1:
+            npa = self.n_per_action
+            tm = self._total_motor
+            _d1_act_spikes = self.spikes_d1[:tm].reshape(
+                self.motor_dim, npa,
+            ).sum(axis=1).astype(np.float32)
+            _d2_act_spikes = self.spikes_d2[:tm].reshape(
+                self.motor_dim, npa,
+            ).sum(axis=1).astype(np.float32)
+            total_d1 = _d1_act_spikes.sum()
+            total_d2 = _d2_act_spikes.sum()
+            if total_d1 > 0 or total_d2 > 0:
+                for a in range(self.motor_dim):
+                    s = a * npa
+                    e = s + npa
+                    d1_others = total_d1 - _d1_act_spikes[a]
+                    d2_others = total_d2 - _d2_act_spikes[a]
+                    # D1→D1 within-pathway lateral inhibition
+                    self.v_d1[s:e] += (_G_LAT_D1 * d1_others) * (_E_INH - self.v_d1[s:e])
+                    # D2→D2 within-pathway lateral inhibition
+                    self.v_d2[s:e] += (_G_LAT_D2 * d2_others) * (_E_INH - self.v_d2[s:e])
+                    # D1→D2 cross-pathway (weak, Taverna 2008 Fig. 5)
+                    self.v_d2[s:e] += (_G_LAT_X * d1_others) * (_E_INH - self.v_d2[s:e])
+
         # ── Rate EMA (for Active Inference readout) ─────────────────────
         rc = 1.0 - self._rate_decay
         self.rate_d1 = self.rate_d1 * self._rate_decay + self.spikes_d1.astype(np.float32) * rc
@@ -1068,21 +1228,29 @@ class D1D2Actor:
         max_ev = net_evidence.max()
         winners = np.flatnonzero(net_evidence == max_ev)
         action = int(np.random.choice(winners))
-        self._last_action = action
+        # Preserve the act()-phase action during inference_mode forward
+        # passes (e.g., V(s') critic integration in observe()).  The
+        # action-gated eligibility in update() needs the act()-phase
+        # action, not a spurious action from zero-input decay dynamics.
+        if not self._inference_mode:
+            self._last_action = action
         self._last_net_evidence = net_evidence.copy()
 
-        # ── Voltage-based eligibility (Clopath et al. 2010) ──────────
-        # EMA form captures ALL neurons' membrane state for credit
-        # assignment matching the membrane-voltage readout in action
-        # selection.  (1-decay) converts sum to bounded EMA.
-        # Non-centered: v_d1_norm ∈ [0,1] gives positive eligibility
-        # for active neurons.  Ratchet prevented by WTA-mediated
-        # inhibition (suppresses losing actions' membrane → lower
-        # eligibility) + column norm clipping + OpAL sign separation.
+        # ── Spike-based eligibility (Bi & Poo 2001; Clopath et al. 2010) ─
+        # Post-synaptic spike traces (_x_post_d1/d2) provide credit to
+        # active neurons.  Combined with cross-action lateral inhibition,
+        # the winner fires more → higher eligibility.  Voltage floor
+        # ensures both D1 and D2 get baseline credit even with sparse
+        # spiking, preventing initialization-dependent lock-in.
+
         if not self._inference_mode:
             _e_compl = 1.0 - self._trace_decay
-            self.e_d1 = self.e_d1 * self._trace_decay + _e_compl * np.outer(state_f32, v_d1_norm)
-            self.e_d2 = self.e_d2 * self._trace_decay + _e_compl * np.outer(state_f32, v_d2_norm)
+            # Hybrid: spike trace + voltage floor (ensures both pathways learn)
+            _floor = 0.07  # minimum eligibility from membrane proximity to threshold
+            post_d1 = np.maximum(self._x_post_d1, _floor * v_d1_norm)
+            post_d2 = np.maximum(self._x_post_d2, _floor * v_d2_norm)
+            self.e_d1 = self.e_d1 * self._trace_decay + _e_compl * np.outer(state_f32, post_d1)
+            self.e_d2 = self.e_d2 * self._trace_decay + _e_compl * np.outer(state_f32, post_d2)
 
         # ── Internal actions (WM gate) via MSN dynamics ─────────────
         # WM gate uses the same bistable MSN membrane state as motor
@@ -1106,7 +1274,47 @@ class D1D2Actor:
         """
         td = float(td_error)
         cfg = self.config
-        effective_lr = cfg.actor_lr * self._receptor_lr
+        base_lr = cfg.actor_lr * self._receptor_lr
+
+        # ── DA-gated plasticity asymmetry (Collins & Frank 2014) ──────
+        # D1/D2 learning rates modulated by receptor occupancy via the
+        # SAME Hill parameters used for excitability (no new constants).
+        # D1 LTP requires D1 receptor activation: cAMP↑ → PKA →
+        #   DARPP-32 phosphorylation → CaMKII → LTP (Surmeier 2007).
+        # D2 LTP requires D2 receptor DE-activation: DA dip →
+        #   cAMP↓ relief → permissive for LTP (Shen et al. 2008).
+        # D1 LTD requires D1 receptor vacancy: eCB-mediated depression
+        #   only when D1/PKA signalling is low (Shen et al. 2008).
+        da = float(np.clip(self._da_level, 0.0, 1.0))
+        _d1_r = hill_response(da, cfg.d1_ec50, cfg.d1_hill_n)
+        _d2_r = hill_response(da, cfg.d2_ec50, cfg.d2_hill_n)
+
+        # ── Action-gated eligibility (Frank 2005; Wickens et al. 2003) ─
+        # Three-factor STDP requires the post-synaptic MSN to have been
+        # in UP state during the action — only responding MSNs accumulate
+        # full synaptic tags (Reynolds & Wickens 2002; Gurney et al. 2015).
+        # With weak lateral inhibition (Taverna et al. 2008: p_conn ≤ 14%,
+        # iPSP ≤ 0.14 mV), spiking WTA alone does not produce sufficient
+        # activity contrast between chosen and non-chosen action channels
+        # to gate eligibility.  Explicit scaling implements the GPi
+        # selection gate: the winning action keeps full eligibility, while
+        # non-chosen actions retain only DOWN-state residual plasticity.
+        #
+        # DOWN-state MSNs fire at 0.5–2 Hz vs UP-state 10–40 Hz
+        # (Wilson & Kawaguchi 1996; Mahon et al. 2006), giving a
+        # spike-rate ratio of ~5–15%.  Subthreshold Ca²⁺ transients
+        # (Yuste & Denk 1995) support weak STDP even in DOWN state.
+        # Factor 0.1 ≈ geometric mean of spike-rate and voltage ratios.
+        _DOWN_STATE_FACTOR = 0.1
+        _act = self._last_action
+        if 0 <= _act < self.motor_dim:
+            npa = self.n_per_action
+            for a in range(self.motor_dim):
+                if a != _act:
+                    s = a * npa
+                    e = s + npa
+                    self.e_d1[:, s:e] *= _DOWN_STATE_FACTOR
+                    self.e_d2[:, s:e] *= _DOWN_STATE_FACTOR
 
         # ── Bidirectional DA-modulated STDP (Shen et al. 2008) ─────────
         # D1 (Go):  LTP on DA burst (positive TD);
@@ -1131,17 +1339,24 @@ class D1D2Actor:
         # and preserves NoGo learning stability.
 
         # D1 (Go): LTP on positive TD (DA burst)
+        # lr ∝ D1 occupancy: high DA → strong LTP (Surmeier et al. 2007)
         if td > 0:
-            dw_d1 = effective_lr * td * self.e_d1
+            lr_d1_ltp = base_lr * (1.0 + cfg.d1_receptor_density * _d1_r)
+            dw_d1 = lr_d1_ltp * td * self.e_d1
             self.w_d1 += dw_d1
 
         # D2 (NoGo): LTP on negative TD (DA dip)
-        # D1 (Go):  LTD on negative TD (DA dip) — Shen et al. 2008
+        # lr ∝ D2 receptor VACANCY (1 − occupancy): low DA → strong NoGo
+        # learning (Shen et al. 2008; Collins & Frank 2014).
+        # D1 (Go): LTD on negative TD — requires D1 receptor vacancy;
+        # lr ∝ (1 − D1 occupancy) × ltd_ratio (Shen et al. 2008).
         if td < 0:
-            dw_d2 = effective_lr * (-td) * self.e_d2
+            lr_d2_ltp = base_lr * (1.0 + cfg.d2_receptor_density * (1.0 - _d2_r))
+            dw_d2 = lr_d2_ltp * (-td) * self.e_d2
             self.w_d2 += dw_d2
 
-            dw_d1_ltd = effective_lr * cfg.ltd_ratio * td * self.e_d1
+            lr_d1_ltd = base_lr * cfg.ltd_ratio * (1.0 - cfg.d1_receptor_density * _d1_r)
+            dw_d1_ltd = lr_d1_ltd * td * self.e_d1
             self.w_d1 += dw_d1_ltd
 
         # Synaptic protein turnover removed: voltage-based EMA
@@ -1223,8 +1438,8 @@ class D1D2Actor:
         self.rate_d2.fill(0.0)
         self.e_d1.fill(0.0)
         self.e_d2.fill(0.0)
-        self._i_nmda_d1.fill(0.0)
-        self._i_nmda_d2.fill(0.0)
+        self._g_nmda_d1.fill(0.0)
+        self._g_nmda_d2.fill(0.0)
         self._x_pre.fill(0.0)
         self._x_post_d1.fill(0.0)
         self._x_post_d2.fill(0.0)
@@ -1264,21 +1479,11 @@ class D1D2Actor:
         self._v_accum_d2.fill(0.0)
         self._n_forward: int = 0
 
-    def gate_eligibility(self, selected_action: int) -> None:
-        """Gate eligibility to the selected action channel only.
-
-        DA reinforcement targets the synaptic pathways of the winning
-        action channel (Redgrave, Gurney & Reynolds 2010).  Non-selected
-        motor populations’ eligibility is zeroed so that update() only
-        modifies the selected action’s weights.  Internal (non-motor)
-        neurons are left intact.
-        """
-        for a in range(self.motor_dim):
-            if a != selected_action:
-                start = a * self.n_per_action
-                end = start + self.n_per_action
-                self.e_d1[:, start:end] = 0.0
-                self.e_d2[:, start:end] = 0.0
+    # gate_eligibility() removed - Phase 2 HACK B.
+    # Voltage-based eligibility (Clopath et al. 2010) naturally decays
+    # for suppressed action channels: InhibitoryPool drives losing
+    # MSNs near V_rest -> v_norm ~ 0 -> eligibility ~ 0.  No explicit
+    # zeroing needed (Wang 2002; Wickens et al. 2003).
 
     def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
         """Apply receptor dose-response modulation (Hill equation effects)."""

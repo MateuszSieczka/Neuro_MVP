@@ -8,7 +8,7 @@ Changes from legacy:
   2. Inhibitory STDP (Woodin et al. 2003): E→I Hebbian, I→E anti-Hebbian.
   3. E/I balance homeostatic rate — slow correction factor.
   4. DA modulation via D2 receptors on PV+ interneurons.
-  5. Proper current naming (i_gaba_a, not g_gaba_a for current-based model).
+  5. Conductance-based E→I drive: I = g × (E_exc − V), self-limiting.
 """
 
 from __future__ import annotations
@@ -84,9 +84,9 @@ class InhibitoryPool:
             cfg.w_ie_mean, cfg.w_ie_mean * 0.2, (n_inh, n_excitatory),
         )).astype(np.float32)
 
-        # ── GABA current traces (current-based, not conductance) ──────
-        self.i_gaba_a: NDArray[np.float32] = np.zeros(n_excitatory, dtype=np.float32)
-        self.i_gaba_b: NDArray[np.float32] = np.zeros(n_excitatory, dtype=np.float32)
+        # ── GABA conductance traces (nS-scale) ──────────────────────
+        self.g_gaba_a: NDArray[np.float32] = np.zeros(n_excitatory, dtype=np.float32)
+        self.g_gaba_b: NDArray[np.float32] = np.zeros(n_excitatory, dtype=np.float32)
 
         # ── Precomputed decays from config ────────────────────────────
         syn_cfg = SynapseConfig(ctx=cfg.ctx)
@@ -99,27 +99,29 @@ class InhibitoryPool:
         self._trace_inh: NDArray[np.float32] = np.zeros(n_inh, dtype=np.float32)
         self._trace_decay: float = cfg.ctx.decay(20.0)  # τ = 20ms
 
-        # ── E→I input gain (biophysics: AdEx rheobase scaling) ────────
+        # ── E→I input calibration (conductance-based) ────────────────
         # PV+ interneurons receive convergent excitatory input and need
         # sufficient current to reach threshold.  Without gain scaling,
         # the raw E→I weight product is ~2 pA per step vs ~350 pA
         # rheobase — a 175× mismatch (Brunel & Wang 2003).
         #
-        # Gain is derived identically to the main pathway:
-        #   I_rheo = g_L × (V_T - E_L - Δ_T)
-        #   gain = I_rheo / (expected_active_inputs × mean_weight)
+        # We fold the calibration into the weights at init time so that
+        # w_ei is in nS and at runtime: I = g × (E_exc − V_inh).
         #
-        # Pessimistic estimate: PV+ interneurons must fire even with
-        # very sparse excitatory input.  In vivo, single cortical
-        # spikes can trigger PV+ firing (Gabernet, Jadhav & Feldman
-        # 2005).  Use min(3, expected) to ensure sensitivity.
+        #   input_gain = I_rheo / (expected_active × w_ei_mean)
+        #   cond_scale = input_gain / driving_force
+        #   w_ei_nS    = w_ei × cond_scale
         ncfg = self._ncfg
         gap_inh = abs(ncfg.v_thresh - ncfg.v_rest)
         i_rheo_inh = ncfg.g_L * (gap_inh - ncfg.delta_t)
         expected_active_exc = max(1.0, min(3.0, n_excitatory * cfg.target_sparsity))
-        self._input_gain: float = float(
+        _input_gain: float = float(
             i_rheo_inh / (expected_active_exc * cfg.w_ei_mean)
         )
+        _driving_force_inh = ncfg.e_exc - ncfg.v_rest  # E_exc − V_rest (70 mV)
+        _cond_scale = _input_gain / max(_driving_force_inh, 1.0)
+        self.w_ei *= np.float32(_cond_scale)
+        self._e_exc: float = ncfg.e_exc
 
         # ── DA modulation gain ────────────────────────────────────────
         self._ie_gain: float = 1.0
@@ -161,8 +163,9 @@ class InhibitoryPool:
         exc_f32 = exc_spikes.astype(np.float32)
         cfg = self.config
 
-        # ── E→I drive (scaled to AdEx rheobase) ──────────────────────
-        i_input = exc_f32 @ self.w_ei * self._input_gain
+        # ── E→I drive: conductance-based (w_ei in nS) ────────────────
+        g_ei = exc_f32 @ self.w_ei                    # total conductance (nS)
+        i_input = g_ei * (self._e_exc - self.v_inh)   # pA = nS × mV
 
         # ── Interneuron AdEx integration ──────────────────────────────
         ncfg = self._ncfg
@@ -203,11 +206,11 @@ class InhibitoryPool:
         inh_f32 = self.spikes_inh.astype(np.float32)
         feedback = inh_f32 @ self.w_ie * self._ie_gain  # (n_exc,)
 
-        self.i_gaba_a *= self._decay_gaba_a
-        self.i_gaba_a += (1.0 - cfg.gaba_b_ratio) * feedback
+        self.g_gaba_a *= self._decay_gaba_a
+        self.g_gaba_a += (1.0 - cfg.gaba_b_ratio) * feedback
 
-        self.i_gaba_b *= self._decay_gaba_b
-        self.i_gaba_b += cfg.gaba_b_ratio * feedback
+        self.g_gaba_b *= self._decay_gaba_b
+        self.g_gaba_b += cfg.gaba_b_ratio * feedback
 
         # ── Inhibitory STDP (Woodin et al. 2003) ─────────────────────
         self._trace_exc *= self._trace_decay
@@ -238,7 +241,7 @@ class InhibitoryPool:
         # threshold (where inhibition matters most), the effective
         # inhibition matches the original current-based model.  Below
         # threshold, inhibition is reduced (self-limiting property).
-        g_total = self.i_gaba_a + self.i_gaba_b  # conductance (arb. units)
+        g_total = self.g_gaba_a + self.g_gaba_b  # conductance (arb. units)
         ref_drive = self.config.v_thresh - _E_INH  # V_thresh - E_inh ≈ 25 mV
         if v_exc is not None:
             driving_force = np.clip((v_exc - _E_INH) / max(ref_drive, 1.0), 0.0, None)
@@ -279,8 +282,8 @@ class InhibitoryPool:
         self.v_inh.fill(self.config.v_rest)
         self.w_adapt_inh.fill(0.0)
         self.spikes_inh.fill(False)
-        self.i_gaba_a.fill(0.0)
-        self.i_gaba_b.fill(0.0)
+        self.g_gaba_a.fill(0.0)
+        self.g_gaba_b.fill(0.0)
         self._trace_exc.fill(0.0)
         self._trace_inh.fill(0.0)
         self._ie_gain = 1.0

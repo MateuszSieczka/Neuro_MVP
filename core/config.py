@@ -132,6 +132,16 @@ class NeuronConfig(BaseConfig):
     ne_trace_compression: float = 3.0   # NE → up to (1 + factor)× trace compression
     ach_membrane_compression: float = 1.0  # ACh → up to (1 + factor)× τ_m compression
 
+    # ── Unitary synaptic conductance (Feldmeyer et al. 2002) ─────────
+    # Peak conductance of a single synapse onto a cortical pyramidal cell.
+    # Feldmeyer et al. (2002): unitary EPSP = 1.0 ± 0.7 mV at L4→L2/3.
+    # Thomson & Lamy (2007): 0.3-2.5 mV range in cortex.
+    # Derived: g_syn = EPSP × g_L / (E_exc − V_rest)
+    #        = 1.0 mV × 30 nS / 70 mV ≈ 0.43 nS
+    # (used for weight init target, not direct current injection)
+    g_syn_unitary: float = 0.43   # nS (Feldmeyer et al. 2002)
+    e_exc: float = 0.0            # Excitatory reversal potential (mV)
+
     # ── Derived (computed in __post_init__) ───────────────────────────
     # Membrane decay factor per timestep (LIF-compat, used by subclasses)
     mem_decay: float = field(init=False, default=0.0)
@@ -145,6 +155,11 @@ class NeuronConfig(BaseConfig):
     w_decay: float = field(init=False, default=0.0)
     # Adaptation gain: 1 - exp(-dt / tau_w)
     w_gain: float = field(init=False, default=0.0)
+    # Unitary synaptic conductance (nS): g_syn_unitary directly.
+    # Used as weight init target — weights are now in nS.
+    psp_target: float = field(init=False, default=0.0)
+    # Excitatory driving force at rest: E_exc − V_rest (mV)
+    driving_force_exc: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
@@ -168,6 +183,14 @@ class NeuronConfig(BaseConfig):
         # AdEx adaptation decay factors
         object.__setattr__(self, 'w_decay', self.ctx.decay(self.tau_w))
         object.__setattr__(self, 'w_gain', self.ctx.complement(self.tau_w))
+        # Unitary EPSP from Ohm's law (Feldmeyer et al. 2002):
+        # PSP = g_syn × (E_exc − V_rest) / g_L  → in mV
+        # psp_target is used by init_weights which NOW outputs nS,
+        # so we keep psp_target in mV (the INPUT to init_weights).
+        psp = self.g_syn_unitary * (self.e_exc - self.v_rest) / self.g_L
+        object.__setattr__(self, 'psp_target', psp)
+        # Driving force at rest (mV): used for weight init nS conversion
+        object.__setattr__(self, 'driving_force_exc', self.e_exc - self.v_rest)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -261,15 +284,26 @@ class SynapseConfig(BaseConfig):
       At V_thresh=-55mV: B ≈ 0.12 (partially open)
       At 0mV: B ≈ 1.0 (fully open)
     """
-    # AMPA
+    # ── Decay time constants (Destexhe et al. 1998, Table 1) ─────────
+    # AMPA: fast glutamatergic; τ_decay = 2 ms (Hestrin et al. 1990)
     tau_ampa: float = 2.0
-    # NMDA
+    # NMDA: slow glutamatergic + Mg²⁺ block; τ_decay = 100 ms
     tau_nmda: float = 100.0
     mg_concentration: float = 1.0  # mM (extracellular [Mg²⁺])
-    # GABA-A
+    # GABA-A: fast GABAergic; τ_decay = 5 ms (Galarreta & Hestrin 1997)
     tau_gaba_a: float = 5.0
-    # GABA-B
+    # GABA-B: slow GABAergic (metabotropic); τ_decay = 100 ms
     tau_gaba_b: float = 100.0
+
+    # ── Rise time constants (Destexhe et al. 1998, Table 1) ──────────
+    # Dual-exponential kinetics: g(t) = N × (exp(-t/τ_d) - exp(-t/τ_r))
+    # where N normalises peak to unity.
+    # τ_rise values from Destexhe, Mainen & Bhalla (1998) Table 1:
+    tau_rise_ampa: float = 0.4     # ms (Hestrin et al. 1990: 0.2-0.4 ms)
+    tau_rise_nmda: float = 10.0    # ms (Lester et al. 1990: 5-15 ms)
+    tau_rise_gaba_a: float = 0.25  # ms (Galarreta & Hestrin 1997: 0.1-0.3 ms)
+    tau_rise_gaba_b: float = 30.0  # ms (Destexhe et al. 1998: 25-50 ms)
+
     # Reversal potentials
     e_exc: float = 0.0       # Excitatory reversal (mV)
     e_inh: float = -75.0     # Inhibitory reversal (mV)
@@ -277,20 +311,49 @@ class SynapseConfig(BaseConfig):
     ampa_nmda_ratio: float = 3.0
 
     # ── Derived ───────────────────────────────────────────────────────
+    # Decay factors: exp(-dt / τ_decay) per channel
     ampa_decay: float = field(init=False, default=0.0)
     nmda_decay: float = field(init=False, default=0.0)
     gaba_a_decay: float = field(init=False, default=0.0)
     gaba_b_decay: float = field(init=False, default=0.0)
+    # Rise factors: exp(-dt / τ_rise) per channel
+    ampa_rise_decay: float = field(init=False, default=0.0)
+    nmda_rise_decay: float = field(init=False, default=0.0)
+    gaba_a_rise_decay: float = field(init=False, default=0.0)
+    gaba_b_rise_decay: float = field(init=False, default=0.0)
+    # Peak-normalisation factors N so that max(exp(-t/τ_d) - exp(-t/τ_r)) = 1
+    # t_peak = τ_r × τ_d / (τ_d - τ_r) × ln(τ_d / τ_r)
+    # N = 1 / (exp(-t_peak/τ_d) - exp(-t_peak/τ_r))
+    ampa_norm: float = field(init=False, default=0.0)
+    nmda_norm: float = field(init=False, default=0.0)
+    gaba_a_norm: float = field(init=False, default=0.0)
+    gaba_b_norm: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_ampa > 0, f"tau_ampa must be positive, got {self.tau_ampa}"
         assert self.tau_nmda > 0, f"tau_nmda must be positive, got {self.tau_nmda}"
         assert self.tau_ampa < self.tau_nmda, f"tau_ampa ({self.tau_ampa}) must be < tau_nmda ({self.tau_nmda})"
         assert self.mg_concentration > 0, f"mg_concentration must be positive, got {self.mg_concentration}"
+        # Decay factors
         object.__setattr__(self, 'ampa_decay', self.ctx.decay(self.tau_ampa))
         object.__setattr__(self, 'nmda_decay', self.ctx.decay(self.tau_nmda))
         object.__setattr__(self, 'gaba_a_decay', self.ctx.decay(self.tau_gaba_a))
         object.__setattr__(self, 'gaba_b_decay', self.ctx.decay(self.tau_gaba_b))
+        # Rise factors
+        object.__setattr__(self, 'ampa_rise_decay', self.ctx.decay(self.tau_rise_ampa))
+        object.__setattr__(self, 'nmda_rise_decay', self.ctx.decay(self.tau_rise_nmda))
+        object.__setattr__(self, 'gaba_a_rise_decay', self.ctx.decay(self.tau_rise_gaba_a))
+        object.__setattr__(self, 'gaba_b_rise_decay', self.ctx.decay(self.tau_rise_gaba_b))
+        # Peak normalisation (Roth & van Rossum 2009, Eq. 7)
+        for prefix, tau_d, tau_r in [
+            ('ampa', self.tau_ampa, self.tau_rise_ampa),
+            ('nmda', self.tau_nmda, self.tau_rise_nmda),
+            ('gaba_a', self.tau_gaba_a, self.tau_rise_gaba_a),
+            ('gaba_b', self.tau_gaba_b, self.tau_rise_gaba_b),
+        ]:
+            t_peak = tau_r * tau_d / (tau_d - tau_r) * np.log(tau_d / tau_r)
+            raw_peak = np.exp(-t_peak / tau_d) - np.exp(-t_peak / tau_r)
+            object.__setattr__(self, f'{prefix}_norm', 1.0 / raw_peak)
 
     @staticmethod
     def nmda_mg_block(v: float | np.ndarray) -> float | np.ndarray:
@@ -300,22 +363,29 @@ class SynapseConfig(BaseConfig):
 
         Reference: Jahr & Stevens (1990)
         """
-        return 1.0 / (1.0 + (1.0 / 3.57) * np.exp(-0.062 * v))
+        return 1.0 / (1.0 + (1.0 / 3.57) * np.exp(np.clip(-0.062 * v, -20.0, 20.0)))
 
 
 @dataclass(frozen=True, kw_only=True)
 class CompetitiveConfig(BaseConfig):
     """k-WTA parameters derived from target sparsity and population size.
 
+    Conductance-based inhibition (Brunel & Wang 2003):
+      ΔV = g_inh × (E_inh − V)
+    Self-limits as V → E_inh (GABA-A reversal = −75 mV).
+
     Key derivation:
       k_winners = ceil(target_sparsity × num_neurons)
-      i_inh = (v_thresh - v_rest) × num_neurons / k_winners × inhibition_strength
-
-    The inhibition strength ensures losers are pushed below rest.
+      g_inh = gap × (N/k) × strength / (V_thresh − E_inh)
+    where denominator = driving force at threshold (20 mV for default params).
+    At V = V_thresh: full inhibitory drive ≡ old heuristic strength.
+    At V → E_inh: drive → 0 (self-limiting, Brunel & Wang 2003).
     """
     target_sparsity: float = 0.15  # Fraction of neurons active per window
-    inhibition_strength: float = 1.5  # Multiplier on i_inh (1.0 = just-sufficient)
+    inhibition_strength: float = 1.5  # Multiplier on g_inh (1.0 = just-sufficient)
     window_ms: float = 100.0  # k-WTA evaluation window (ms)
+    # GABA-A reversal potential (Buhl et al. 1995: −75 ± 3 mV in cortex)
+    e_inh: float = -75.0
 
     def __post_init__(self) -> None:
         assert 0 < self.target_sparsity < 1, f"target_sparsity must be in (0, 1), got {self.target_sparsity}"
@@ -328,19 +398,28 @@ class CompetitiveConfig(BaseConfig):
         return max(1, math.ceil(target_sparsity * num_neurons))
 
     @staticmethod
-    def derive_i_inh(
+    def derive_g_inh(
         gap: float,
+        v_thresh: float,
+        e_inh: float,
         num_neurons: int,
         k_winners: int,
         strength: float = 1.5,
     ) -> float:
-        """Derive inhibition magnitude from biophysics.
+        """Derive inhibitory conductance for conductance-based k-WTA.
 
-        i_inh must push losers below V_rest with margin. Scaled by
-        the ratio N/k to ensure k-WTA dynamics are maintained regardless
-        of population size.
+        Chosen so that at V = V_thresh the inhibitory voltage step equals
+        the old heuristic ``gap × N/k × strength``.  At V → E_inh the
+        driving force vanishes — faithfully modelling GABA-A shunting
+        inhibition (Brunel & Wang 2003).
+
+        g_inh = gap × (N/k) × strength / (V_thresh − E_inh)
+
+        Reference: Brunel & Wang (2003) "What determines the frequency
+        of fast network oscillations with irregular neural discharges?"
         """
-        return gap * (num_neurons / max(k_winners, 1)) * strength
+        driving_force = max(v_thresh - e_inh, 1e-6)
+        return gap * (num_neurons / max(k_winners, 1)) * strength / driving_force
 
 
 # =====================================================================
@@ -742,7 +821,8 @@ class WorkingMemoryConfig(BaseConfig):
 
     Reference: Goldman-Rakic (1995), O'Reilly & Frank (2006)
 
-    tau_m = 300ms for slow sustained dynamics.
+    WM content neurons: τ_m = 300ms for slow sustained dynamics.
+    Gate neurons: striosomal MSNs (O'Reilly & Frank 2006) using AdEx.
     Dual gating: ACh (sensory) AND DA (update signal).
     """
     tau_m: float = 300.0
@@ -762,15 +842,58 @@ class WorkingMemoryConfig(BaseConfig):
     tau_pre: float = 20.0
     tau_post: float = 20.0
 
+    # ── Gate neuron parameters (striosomal MSN; O'Reilly & Frank 2006) ──
+    # Population size: same as BG neurons_per_action (Georgopoulos 1986).
+    # Gate = binary action decision (open/close) by MSN population.
+    # With N=32 and Poisson spike variability, population CV = 1/√N ≈ 0.18,
+    # giving reliable threshold detection (d' > 2 for suprathreshold drive).
+    n_gate: int = 32
+    # MSN Up-state τ = 25ms (Wilson & Kawaguchi 1996; same as BG actor)
+    gate_tau: float = 25.0
+    # AdEx spike initiation (Brette & Gerstner 2005)
+    gate_delta_t: float = 2.0             # mV, spike sharpness
+    gate_v_spike_cutoff: float = -30.0    # mV, spike detection
+    # AdEx adaptation for gate MSNs: moderate spike-frequency adaptation
+    # prevents gate from "ringing" — each spike increases adaptation
+    # current, stabilizing the gate signal (Humphries et al. 2006).
+    gate_tau_w: float = 144.0             # ms, adaptation τ (RS neuron)
+    gate_a: float = 4.0                   # nS, subthreshold adaptation
+    gate_b: float = 80.5                  # pA, spike-triggered adaptation
+    gate_g_L: float = 30.0               # nS, leak conductance (Destexhe & Paré 1999)
+    gate_C_m: float = 281.0              # pF, membrane capacitance (Brette & Gerstner 2005)
+    # Membrane noise: in vivo cortical noise 1-1.5 mV (Destexhe et al. 2003).
+    # Applied as current noise: I_noise ~ N(0, g_L × σ_V) in pA.
+    gate_noise_std: float = 1.0           # mV, same as BG membrane_noise_std
+    # Maximum sustained MSN firing rate: 40 Hz (Humphries et al. 2006;
+    # Planert et al. 2010: up-state MSN in vivo 10-40 Hz).
+    # At dt=1ms: max_rate = 40/1000 = 0.04 spikes/step.
+    # Used to normalise population rate to [0, 1] gate signal.
+    gate_max_rate_hz: float = 40.0        # Hz, MSN sustained maximum
+
     # ── Derived ───────────────────────────────────────────────────────
     mem_decay: float = field(init=False, default=0.0)
     content_decay: float = field(init=False, default=0.0)
+    gate_mem_decay: float = field(init=False, default=0.0)
+    gate_rate_decay: float = field(init=False, default=0.0)
+    gate_w_decay: float = field(init=False, default=0.0)
+    gate_w_gain: float = field(init=False, default=0.0)
+    gate_max_rate_per_step: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
         assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
         assert self.v_reset < self.v_thresh, f"v_reset ({self.v_reset}) must be < v_thresh ({self.v_thresh})"
+        assert self.gate_v_spike_cutoff > self.v_thresh, (
+            f"gate_v_spike_cutoff ({self.gate_v_spike_cutoff}) must be > v_thresh ({self.v_thresh})"
+        )
         object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
         object.__setattr__(self, 'content_decay', self.ctx.decay(self.tau_m))
+        object.__setattr__(self, 'gate_mem_decay', self.ctx.decay(self.gate_tau))
+        object.__setattr__(self, 'gate_rate_decay', self.ctx.decay(self.gate_tau))
+        object.__setattr__(self, 'gate_w_decay', self.ctx.decay(self.gate_tau_w))
+        object.__setattr__(self, 'gate_w_gain', self.ctx.complement(self.gate_tau_w))
+        # max_rate in spikes per dt step
+        object.__setattr__(self, 'gate_max_rate_per_step',
+                           self.gate_max_rate_hz * self.ctx.dt / 1000.0)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -894,16 +1017,13 @@ class ActiveInferenceConfig(BaseConfig):
 class AgentConfig(BaseConfig):
     """Agent-level parameters extracted from snn_agent.py magic numbers.
 
-    These control reward shaping, plasticity gating, exploration dynamics,
-    and sleep scheduling — previously hardcoded in SNNAgent.observe().
+    These control reward shaping, plasticity gating, and sleep
+    scheduling — previously hardcoded in SNNAgent.observe().
     """
     td_clip: float = 50.0                      # gradient clipping on TD error
-    noise_smoothing: float = 0.8               # EMA coefficient for exploration noise
-    min_exploration: float = 0.15              # exploration noise floor
 
     def __post_init__(self) -> None:
         assert self.td_clip > 0, f"td_clip must be positive, got {self.td_clip}"
-        assert 0 < self.min_exploration < 1, f"min_exploration must be in (0, 1), got {self.min_exploration}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -968,8 +1088,13 @@ class BasalGangliaConfig(BaseConfig):
     # by a population, not a single neuron.  Population sum gives robust
     # rate estimates for spike-based action selection.
     neurons_per_action: int = 32
-    # Exploration
-    exploration_noise: float = 0.05
+    # STN-GPe hyperdirect pathway (Frank 2006; Bogacz & Gurney 2007)
+    # Low DA → STN disinhibited → global GPi excitation → all action
+    # channels suppressed → margin shrinks → membrane noise breaks
+    # symmetry → exploratory action.  Replaces ε-greedy.
+    # Multiplicative: at DA=0 currents scaled by (1 - stn_strength × baseline_da).
+    # Only active when DA drops below baseline_da (phasic dip).
+    stn_strength: float = 0.5         # Fraction of current suppressed per unit DA deficit
     # DA pathway-specific modulation (Frank 2005; Surmeier et al. 2007)
     # D1 receptors (Go pathway): DA excites via cAMP↑/PKA → NMDA potentiation
     # D2 receptors (NoGo pathway): DA inhibits via cAMP↓ → reduced excitability
@@ -1125,35 +1250,52 @@ class VTAConfig(BaseConfig):
 _UNITARY_EPSP_MV: float = 0.4 * 70.6 / 30.0  # ≈ 0.94 mV
 _PSP_TARGET_DEFAULT: float = float(_UNITARY_EPSP_MV / np.sqrt(2.0 / np.pi))  # ≈ 1.18 mV
 
+# Conversion factor: mV-equivalent → nS (conductance).
+# From Ohm's law at rest:  I = g × (E_exc − V_rest)
+#   ⇒ g = EPSP × g_L / (E_exc − V_rest)
+# Default: 30 nS / 70 mV ≈ 0.4286 nS per mV-equivalent.
+_G_L_REF: float = 30.0    # Reference leak conductance (nS)
+_E_EXC_REF: float = 0.0   # Excitatory reversal potential (mV)
+_V_REST_REF: float = -70.0  # Reference resting potential (mV)
+_DRIVING_FORCE_REF: float = _E_EXC_REF - _V_REST_REF  # 70 mV
+
 
 def compute_weight_std(
     fan_in: int,
     fan_out: int,
     psp_target: float = _PSP_TARGET_DEFAULT,
     target_rate: float = 0.05,
+    g_L: float = _G_L_REF,
+    driving_force: float = _DRIVING_FORCE_REF,
 ) -> float:
-    """Derive weight initialization std from desired PSP amplitude.
+    """Derive weight initialization std in conductance units (nS).
 
-    σ² = PSP_target² / (fan_in × p_fire)
+    Weights are synaptic conductances: I_syn = g × (E_exc − V).
+    At V = V_rest the PSP is: ΔEPSP = g × (E_exc − V_rest) / g_L = psp_target.
+    Therefore: g = psp_target × g_L / (E_exc − V_rest).
 
-    Ensures that under expected input (fan_in × target_rate active inputs),
-    the total PSP approximates psp_target mV.
+    Under expected input (fan_in × target_rate active), σ is set so
+    the total conductance produces psp_target mV at rest.
 
-    Default psp_target derived from Feldmeyer et al. (2002) unitary
-    EPSP biophysics: g_syn=0.4nS, E_AMPA=0mV, V_rest=−70.6mV,
+    σ_nS = psp_target × g_L / (driving_force × √(fan_in × target_rate))
+
+    Default psp_target from Feldmeyer et al. (2002) unitary EPSP
+    biophysics: g_syn=0.4nS, E_AMPA=0mV, V_rest=−70.6mV,
     g_L=30nS → EPSP≈0.94 mV → psp_target≈1.18 mV.
 
     Args:
-        fan_in:      Number of input connections.
-        fan_out:     Number of output neurons (unused, kept for API).
-        psp_target:  Desired total PSP amplitude (mV).
-        target_rate: Expected fraction of active inputs.
+        fan_in:         Number of input connections.
+        fan_out:        Number of output neurons (unused, kept for API).
+        psp_target:     Desired total PSP amplitude at rest (mV).
+        target_rate:    Expected fraction of active inputs.
+        g_L:            Leak conductance of postsynaptic neuron (nS).
+        driving_force:  E_exc − V_rest (mV), default 70 mV.
 
     Returns:
-        Standard deviation for weight initialization.
+        Standard deviation for weight initialization (nS).
     """
     expected_active = max(1.0, fan_in * target_rate)
-    return psp_target / np.sqrt(expected_active)
+    return psp_target * g_L / (driving_force * np.sqrt(expected_active))
 
 
 def init_weights(
@@ -1162,8 +1304,14 @@ def init_weights(
     psp_target: float = _PSP_TARGET_DEFAULT,
     target_rate: float = 0.05,
     excitatory: bool = True,
+    g_L: float = _G_L_REF,
+    driving_force: float = _DRIVING_FORCE_REF,
 ) -> np.ndarray:
-    """Initialize weights with principled scaling.
+    """Initialize synaptic weights in conductance units (nS).
+
+    Weights represent peak synaptic conductance.  At runtime, current
+    is computed as I_syn = g × (E_rev − V) (Ohm's law), giving
+    voltage-dependent driving force and self-limiting excitation.
 
     Feedforward: w ~ |N(0, σ²)| if excitatory (Dale's law)
     Inhibitory:  w ~ -|N(0, σ²)| (Dale's law: w ≤ 0)
@@ -1171,16 +1319,19 @@ def init_weights(
     Default psp_target from unitary EPSP biophysics (Feldmeyer 2002).
 
     Args:
-        fan_in:      Input dimension.
-        fan_out:     Output dimension.
-        psp_target:  Desired PSP (mV).
-        target_rate: Expected input activity.
-        excitatory:  If True, weights ≥ 0 (Dale's law).
+        fan_in:         Input dimension.
+        fan_out:        Output dimension.
+        psp_target:     Desired PSP at rest (mV).
+        target_rate:    Expected input activity.
+        excitatory:     If True, weights ≥ 0 (Dale's law).
+        g_L:            Postsynaptic leak conductance (nS).
+        driving_force:  E_exc − V_rest (mV).
 
     Returns:
-        Weight matrix (fan_in, fan_out), dtype float32.
+        Weight matrix (fan_in, fan_out), dtype float32, units nS.
     """
-    std = compute_weight_std(fan_in, fan_out, psp_target, target_rate)
+    std = compute_weight_std(fan_in, fan_out, psp_target, target_rate,
+                             g_L=g_L, driving_force=driving_force)
     w = np.random.normal(0.0, std, (fan_in, fan_out)).astype(np.float32)
     if excitatory:
         w = np.abs(w)

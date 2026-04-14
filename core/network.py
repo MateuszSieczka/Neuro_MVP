@@ -563,10 +563,14 @@ class NetworkGraph:
         if not outputs:
             return False
 
-        all_rates = []
+        # Weighted mean (total spikes / total neurons) so small layers
+        # like the 2-neuron actor don't dominate the rate estimate.
+        total_spikes = 0
+        total_neurons = 0
         for spikes in outputs.values():
-            all_rates.append(float(np.mean(spikes)))
-        mean_rate = float(np.mean(all_rates))
+            total_spikes += int(np.sum(spikes > 0))
+            total_neurons += spikes.size
+        mean_rate = total_spikes / max(total_neurons, 1)
 
         if self.oscillator.check_seizure(mean_rate, baseline_rate):
             # Force global hyperpolarization: zero all layer outputs

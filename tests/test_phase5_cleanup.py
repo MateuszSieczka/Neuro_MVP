@@ -231,12 +231,18 @@ class TestPSPBiophysics:
         )
 
     def test_single_synapse_epsp_reasonable(self):
-        """With a single active synapse, expected weight ≈ unitary EPSP."""
+        """With a single active synapse, expected weight ≈ unitary conductance (nS).
+
+        compute_weight_std now returns nS (conductance).  The expected
+        single-synapse weight E[|N(0,σ)|] should match the unitary
+        conductance g_syn = EPSP × g_L / driving_force ≈ 0.40 nS.
+        """
         std = compute_weight_std(fan_in=1, fan_out=1)
         expected_single_w = std * np.sqrt(2.0 / np.pi)  # E[|N(0,σ)|]
-        # Should be close to the unitary EPSP
+        # Unitary conductance: EPSP × g_L / driving_force
+        g_syn_expected = _UNITARY_EPSP_MV * 30.0 / 70.0  # nS
         np.testing.assert_allclose(
-            expected_single_w, _UNITARY_EPSP_MV, rtol=0.01,
+            expected_single_w, g_syn_expected, rtol=0.01,
         )
 
 

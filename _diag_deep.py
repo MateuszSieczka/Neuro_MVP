@@ -39,8 +39,8 @@ def diagnose_single_button(n_episodes=300):
     print(f"Critic hidden: {bg.hidden_size}")
     print(f"Neurons per action: {bg.neurons_per_action}")
     print(f"Actor dim: {agent.actor.action_dim}")
-    print(f"Critic input gain: {agent.critic._input_gain:.4f}")
-    print(f"Actor input gain: {agent.actor._input_gain:.4f}")
+    print(f"Critic cond scale: {agent.critic._cond_scale:.4f}")
+    print(f"Actor cond scale: {agent.actor._cond_scale:.4f}")
     print(f"Actor D2 gain comp: {agent.actor._d2_gain_comp:.4f}")
 
     # D1/D2 modulation at baseline DA

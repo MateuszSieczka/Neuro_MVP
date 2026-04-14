@@ -154,10 +154,15 @@ class TestWTADeterminism:
         assert actor._last_net_evidence is not None
 
     def test_argmax_matches_net_evidence(self, actor: D1D2Actor) -> None:
-        """Selected action == argmax of net_evidence."""
+        """Selected action is one of the max-evidence actions."""
         state = np.random.random(10).astype(np.float32)
         action = _run_substeps(actor, state, 25)
-        assert action == int(np.argmax(actor._last_net_evidence))
+        ev = actor._last_net_evidence
+        max_ev = ev.max()
+        winners = set(np.flatnonzero(ev == max_ev).tolist())
+        assert action in winners, (
+            f"action {action} not in winners {winners} (evidence={ev})"
+        )
 
 
 # =====================================================================
@@ -227,6 +232,7 @@ class TestActionEntropy:
 
     def test_entropy_zero_when_dominant(self, actor: D1D2Actor) -> None:
         """Strong bias → margin large → entropy below 1.0 (initial)."""
+        np.random.seed(7)  # deterministic — avoid suite-order flakiness
         state = _make_biased_input(
             10, actor.n_per_action, actor.motor_dim,
             0, actor.w_d1, bias_factor=15.0,
@@ -269,9 +275,10 @@ class TestOpALPathway:
         d1_change = np.sum(np.abs(actor.w_d1 - d1_before))
         d2_change = np.sum(np.abs(actor.w_d2 - d2_before))
         assert d1_change > 1e-4, "D1 should change meaningfully on positive TD"
-        # D2 may drift from continuous homeostasis (Turrigiano 2004),
-        # but this should be negligible vs the D1 STDP update.
-        assert d2_change < max(d1_change * 0.5, 0.05), (
+        # D2 may drift from continuous homeostasis (Turrigiano 2004)
+        # and from the hybrid eligibility voltage floor (Phase 2),
+        # but D1 should still dominate the weight change.
+        assert d2_change < max(d1_change * 0.7, 0.05), (
             f"D2 should not change more than D1 on positive TD: "
             f"D2={d2_change:.4f}, D1={d1_change:.4f}"
         )
@@ -290,9 +297,10 @@ class TestOpALPathway:
 
         d1_change = np.sum(np.abs(actor.w_d1 - d1_before))
         d2_change = np.sum(np.abs(actor.w_d2 - d2_before))
-        # D1 may drift from continuous homeostasis (Turrigiano 2004),
-        # but this should be negligible vs the D2 STDP update.
-        assert d1_change < max(d2_change * 0.5, 0.05), (
+        # D1 may drift from continuous homeostasis (Turrigiano 2004)
+        # and from the hybrid eligibility voltage floor (Phase 2),
+        # but D2 should still dominate the weight change.
+        assert d1_change < max(d2_change * 0.7, 0.05), (
             f"D1 should not change more than D2 on negative TD: "
             f"D1={d1_change:.4f}, D2={d2_change:.4f}"
         )
@@ -502,10 +510,12 @@ class TestEligibilityNaturalGating:
         )
 
     def test_gate_eligibility_removed_from_api(self) -> None:
-        """gate_eligibility still exists as a method but is no longer
-        called in the agent.  We verify it exists but could be deprecated."""
-        # Method still exists for backward compatibility
-        assert hasattr(D1D2Actor, 'gate_eligibility')
+        """gate_eligibility has been removed — voltage-based eligibility
+        handles credit assignment naturally (Phase 2 HACK B)."""
+        assert not hasattr(D1D2Actor, 'gate_eligibility'), (
+            "gate_eligibility should be removed — voltage-based eligibility "
+            "naturally gates credit via InhibitoryPool suppression"
+        )
 
 
 # =====================================================================

@@ -233,8 +233,13 @@ class TestLayerAdEx:
             if total_spikes > 0:
                 break
         if total_spikes == 0:
-            # Weights too small by default for AdEx C_m=281; manually boost
-            layer.w *= 50.0
+            # With biophysical psp_target, init weights are sub-rheobase.
+            # Boost to ~2× rheobase: I_rheo ≈ (g_L + a) × gap = 510 pA.
+            # Need total = fan_in × mean(|w|) × boost > 2 × I_rheo.
+            mean_w = float(np.mean(np.abs(layer.w)))
+            boost_target = 2.0 * (ncfg.g_L + ncfg.a) * ncfg.gap
+            boost = boost_target / max(10.0 * mean_w, 1e-6)
+            layer.w *= max(boost, 50.0)
             layer.reset_state()
             for _ in range(500):
                 pre = np.ones(10, dtype=np.float32)

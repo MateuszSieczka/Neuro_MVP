@@ -203,22 +203,30 @@ def aggregate_receptor_effects(
         gain_mod scales membrane excitability / input current.
         plasticity_mod scales STDP learning rate.
 
-    Simple summation: each receptor's effect already encodes sign × density
-    × Hill response × r_max.  No arbitrary per-receptor weights needed.
+    Multiplicative integration (Seamans & Yang 2004; Silver 2010):
+    Each receptor subtype acts through an independent G-protein cascade
+    (Gs, Gi, Gq), so their effects on membrane conductance compose
+    multiplicatively:  gain = ∏(1 + effect_i).
+    This correctly captures diminishing returns when multiple excitatory
+    or inhibitory pathways are co-active, and avoids the pathological
+    cancellation seen with additive models (Doya 2002).
     Plasticity receptors: D1, Beta-NE, M1, HT2A (Surmeier 2007).
     """
-    # All receptors contribute to gain
-    gain_delta = sum(effects.values())
-    gain_mod = max(1.0 + gain_delta, 0.1)
+    # All receptors contribute to gain — multiplicative composition
+    gain_mod = 1.0
+    for eff in effects.values():
+        gain_mod *= (1.0 + eff)
+    gain_mod = max(gain_mod, 0.1)
 
     # Plasticity-relevant receptors (Surmeier et al. 2007)
     _PLASTICITY_RECEPTORS = {
         ReceptorType.D1, ReceptorType.BETA,
         ReceptorType.M1, ReceptorType.HT2A,
     }
-    plast_delta = sum(
-        eff for rt, eff in effects.items() if rt in _PLASTICITY_RECEPTORS
-    )
-    plasticity_mod = max(1.0 + plast_delta, 0.1)
+    plasticity_mod = 1.0
+    for rt, eff in effects.items():
+        if rt in _PLASTICITY_RECEPTORS:
+            plasticity_mod *= (1.0 + eff)
+    plasticity_mod = max(plasticity_mod, 0.1)
 
     return gain_mod, plasticity_mod

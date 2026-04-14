@@ -250,19 +250,23 @@ class SNNAgent(Agent):
         )
         _headroom_c = 1.0 / _denom_c
         _headroom_a = 1.0 / _denom_a
-        # Recompute input gains with dynamic headroom
-        from core.basal_ganglia import _derive_input_gain
-        self.critic._input_gain = _derive_input_gain(
+        # Update forward-time conductance scale for dynamic headroom.
+        # Scale is applied in forward(), not baked into weights, so
+        # simply overwriting _cond_scale suffices (no weight rescaling).
+        from core.basal_ganglia import _derive_conductance_scale
+        self.critic._cond_scale = _derive_conductance_scale(
             bg_input_size, self.critic._ncfg,
             self._bg_config.w_clip_critic,
             mean_input_rate=_mean_input_rate,
             headroom=_headroom_c,
+            actual_mean_w=self.critic._init_mean_w,
         )
-        self.actor._input_gain = _derive_input_gain(
+        self.actor._cond_scale = _derive_conductance_scale(
             bg_input_size, self.actor._ncfg,
             self._bg_config.w_clip,
             mean_input_rate=_mean_input_rate,
             headroom=_headroom_a,
+            actual_mean_w=self.actor._init_mean_w,
         )
 
     # ------------------------------------------------------------------
@@ -420,6 +424,7 @@ class SNNAgent(Agent):
         # ── Set DA / epistemic drive BEFORE graph step ────────────────
         da_level = float(np.clip(self.neuromod.dopamine, 0.0, 1.0))
         self.actor.set_da_level(da_level)
+        self.actor.set_tonic_da_level(self.neuromod.tonic_da)
 
         if self._use_wm:
             self.actor.set_epistemic_drive(
@@ -459,24 +464,15 @@ class SNNAgent(Agent):
         # inhibit VTA DA neurons during observe() (Eshel et al. 2015).
         self.vta.store_prediction(self.critic.activation)
 
-        # WTA dynamics naturally gate eligibility: the winning action's
-        # MSNs are most depolarised → highest voltage-based eligibility.
-        # Losing actions are suppressed by the InhibitoryPool → near-rest
-        # membrane → near-zero eligibility.  No explicit zeroing needed
-        # (Wang 2002; Wickens et al. 2003).
+        # WTA dynamics bias eligibility toward the winning action,
+        # and explicit action gating in D1D2Actor.update() ensures
+        # only the responding MSN population receives three-factor
+        # plasticity (Frank 2005; Wickens et al. 2003).
         action = self.actor.get_action()
 
-        # ── STN-mediated exploration (Frank 2006; Wiecki & Frank 2013) ─
-        # Low tonic DA disinhibits STN → global GPi excitation → all
-        # thalamic channels suppressed → selection reverts to noise.
-        # Modelled as ε-greedy: ε = f(DA, 5-HT) from neuromodulatory
-        # state.  As DA rises with learning, ε → min_exploration.
-        _epsilon = self.bg.compute_exploration_noise(
-            serotonin=float(np.clip(self.neuromod.serotonin, 0.0, 1.0)),
-            tonic_da=float(np.clip(self.neuromod.dopamine, 0.0, 1.0)),
-        )
-        if np.random.random() < _epsilon:
-            action = int(np.random.randint(self.n_actions))
+        # Exploration is emergent from STN-GPe pathway (Frank 2006):
+        # low DA → STN tonic activity → global inhibition → margin
+        # shrinks → membrane noise breaks symmetry.  No ε-greedy.
 
         return action
 
@@ -571,14 +567,9 @@ class SNNAgent(Agent):
         # Both receive the same Tobler-normalized signal.
         self.critic.update(td_error_normed)
 
-        # Action-channel eligibility gating (Redgrave et al. 2010;
-        # Schultz 2006): DA modifies corticostriatal synapses only
-        # at the selected action channel.  The BG circuit organizes
-        # D1/D2-MSNs in action-specific populations, and the
-        # thalamocortical feedback loop re-excites only the winning
-        # channel during the post-decision window.  Without gating,
-        # DA equally strengthens all actions → no action discrimination.
-        self.actor.gate_eligibility(action)
+        # Action-gated eligibility (Frank 2005; Wickens et al. 2003):
+        # update() masks eligibility to the chosen action's MSNs before
+        # applying three-factor STDP weight changes.
         self.actor.update(td_error_normed)
 
         # ── 5. World model + neuromodulator update ────────────────────
@@ -592,6 +583,7 @@ class SNNAgent(Agent):
                 prediction_error=pred_error,
                 td_error=td_error_normed,
                 novelty=self._last_curiosity,
+                reward=reward,
             )
 
             # WM plasticity
@@ -620,6 +612,7 @@ class SNNAgent(Agent):
                 prediction_error=np.array([norm_pe], dtype=np.float32),
                 td_error=td_error_normed,
                 novelty=sensory_novelty,
+                reward=reward,
             )
 
         # ── 6. Tonic DA now updated per-step inside neuromod.update() ──
@@ -763,16 +756,5 @@ class _BGFacade:
         self.critic.set_plasticity_timescales(ne)
         self.actor.set_plasticity_timescales(ne)
 
-    def compute_exploration_noise(
-        self,
-        serotonin: float,
-        tonic_da: float,
-    ) -> float:
-        min_exploration = self._agent_cfg.min_exploration
-        # DA and 5-HT suppress exploration proportionally.
-        # Floor = baseline level: even at maximum neuromodulator,
-        # exploration never drops below the resting-state noise.
-        # baseline_da=0.5, baseline_sero=0.6 from NeuromodulatorConfig.
-        da_noise = max(1.0 - tonic_da, 0.0)
-        sero_noise = max(1.0 - serotonin, 0.0)
-        return max(min_exploration, da_noise * sero_noise)
+    # compute_exploration_noise() removed — Phase 2 HACK A.
+    # Exploration is now emergent from STN-GPe pathway in D1D2Actor.

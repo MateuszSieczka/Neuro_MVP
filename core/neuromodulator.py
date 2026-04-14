@@ -74,6 +74,7 @@ class NeuromodulatorSystem:
         prediction_error: NDArray[np.float32],
         td_error: float = 0.0,
         novelty: float | None = None,
+        reward: float = 0.0,
     ) -> None:
         """Update per-step neuromodulator levels."""
         cfg = self.config
@@ -139,12 +140,25 @@ class NeuromodulatorSystem:
             + stability * (1.0 - cfg.sero_decay)
         )
 
-        # ── Tonic DA: continuous leaky integrator (Grace 1991) ────────
-        # Integrates |RPE| over ~60s window. No episode boundary needed.
-        rpe_abs = float(np.clip(abs(td_error), 0.0, 1.0))
+        # ── Tonic DA: average reward rate (Niv et al. 2007; Grace 1991) ─
+        # Tonic VTA DA firing rate tracks the average reward rate in
+        # the environment, NOT |RPE| (which converges to 0 as V → V*).
+        # Rich environment → high tonic DA → D1 bias → exploitation.
+        # Poor/unknown environment → low tonic DA → D2 bias → caution.
+        #
+        # Raw reward is transformed through the DA neuron f–I curve
+        # (logistic with unit gain; Dreyer et al. 2010 Fig 2).  The
+        # logistic σ(r) = 1/(1+exp(−r)) is parameter-free and maps
+        # reward in natural units to bounded firing rate (0, 1).
+        # DA neurons fire at 2–8 Hz baseline with bursts to ~20 Hz
+        # (Grace 1991), i.e. ~10× dynamic range, consistent with
+        # σ mapping ±3 units to 5–95% of output.
+        # τ_tonic ≈ 60 s (Grace 1991): minute-scale integration.
+        _r_clipped = float(np.clip(reward, -20.0, 20.0))  # overflow guard
+        reward_signal = float(1.0 / (1.0 + np.exp(-_r_clipped)))
         self.tonic_da = (
             self.tonic_da * cfg.tonic_da_decay
-            + rpe_abs * (1.0 - cfg.tonic_da_decay)
+            + reward_signal * (1.0 - cfg.tonic_da_decay)
         )
 
         # ── Stagnation tracking (ACC) ─────────────────────────────────

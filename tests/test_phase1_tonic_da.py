@@ -55,19 +55,26 @@ class TestTonicDAStabilisation:
             f"tonic_da should stabilise: was {tda_snapshot}, now {nm.tonic_da}"
         )
 
-    def test_zero_rpe_decays_to_zero(self, nm: NeuromodulatorSystem) -> None:
-        """With zero td_error, tonic_da should decay toward baseline (0)."""
-        # First prime it
+    def test_zero_rpe_decays_to_baseline(self, nm: NeuromodulatorSystem) -> None:
+        """With zero reward, tonic_da should converge to σ(0)=0.5.
+
+        Niv et al. (2007): tonic DA reflects average reward rate.
+        Zero reward → σ(0)=0.5 (DA neuron f–I curve baseline).
+        """
+        # First prime it with positive reward (need ~3τ = 180s = 180k steps)
         pe = np.array([0.5], dtype=np.float32)
-        for _ in range(10_000):
-            nm.update(prediction_error=pe, td_error=1.0)
-        assert nm.tonic_da > 0.01
+        for _ in range(200_000):
+            nm.update(prediction_error=pe, td_error=1.0, reward=1.0)
+        assert nm.tonic_da > 0.5
 
-        # Now let it decay
+        # Now let it relax with zero reward
         for _ in range(300_000):
-            nm.update(prediction_error=np.zeros(1, dtype=np.float32), td_error=0.0)
+            nm.update(prediction_error=np.zeros(1, dtype=np.float32), td_error=0.0, reward=0.0)
 
-        assert nm.tonic_da < 0.01, f"tonic_da should decay near zero, got {nm.tonic_da}"
+        # σ(0) = 0.5: the DA neuron's baseline output for zero input
+        assert abs(nm.tonic_da - 0.5) < 0.05, (
+            f"tonic_da should converge to σ(0)≈0.5, got {nm.tonic_da}"
+        )
 
 
 # =====================================================================
@@ -76,21 +83,26 @@ class TestTonicDAStabilisation:
 
 class TestTonicDARelaxation:
     def test_reward_switch(self, nm: NeuromodulatorSystem) -> None:
-        """After switching RPE magnitude, tonic_da should relax to new equilibrium."""
+        """After switching reward magnitude, tonic_da should relax to new equilibrium.
+
+        Niv et al. (2007): tonic DA tracks average reward rate.
+        High reward → σ(r) > 0.5 → high tonic DA (exploitation).
+        Low reward → σ(r) ≈ 0.5 → lower tonic DA (caution).
+        """
         pe = np.array([0.5], dtype=np.float32)
 
-        # Phase 1: high RPE
+        # Phase 1: high reward
         for _ in range(200_000):
-            nm.update(prediction_error=pe, td_error=0.8)
+            nm.update(prediction_error=pe, td_error=0.8, reward=1.0)
         high_eq = nm.tonic_da
 
-        # Phase 2: low RPE
+        # Phase 2: low reward
         for _ in range(200_000):
-            nm.update(prediction_error=pe, td_error=0.1)
+            nm.update(prediction_error=pe, td_error=0.1, reward=0.1)
         low_eq = nm.tonic_da
 
         assert low_eq < high_eq, (
-            f"tonic_da should be lower with smaller RPE: high={high_eq}, low={low_eq}"
+            f"tonic_da should be lower with smaller reward: high={high_eq}, low={low_eq}"
         )
 
 

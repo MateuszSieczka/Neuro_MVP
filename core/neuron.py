@@ -157,11 +157,13 @@ class AdExLayer:
             num_neurons, dtype=np.float32,
         )
 
-        # ── Synaptic weights ──────────────────────────────────────────
+        # ── Synaptic weights (nS conductance) ─────────────────────────
         self.w: NDArray[np.float32] = init_weights(
             num_inputs, num_neurons,
-            psp_target=self.neuron_cfg.gap * 0.15,  # ~15% of gap per synapse
+            psp_target=self.neuron_cfg.psp_target,
             excitatory=excitatory,
+            g_L=self.neuron_cfg.g_L,
+            driving_force=self.neuron_cfg.driving_force_exc,
         )
 
         # ── STDP traces (Bi & Poo 2001) ──────────────────────────────
@@ -288,8 +290,9 @@ class AdExLayer:
             self.channels.decay()
             current = self.channels.compute_current(self.v)
         else:
-            # Instantaneous current-based model
-            current = pre_f32 @ self.w  # (num_neurons,)
+            # Instantaneous conductance-based model: I = g × (E_exc − V)
+            g_exc = pre_f32 @ self.w  # total excitatory conductance (nS)
+            current = g_exc * (ncfg.e_exc - self.v)  # pA
 
         # 4. AdEx membrane integration via Exponential Euler
         # F(V) = (1/C_m) * [-g_L*(V-E_L) + g_L*Δ_T*exp((V-V_T)/Δ_T) + I - w]
@@ -404,12 +407,13 @@ class AdExLayer:
         Every ``_scaling_interval`` steps, rescale:
             w_col *= target_norm / actual_norm
         where target_norm = initial column-wise L2 norm (approximated
-        from init std × sqrt(fan_in)).
+        from init std × sqrt(fan_in)), in nS conductance units.
         """
         col_norms = np.linalg.norm(self.w, axis=0)
+        ncfg = self.neuron_cfg
         target = np.sqrt(float(self.num_inputs)) * (
-            self.neuron_cfg.gap * 0.15
-            / np.sqrt(max(1.0, self.num_inputs * 0.05))
+            ncfg.psp_target * ncfg.g_L
+            / (ncfg.driving_force_exc * np.sqrt(max(1.0, self.num_inputs * 0.05)))
         )
         scale = np.where(col_norms > 1e-8, target / col_norms, 1.0)
         # Soft scaling — move 10% toward target per event

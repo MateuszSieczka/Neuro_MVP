@@ -51,16 +51,19 @@ class CompetitiveLIFLayer(LIFLayer):
         self.comp_cfg = comp_cfg or CompetitiveConfig()
         self._homeo_kwta = homeo_cfg or HomeostaticConfig()
 
-        # Derive k and i_inh from config + population size
+        # Derive k and g_inh from config + population size
         self.k_winners: int = CompetitiveConfig.derive_k(
             self.comp_cfg.target_sparsity, num_neurons,
         )
-        self.i_inh: float = CompetitiveConfig.derive_i_inh(
+        self.g_inh: float = CompetitiveConfig.derive_g_inh(
             gap=ncfg.gap,
+            v_thresh=ncfg.v_thresh,
+            e_inh=self.comp_cfg.e_inh,
             num_neurons=num_neurons,
             k_winners=self.k_winners,
             strength=self.comp_cfg.inhibition_strength,
         )
+        self._e_inh: float = self.comp_cfg.e_inh
 
         # Parent gets NO homeostatic config — we manage it ourselves
         super().__init__(
@@ -125,9 +128,9 @@ class CompetitiveLIFLayer(LIFLayer):
     def _apply_proactive_inhibition(self) -> None:
         """GABAergic tonic inhibition: penalise over-active neurons.
 
-        For each neuron, excess = spikes - expected_share. Neurons with
-        excess > 0 receive inhibitory current proportional to excess, scaled
-        so the per-step force is independent of window length.
+        Conductance-based (Brunel & Wang 2003): ΔV = g × (E_inh − V).
+        Self-limits as V → E_inh.  At V_thresh the effect matches the
+        original heuristic; at rest it is weaker (driving force ratio).
         """
         if self._current_window_size == 0 or self.k_winners >= self.num_neurons:
             return
@@ -139,15 +142,21 @@ class CompetitiveLIFLayer(LIFLayer):
             0.0,
             self.window_spike_counts.astype(np.float32) - expected,
         )
-        inhibition = excess * (self.i_inh / self._current_window_size)
-        self.v -= inhibition
+        g_scaled = excess * (self.g_inh / self._current_window_size)
+        self.v += g_scaled * (self._e_inh - self.v)
+        # Clamp at E_inh: explicit step with large g can overshoot
+        self.v = np.maximum(self.v, self._e_inh)
 
     # ------------------------------------------------------------------
     # Lateral inhibition at window boundary (k-WTA evaluation)
     # ------------------------------------------------------------------
 
     def _apply_lateral_inhibition(self) -> None:
-        """End-of-window k-WTA: push losers below rest, zero their traces."""
+        """End-of-window k-WTA: push losers toward E_inh, zero their traces.
+
+        Conductance-based (Brunel & Wang 2003): ΔV = g_inh × (E_inh − V).
+        Cannot push below GABA-A reversal potential (−75 mV).
+        """
         if self.k_winners >= self.num_neurons:
             return
         if np.max(self.window_spike_counts) == 0:
@@ -163,7 +172,9 @@ class CompetitiveLIFLayer(LIFLayer):
         no_spike = self.window_spike_counts == 0
         losers |= no_spike
 
-        self.v[losers] -= self.i_inh
+        self.v[losers] += self.g_inh * (self._e_inh - self.v[losers])
+        # Clamp at E_inh: explicit step with g > 1 can overshoot
+        self.v[losers] = np.maximum(self.v[losers], self._e_inh)
         self.e[:, losers] = 0.0
         self.x_post[losers] = 0.0
         self.refrac_count[losers] = 0

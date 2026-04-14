@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import ErrorNeuronConfig, NeuronConfig, init_weights
+from .config import ErrorNeuronConfig, NeuronConfig, SynapseConfig, init_weights
 from .free_energy import _broadcast_precision
 
 if TYPE_CHECKING:
@@ -89,22 +89,34 @@ class ErrorNeuronLayer:
         )
 
         # ── Synaptic weights (principled init) ────────────────────────
-        gap = abs(v_thresh - v_rest)
+        # PSP target from NeuronConfig biophysics (Feldmeyer et al. 2002).
+        # Recurrent (error↔state) pathways are 1.3× stronger than
+        # feedforward — typical of cortical feedback (Covic & Sherman 2011).
+        psp_ff = self._ncfg.psp_target
+        psp_rec = psp_ff * 1.3
+        _gL = self._ncfg.g_L
+        _df = self._ncfg.driving_force_exc
 
         # W_bu: error → state (bottom-up error correction)
         self.w_bu: NDArray[np.float32] = init_weights(
-            self.n_error, self.n_state, psp_target=gap * 0.2,
+            self.n_error, self.n_state, psp_target=psp_rec,
+            g_L=_gL, driving_force=_df,
         )
 
         # W_td: state → error (top-down generative model)
         self.w_td: NDArray[np.float32] = init_weights(
-            self.n_state, self.n_error, psp_target=gap * 0.2,
+            self.n_state, self.n_error, psp_target=psp_rec,
+            g_L=_gL, driving_force=_df,
         )
 
         # W_in: input → error (feedforward drive)
         self.w_in: NDArray[np.float32] = init_weights(
-            n_input, self.n_error, psp_target=gap * 0.15,
+            n_input, self.n_error, psp_target=psp_ff,
+            g_L=_gL, driving_force=_df,
         )
+
+        # ── Inhibitory reversal for signed error current ──────────────
+        self._e_inh: float = SynapseConfig(ctx=cfg.ctx).e_inh
 
         # ── Eligibility traces ────────────────────────────────────────
         self.e_bu: NDArray[np.float32] = np.zeros_like(self.w_bu)
@@ -217,11 +229,23 @@ class ErrorNeuronLayer:
         cfg = self.config
 
         # ── Prediction from state rates (generative model) ───────────
-        prediction = self.state_rate @ self.w_td  # (n_error,)
+        prediction = self.state_rate @ self.w_td  # (n_error,) nS
 
         # ── Error neuron drive: ACh-gated feedforward − prediction ────
-        feedforward = inp @ self.w_in  # (n_error,)
-        error_input = (self._ach_gain * feedforward - prediction) * self._receptor_gain
+        feedforward = inp @ self.w_in  # (n_error,) nS
+        # Conductance difference (nS): positive = excitatory, negative = inhibitory
+        g_error = (self._ach_gain * feedforward - prediction) * self._receptor_gain
+
+        # Signed error → conductance-based current (Ohm's law)
+        # Positive error ⇒ excitatory: I = g × (E_exc − V)
+        # Negative error ⇒ inhibitory: I = |g| × (E_inh − V) (GABA reversal)
+        ncfg = self._ncfg
+        pos_g = np.maximum(g_error, 0.0)
+        neg_g = np.maximum(-g_error, 0.0)
+        error_input = (
+            pos_g * (ncfg.e_exc - self.v_error)
+            + neg_g * (self._e_inh - self.v_error)
+        )
 
         # ── Error neuron AdEx (fast τ) ────────────────────────────────
         in_refrac_e = self.refrac_error > 0
@@ -247,7 +271,8 @@ class ErrorNeuronLayer:
 
         # ── State neuron drive: bottom-up error correction ────────────
         error_signal = self.spikes_error.astype(np.float32)
-        state_input = error_signal @ self.w_bu  # (n_state,)
+        g_bu = error_signal @ self.w_bu  # (n_state,) nS
+        state_input = g_bu * (ncfg.e_exc - self.v_state)  # pA
 
         # ── State neuron AdEx (slow τ) ────────────────────────────────
         in_refrac_s = self.refrac_state > 0

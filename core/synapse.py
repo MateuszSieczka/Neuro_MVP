@@ -52,11 +52,20 @@ class SynapticChannels:
         self.config = config or SynapseConfig()
         self.n_post = n_post
 
-        # Conductance trace per channel (n_post,)
+        # Decay-phase conductance traces per channel (n_post,)
         self.g_ampa: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
         self.g_nmda: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
         self.g_gaba_a: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
         self.g_gaba_b: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+
+        # Rise-phase traces (dual-exponential, Destexhe et al. 1998)
+        # Effective conductance = g_decay - g_rise after normalisation.
+        # Spikes increment both; rise decays faster → difference gives
+        # the characteristic rise-then-decay synaptic waveform.
+        self.g_ampa_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+        self.g_nmda_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+        self.g_gaba_a_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+        self.g_gaba_b_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
 
     def receive_excitatory(
         self,
@@ -66,18 +75,24 @@ class SynapticChannels:
         """Process presynaptic excitatory spikes through AMPA + NMDA channels.
 
         AMPA/NMDA ratio from config (default 3:1, Myme et al. 2003).
-        Spike → instantaneous conductance increment proportional to weight.
+        Spike increments both decay and rise traces by w × N (normalisation
+        factor from Destexhe et al. 1998) so that peak conductance = w.
 
         Args:
             pre_spikes: (n_pre,) spike vector.
             w: (n_pre, n_post) weight matrix.
         """
-        # Total excitatory drive
         drive = pre_spikes.astype(np.float32) @ w  # (n_post,)
-        ratio = self.config.ampa_nmda_ratio
+        cfg = self.config
+        ratio = cfg.ampa_nmda_ratio
         total = ratio + 1.0
-        self.g_ampa += drive * (ratio / total)
-        self.g_nmda += drive * (1.0 / total)
+        ampa_drive = drive * (ratio / total)
+        nmda_drive = drive * (1.0 / total)
+        # Both decay and rise traces get the same norm-scaled increment
+        self.g_ampa += ampa_drive * cfg.ampa_norm
+        self.g_ampa_rise += ampa_drive * cfg.ampa_norm
+        self.g_nmda += nmda_drive * cfg.nmda_norm
+        self.g_nmda_rise += nmda_drive * cfg.nmda_norm
 
     def receive_inhibitory(
         self,
@@ -93,15 +108,30 @@ class SynapticChannels:
             gaba_b_ratio: Fraction of inhibition via GABA-B (Isaacson 2011).
         """
         drive = inh_spikes.astype(np.float32) @ w_ie  # (n_post,)
-        self.g_gaba_a += drive * (1.0 - gaba_b_ratio)
-        self.g_gaba_b += drive * gaba_b_ratio
+        cfg = self.config
+        ga_drive = drive * (1.0 - gaba_b_ratio)
+        gb_drive = drive * gaba_b_ratio
+        self.g_gaba_a += ga_drive * cfg.gaba_a_norm
+        self.g_gaba_a_rise += ga_drive * cfg.gaba_a_norm
+        self.g_gaba_b += gb_drive * cfg.gaba_b_norm
+        self.g_gaba_b_rise += gb_drive * cfg.gaba_b_norm
 
     def decay(self) -> None:
-        """Apply exponential decay to all conductance channels."""
-        self.g_ampa *= self.config.ampa_decay
-        self.g_nmda *= self.config.nmda_decay
-        self.g_gaba_a *= self.config.gaba_a_decay
-        self.g_gaba_b *= self.config.gaba_b_decay
+        """Apply exponential decay to all conductance channels.
+
+        Both decay-phase and rise-phase traces decay independently.
+        Effective conductance = g_decay - g_rise (computed in
+        compute_current).
+        """
+        cfg = self.config
+        self.g_ampa *= cfg.ampa_decay
+        self.g_nmda *= cfg.nmda_decay
+        self.g_gaba_a *= cfg.gaba_a_decay
+        self.g_gaba_b *= cfg.gaba_b_decay
+        self.g_ampa_rise *= cfg.ampa_rise_decay
+        self.g_nmda_rise *= cfg.nmda_rise_decay
+        self.g_gaba_a_rise *= cfg.gaba_a_rise_decay
+        self.g_gaba_b_rise *= cfg.gaba_b_rise_decay
 
     def compute_current(
         self,
@@ -109,14 +139,11 @@ class SynapticChannels:
     ) -> NDArray[np.float32]:
         """Compute total synaptic current from all channels (Ohm's law).
 
-        Conductance-based model with reversal potentials:
-          I_exc = (g_ampa + g_nmda × B(V)) × (V - E_exc)
-          I_inh = (g_gaba_a + g_gaba_b) × (V - E_inh)
-          I_total = I_exc + I_inh
-
-        At V < E_exc (0 mV): excitatory current is negative (depolarizing
-        in the convention dV/dt ~ -I, or depolarizing if we add I to V
-        with the driving force providing correct sign).
+        Dual-exponential kinetics (Destexhe et al. 1998):
+          g_eff = g_decay − g_rise  (difference gives rise-then-decay shape)
+        Conductance-based current with reversal potentials:
+          I_exc = (g_ampa_eff + g_nmda_eff × B(V)) × (E_exc − V)
+          I_inh = (g_gaba_a_eff + g_gaba_b_eff) × (E_inh − V)
 
         Reference: Jahr & Stevens (1990), Destexhe et al. (1998)
 
@@ -128,18 +155,21 @@ class SynapticChannels:
         """
         cfg = self.config
 
+        # Effective conductances: decay trace − rise trace (≥ 0 by construction)
+        g_ampa_eff = np.maximum(self.g_ampa - self.g_ampa_rise, 0.0)
+        g_nmda_eff = np.maximum(self.g_nmda - self.g_nmda_rise, 0.0)
+        g_gaba_a_eff = np.maximum(self.g_gaba_a - self.g_gaba_a_rise, 0.0)
+        g_gaba_b_eff = np.maximum(self.g_gaba_b - self.g_gaba_b_rise, 0.0)
+
         # NMDA voltage-dependent Mg²⁺ block (Jahr & Stevens 1990)
         mg_block = SynapseConfig.nmda_mg_block(v_post)
 
-        # Excitatory: driving force (V - E_exc), E_exc = 0 mV
-        # At rest V=-70 mV → (V - 0) = -70 → g × (-70) is negative
-        # We want depolarizing = positive, so negate: I = g × (E_exc - V)
-        g_exc = self.g_ampa + self.g_nmda * mg_block
+        # Excitatory: I = g × (E_exc − V) → positive at rest (depolarizing)
+        g_exc = g_ampa_eff + g_nmda_eff * mg_block
         i_exc = g_exc * (cfg.e_exc - v_post)
 
-        # Inhibitory: driving force toward E_inh = -75 mV
-        # At rest V=-70 mV → (E_inh - V) = -75 - (-70) = -5 → hyperpolarizing
-        g_inh = self.g_gaba_a + self.g_gaba_b
+        # Inhibitory: I = g × (E_inh − V) → negative at rest (hyperpolarizing)
+        g_inh = g_gaba_a_eff + g_gaba_b_eff
         i_inh = g_inh * (cfg.e_inh - v_post)
 
         return i_exc + i_inh
@@ -150,3 +180,7 @@ class SynapticChannels:
         self.g_nmda.fill(0.0)
         self.g_gaba_a.fill(0.0)
         self.g_gaba_b.fill(0.0)
+        self.g_ampa_rise.fill(0.0)
+        self.g_nmda_rise.fill(0.0)
+        self.g_gaba_a_rise.fill(0.0)
+        self.g_gaba_b_rise.fill(0.0)

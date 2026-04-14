@@ -440,6 +440,7 @@ class SNNDeepCritic:
             self.spikes_hidden.astype(np.float32), v_exc=self.v_hidden,
         )
         self.v_hidden -= inh_current
+        np.clip(self.v_hidden, -90.0, None, out=self.v_hidden)  # K+ reversal floor
 
         self.refrac_hidden[self.spikes_hidden] = cfg.refrac_period
 
@@ -1086,6 +1087,7 @@ class D1D2Actor:
             self.spikes_d1.astype(np.float32), v_exc=self.v_d1,
         )
         self.v_d1 -= inh_d1
+        np.clip(self.v_d1, -90.0, None, out=self.v_d1)  # K+ reversal floor
 
         self.spikes_d1 = (self.v_d1 >= ncfg.v_spike_cutoff) & ~in_refrac_d1
         self.v_d1[self.spikes_d1] = ncfg.v_reset
@@ -1116,6 +1118,7 @@ class D1D2Actor:
             self.spikes_d2.astype(np.float32), v_exc=self.v_d2,
         )
         self.v_d2 -= inh_d2
+        np.clip(self.v_d2, -90.0, None, out=self.v_d2)  # K+ reversal floor
 
         self.spikes_d2 = (self.v_d2 >= ncfg.v_spike_cutoff) & ~in_refrac_d2
         self.v_d2[self.spikes_d2] = ncfg.v_reset
@@ -1420,6 +1423,19 @@ class D1D2Actor:
             scale = 1.0 + _alpha_h * rate_err
             w *= scale[np.newaxis, :]
             np.maximum(w, 0.0, out=w)  # Maintain Dale's law
+
+        # ── Per-column norm clipping (Sabatini et al. 2002) ───────────
+        # PSD surface area limits total receptor count per dendritic
+        # spine.  The init-time clip (1.5× mean_col_norm) is tight for
+        # symmetry breaking.  During learning, allow 10× growth before
+        # clipping — enough for reliable D1/D2 discrimination while
+        # preventing runaway drift (D2 has no LTD pathway).
+        _learn_clip = self._w_clip_nS * 10.0
+        for w_mat in (self.w_d1, self.w_d2):
+            for j in range(self.action_dim):
+                col_norm = float(np.linalg.norm(w_mat[:, j]))
+                if col_norm > _learn_clip:
+                    w_mat[:, j] *= _learn_clip / col_norm
 
     def get_action(self) -> int:
         return self._last_action

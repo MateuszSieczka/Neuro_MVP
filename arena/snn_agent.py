@@ -477,14 +477,6 @@ class SNNAgent(Agent):
                 self.world_model.encoder.prediction_error_rate,
             )
 
-        # ── WM gating (soft sigmoid) ─────────────────────────────────
-        if self._use_working_memory:
-            wm_da = max(self.neuromod.learning_rate_modulation, 0.0)
-            self.working_memory.gate(
-                ach_level=self.neuromod.bottom_up_gain,
-                da_level=wm_da,
-            )
-
         # ── Pass NE level for temperature-modulated exploration ──────
         self.actor.set_ne_level(self.neuromod.competition_sharpness)
 
@@ -495,6 +487,15 @@ class SNNAgent(Agent):
         # biologically realistic trial-to-trial variability.
         self.actor.reset_spike_counts()  # New decision cycle (Lo & Wang 2006)
         for _sub in range(self._n_substeps):
+            # WM gate integrates in real time alongside content neurons.
+            # Gate AdEx MSNs need ~20 ms to reach threshold from rest
+            # (Brette & Gerstner 2005), so single-call gating fails.
+            if self._use_working_memory:
+                wm_da = max(self.neuromod.learning_rate_modulation, 0.0)
+                self.working_memory.gate(
+                    ach_level=self.neuromod.bottom_up_gain,
+                    da_level=wm_da,
+                )
             encoded = self._poisson.encode(pop_rates)
             sensory = self._build_sensory_inputs(encoded, state_f32)
             self.network.step(
@@ -733,7 +734,12 @@ class SNNAgent(Agent):
         # dynamics handle adaptation (Tobler et al. 2005).
         # ATP-triggered sleep enables continuous learning without
         # episode boundaries (Kann & Kovács 2007; plan step 4.5).
-        _should_sleep = done or self._needs_sleep()
+        # Sleep is triggered ONLY by metabolic depletion (_needs_sleep),
+        # not by episode boundaries.  Episode-boundary sleep conflates
+        # task segmentation (an RL artefact) with the homeostatic drive
+        # that biology uses.  For WM-dependent tasks, replaying without
+        # WM content would overwrite online cue→action associations.
+        _should_sleep = self._needs_sleep()
         if _should_sleep and self._use_wm and len(self.replay_buffer) > 0:
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,

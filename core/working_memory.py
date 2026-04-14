@@ -68,16 +68,37 @@ class WorkingMemoryModule:
         )
 
         # ── Synaptic weights (nS, conductance-based; Feldmeyer 2002) ─
+        # WM receives sparse low-dimensional input (raw state, not
+        # population-coded): typically 1-3 out of N inputs active per
+        # step.  Each synapse must be strong enough that 2 active inputs
+        # approach threshold.  Calibrate PSP to gap/2 so that 2 co-active
+        # inputs produce ~gap mV total depolarisation → threshold.
+        # This matches thalamic→PFC unitary EPSPs: 5-10 mV
+        # (Cruikshank et al. 2012; Gil & Bhatt 1999).
+        _wm_psp = cfg.gap / 2.0
         self.w_ff: NDArray[np.float32] = init_weights(
             num_external_inputs, num_neurons,
-            psp_target=cfg.psp_target,
+            psp_target=_wm_psp,
             excitatory=True,
             g_L=cfg.g_L,
             driving_force=cfg.driving_force_exc,
         )
-        self.w_lateral: NDArray[np.float32] = np.zeros(
-            (num_neurons, num_neurons), dtype=np.float32,
+        # Recurrent connectivity for attractor dynamics (Compte et al.
+        # 2000; Goldman-Rakic 1995).  PFC persistent activity requires
+        # pre-existing recurrent excitation — lateral weights cannot
+        # bootstrap from zero because without firing there is no
+        # Hebbian learning signal (chicken-and-egg problem).
+        # Lateral PSP scaled to gap/3: recurrent alone shouldn't cause
+        # runaway firing, but 3 co-active neighbours → threshold.
+        _lat_psp = cfg.gap / 3.0
+        self.w_lateral: NDArray[np.float32] = init_weights(
+            num_neurons, num_neurons,
+            psp_target=_lat_psp,
+            excitatory=True,
+            g_L=cfg.g_L,
+            driving_force=cfg.driving_force_exc,
         )
+        np.fill_diagonal(self.w_lateral, 0.0)  # No autapses (no self-connections)
 
         # ── Eligibility traces ────────────────────────────────────────
         self.e: NDArray[np.float32] = np.zeros(
@@ -104,8 +125,14 @@ class WorkingMemoryModule:
         # channel — gate is a binary action: open/close).
         ng = cfg.n_gate
         self._n_gate: int = ng
+        # Gate MSNs initialise in up-state (Wilson & Kawaguchi 1996;
+        # Stern et al. 1998): V ≈ V_T − 2 mV.  In-vivo MSNs
+        # alternate between down-state (−80 mV) and up-state
+        # (−55 mV); starting in up-state lets the gate respond
+        # within 2-3 ms when ACh × DA drive arrives.
+        _gate_v_init = cfg.v_thresh - 2.0  # up-state
         self._gate_v: NDArray[np.float32] = np.full(
-            ng, cfg.v_rest, dtype=np.float32,
+            ng, _gate_v_init, dtype=np.float32,
         )
         self._gate_spikes: NDArray[np.bool_] = np.zeros(ng, dtype=bool)
         self._gate_refrac: NDArray[np.int32] = np.zeros(ng, dtype=np.int32)
@@ -118,14 +145,21 @@ class WorkingMemoryModule:
         self._gate_mem_decay: float = cfg.gate_mem_decay
         self._gate_rate_decay: float = cfg.gate_rate_decay
         # Drive calibration: at both thresholds, total synaptic current
-        # should just reach AdEx rheobase.
+        # should just reach AdEx rheobase + steady-state adaptation.
         # AdEx rheobase ≈ g_L × (V_T - E_L - Δ_T) (Brette & Gerstner 2005)
         # where the -Δ_T accounts for the exponential spike initiation
         # lowering the effective threshold.
+        # Adaptation at threshold: w_eq = a × (V_T - E_L) — the steady-
+        # state subthreshold adaptation current that builds up as V
+        # approaches V_T.  Without this term, the gate current balances
+        # against rheobase but the accumulated adaptation absorbs the
+        # margin, creating a stable sub-threshold equilibrium where
+        # gate neurons can never spike (observed: V stalls at ~-55 mV).
         _g_L_eff = cfg.gate_C_m / cfg.gate_tau
         _gap = cfg.v_thresh - cfg.v_rest  # 15 mV
         _i_rheo = _g_L_eff * (_gap - cfg.gate_delta_t)
-        self._gate_drive: float = _i_rheo / (
+        _w_adapt_at_thresh = cfg.gate_a * _gap
+        self._gate_drive: float = (_i_rheo + _w_adapt_at_thresh) / (
             max(cfg.ach_gate_threshold, 0.01) * max(cfg.da_gate_threshold, 0.01)
         )
         self._gate_signal: float = 0.0
@@ -425,8 +459,9 @@ class WorkingMemoryModule:
         self._gate_signal = 0.0
         self._ach_level = 0.0
         self._da_level = 0.0
-        # Reset gate neuron state
-        self._gate_v.fill(self.config.v_rest)
+        # Reset gate neuron state — up-state init (Wilson & Kawaguchi 1996)
+        _gate_v_init = self.config.v_thresh - 2.0
+        self._gate_v.fill(_gate_v_init)
         self._gate_spikes.fill(False)
         self._gate_refrac.fill(0)
         self._gate_rate.fill(0.0)

@@ -311,15 +311,17 @@ class TMazeEnv(Environment):
                                                ↙       ↘
                                            [left]     [right]
 
-    At reset, a cue is shown (state[0]=0 or 1) indicating which arm
-    has the reward (+10).  During corridor traversal the cue disappears.
+    At reset, a cue is shown indicating which arm has the reward (+10).
+    During corridor traversal the cue disappears.
     At the junction, the agent must remember the cue and choose correctly.
 
     Actions:  0 = move forward / go left,  1 = move forward / go right
       - In corridor cells: both actions move forward.
       - At junction: 0 = left, 1 = right.
 
-    State:  [cue, position_onehot(5)]  → 6D total.
+    State:  [cue_left, cue_right, position_onehot(5)]  → 7D total.
+      Cue channels are one-hot encoded so both cue values produce active
+      signals for spike-based learning (absence of signal = zero eligibility).
       Position 0=start (cue visible), 1-2=corridor, 3=junction, 4=terminal.
 
     Reward: +10 at correct arm, -1 at wrong arm, -0.1 per step.
@@ -347,12 +349,16 @@ class TMazeEnv(Environment):
             return self._make_state(), reward, True, {"cue": self._cue, "pos": self._pos, "correct": correct}
 
     def _make_state(self) -> np.ndarray:
-        s = np.zeros(6, dtype=np.float32)
-        # Cue is only visible at start position
+        s = np.zeros(7, dtype=np.float32)
+        # One-hot cue encoding: both cue=0 and cue=1 produce active
+        # signals.  s[0]=1 means "left correct", s[1]=1 means "right
+        # correct".  Without this, cue=0 → s[0]=0.0 is indistinguishable
+        # from the corridor (no cue) and generates zero eligibility in
+        # spike-based STDP (pre_binary = state > 0.5 → no spike → no trace).
         if self._pos == 0:
-            s[0] = float(self._cue)
+            s[self._cue] = 1.0      # s[0] or s[1]
         pos_idx = min(self._pos, 4)
-        s[1 + pos_idx] = 1.0
+        s[2 + pos_idx] = 1.0
         return s
 
     @property
@@ -361,7 +367,7 @@ class TMazeEnv(Environment):
 
     @property
     def state_size(self) -> int:
-        return 6
+        return 7
 
 
 # =====================================================================

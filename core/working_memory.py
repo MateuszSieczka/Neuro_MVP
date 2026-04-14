@@ -4,11 +4,15 @@ Working Memory — prefrontal attractor dynamics with dual ACh+DA gating.
 Reference:
   Goldman-Rakic (1995)  Prefrontal persistent activity
   O'Reilly & Frank (2006)  "Making working memory work"
+  Durstewitz et al. (2000)  "Neurocomputational models of working memory"
+  Compte et al. (2000)  Synaptic mechanisms of persistent activity
 
 Changes from legacy:
   1. Dual gating: ACh (sensory) AND DA (update signal) — conjunction gate
-  2. Uses WorkingMemoryConfig from config.py (derived mem_decay, content_decay)
+  2. Uses WorkingMemoryConfig from config.py (derived decays)
   3. Gate opens only when BOTH ACh ≥ threshold AND DA ≥ threshold
+  4. Content neurons: AdEx with PFC-like slow adaptation (τ_w=300ms)
+  5. Conductance-based synapses: I = g × (E_exc - V) (Ohm's law)
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import WorkingMemoryConfig
+from .config import WorkingMemoryConfig, init_weights
 
 
 class WorkingMemoryModule:
@@ -53,11 +57,19 @@ class WorkingMemoryModule:
         )
         self.has_spiked: NDArray[np.bool_] = np.zeros(num_neurons, dtype=bool)
         self.refrac_count: NDArray[np.int32] = np.zeros(num_neurons, dtype=np.int32)
+        # AdEx adaptation current (Durstewitz et al. 2000)
+        self.w_adapt: NDArray[np.float32] = np.zeros(
+            num_neurons, dtype=np.float32,
+        )
 
-        # ── Synaptic weights ──────────────────────────────────────────
-        self.w_ff: NDArray[np.float32] = np.random.uniform(
-            0.1, 0.5, (num_external_inputs, num_neurons),
-        ).astype(np.float32)
+        # ── Synaptic weights (nS, conductance-based; Feldmeyer 2002) ─
+        self.w_ff: NDArray[np.float32] = init_weights(
+            num_external_inputs, num_neurons,
+            psp_target=cfg.psp_target,
+            excitatory=True,
+            g_L=cfg.g_L,
+            driving_force=cfg.driving_force_exc,
+        )
         self.w_lateral: NDArray[np.float32] = np.zeros(
             (num_neurons, num_neurons), dtype=np.float32,
         )
@@ -74,7 +86,6 @@ class WorkingMemoryModule:
         )
 
         # ── Precomputed decays from config ────────────────────────────
-        self._mem_decay: float = cfg.mem_decay
         self._trace_decay: float = cfg.ctx.decay(cfg.tau_e)
         self._pre_decay: float = cfg.ctx.decay(cfg.tau_pre)
         self._post_decay: float = cfg.ctx.decay(cfg.tau_post)
@@ -226,46 +237,77 @@ class WorkingMemoryModule:
     # ------------------------------------------------------------------
 
     def forward(self, external_input: NDArray[np.float32]) -> NDArray[np.float32]:
-        """One timestep of WM dynamics.
+        """One timestep of WM dynamics with AdEx integration.
 
-        Feedforward current scaled by soft gate signal [0, 1].
+        Feedforward conductance scaled by soft gate signal [0, 1].
         Recurrent attractor always active for content maintenance.
+        Conductance-based: I = g × (E_exc - V) (Ohm's law).
+        AdEx: exponential spike initiation + spike-frequency adaptation
+        with PFC-like slow τ_w=300ms (Durstewitz et al. 2000).
 
         Returns:
             (num_neurons,) spike array as float32.
         """
         cfg = self.config
         gate = self._gate_signal
+        ctx = cfg.ctx
 
         # ── Trace decay ───────────────────────────────────────────────
         self.x_pre *= self._pre_decay
         self.x_post *= self._post_decay
 
-        # ── Input current (scaled by soft gate + receptor gain) ─────
+        # ── Conductance-based input (scaled by gate + receptor gain) ──
         ext_f32 = external_input.astype(np.float32)
-        external_current = gate * self._receptor_gain * (ext_f32 @ self.w_ff)
+        g_ff = gate * self._receptor_gain * (ext_f32 @ self.w_ff)  # nS
+        I_ff = g_ff * (cfg.e_exc - self.v)                         # pA
         self.x_pre += np.clip(ext_f32, 0.0, 1.0) * gate
 
         # Recurrent contribution always active (attractor maintenance)
-        recurrent_current = (
-            self.content @ self.w_lateral * cfg.lateral_strength
-        )
-        total_current = external_current + recurrent_current
+        # Lateral weights are Hebbian [0, 1]; treat as conductance gain
+        g_rec = self.content @ self.w_lateral * cfg.lateral_strength  # nS
+        I_rec = g_rec * (cfg.e_exc - self.v)                         # pA
 
-        # ── LIF integration ───────────────────────────────────────────
+        I_syn = I_ff + I_rec
+
+        # ── AdEx membrane integration (Brette & Gerstner 2005) ────────
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1
 
-        integrated_v = (
-            self.v * self._mem_decay
-            + (cfg.v_rest + total_current) * (1.0 - self._mem_decay)
+        inv_Cm = 1.0 / cfg.C_m
+        exp_term = np.exp(np.clip(
+            (self.v - cfg.v_thresh) / cfg.delta_t,
+            -20.0, 10.0,
+        ))
+        F = inv_Cm * (
+            -cfg.g_L * (self.v - cfg.v_rest)
+            + cfg.g_L * cfg.delta_t * exp_term
+            + I_syn - self.w_adapt
         )
-        self.v = np.where(in_refrac, cfg.v_reset, integrated_v)
-        self.has_spiked = (self.v >= cfg.v_thresh) & ~in_refrac
+        J = inv_Cm * (-cfg.g_L + cfg.g_L * exp_term)
 
+        # Exponential Euler step (same integrator as rest of network)
+        dt = ctx.dt
+        Jdt = J * dt
+        Jdt_clipped = np.clip(Jdt, -20.0, 20.0)
+        integrated = np.where(
+            np.abs(Jdt) > 1e-6,
+            self.v + F / J * (np.exp(Jdt_clipped) - 1.0),
+            self.v + F * dt,
+        )
+        self.v = np.where(in_refrac, cfg.v_reset, integrated)
+
+        # ── Spike detection at v_spike_cutoff ─────────────────────────
+        self.has_spiked = (self.v >= cfg.v_spike_cutoff) & ~in_refrac
         self.v[self.has_spiked] = cfg.v_reset
         self.refrac_count[self.has_spiked] = cfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
+
+        # ── Adaptation current w: τ_w dw/dt = a(V-E_L) - w; w += b ──
+        self.w_adapt[self.has_spiked] += cfg.b
+        self.w_adapt = (
+            self.w_adapt * cfg.w_decay
+            + cfg.a * (self.v - cfg.v_rest) * cfg.w_gain
+        )
 
         # ── Eligibility traces (feedforward, gate-scaled) ───────────
         self.e *= self._trace_decay
@@ -340,6 +382,7 @@ class WorkingMemoryModule:
     def reset_state(self) -> None:
         """Reset transient state. Learned weights preserved."""
         self.v.fill(self.config.v_rest)
+        self.w_adapt.fill(0.0)
         self.e.fill(0.0)
         self.x_pre.fill(0.0)
         self.x_post.fill(0.0)

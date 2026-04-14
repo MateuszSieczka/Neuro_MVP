@@ -1,11 +1,11 @@
 """
 PredictiveCodingLayer — extends CompetitiveLIFLayer with PC mechanics.
 
-Reference: Friston (2010), Rao & Ballard (1999), Hasselmo (2006)
+Reference: Friston (2010), Rao & Ballard (1999), Hasselmo (2006), Bogacz (2017)
 
 Changes from legacy:
   1. Convergence-checked relaxation loop (Lipschitz-bounded step size)
-     replaces fixed 10 iterations × 0.1 rate.
+     iterates belief update 3-5× per dt before spike generation.
   2. ACh modulates bottom-up / top-down balance via M1 receptor activation.
   3. Feedback weights use init_weights() for principled scaling.
   4. No duplicated STDP trace management — delegates to parent.
@@ -102,13 +102,16 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
     # ------------------------------------------------------------------
 
     def forward(self, pre_spikes: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Single-step predictive coding with AdEx dynamics.
+        """Predictive coding with relaxation loop + AdEx dynamics.
 
-        One dt step:
-          1. Feedforward drive + prediction error gradient.
-          2. AdEx membrane integration via Exponential Euler.
-          3. Spike detection + adaptation.
-          4. Update feedback prediction.
+        Per timestep dt:
+          1. Feedforward drive (once).
+          2. Inner relaxation loop (Bogacz 2017): iteratively refine
+             belief (rate proxy r) until prediction error converges.
+             Step size bounded by 1/L (Lipschitz, from feedback_w).
+          3. Use converged error gradient for I_syn.
+          4. AdEx membrane integration via Exponential Euler.
+          5. Spike detection + adaptation + STDP traces.
 
         Returns:
             (num_neurons,) float spike array.
@@ -124,18 +127,39 @@ class PredictiveCodingLayer(CompetitiveLIFLayer):
         # ── Proactive inhibition (continuous k-WTA) ───────────────────
         self._apply_proactive_inhibition()
 
-        # ── Single-step prediction error gradient ─────────────────────
+        # ── Relaxation loop (Rao & Ballard 1999; Bogacz 2017) ────────
+        # Rate proxy from current membrane state
         r = np.clip(
             (self.v - ncfg.v_rest) / ncfg.gap,
             0.0, 1.0,
         )
-        my_prediction = r @ self.feedback_w
-        self.prediction_error = pre_f32 - my_prediction
+        # Lipschitz-bounded step size: η = 1 / ||W^T W|| ≈ 1 / ||W||_F²/n
+        # Ensures gradient descent on F(r) = 0.5‖x - rW‖² is stable.
+        w_norm_sq = max(float(np.sum(self.feedback_w ** 2)), 1e-6)
+        step_size = min(float(self.feedback_w.shape[0]) / w_norm_sq, 0.5)
 
-        # ACh-weighted gradient (Hasselmo 2006)
-        error_gradient = self.prediction_error @ self.feedback_w.T
+        n_relax = self.pc_cfg.n_relax_steps
+        tol = self.pc_cfg.relax_tolerance
+
+        for _ in range(n_relax):
+            my_prediction = r @ self.feedback_w
+            error = pre_f32 - my_prediction
+            error_gradient = error @ self.feedback_w.T
+            dr = step_size * (
+                self.ach_level * error_gradient
+                + (1.0 - self.ach_level) * self.top_down_prediction
+            )
+            r = np.clip(r + dr, 0.0, 1.0)
+            # Convergence check
+            if float(np.max(np.abs(dr))) < tol:
+                break
+
+        # Final prediction error from converged belief
+        self.prediction_error = pre_f32 - r @ self.feedback_w
+
+        # Converged error gradient for membrane drive
         combined = (
-            self.ach_level * error_gradient
+            self.ach_level * (self.prediction_error @ self.feedback_w.T)
             + (1.0 - self.ach_level) * self.top_down_prediction
         )
 

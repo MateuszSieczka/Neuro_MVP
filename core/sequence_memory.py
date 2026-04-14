@@ -24,9 +24,13 @@ from .config import SequenceMemoryConfig
 class SequenceMemory:
     """Temporal sequence learning via spike-timing transition weights.
 
-    DG-like pattern separation (Rolls 2013): random projection into
+    DG-like pattern separation (Rolls 2013): plastic projection into
     expanded space + competitive k-WTA thresholding before Hebbian
     outer product. Prevents attractor collapse from overlapping inputs.
+
+    DG projection learns via competitive Hebbian learning (Rolls 2013;
+    Treves & Rolls 1994): dw = lr × outer(sparse_output, input).
+    This improves pattern separation compared to fixed random projection.
 
     W[i, j] = how strongly neuron j at time t predicts neuron i at t+1.
     Learning rule: dW = lr × outer(post_t, pre_{t-1})
@@ -51,6 +55,11 @@ class SequenceMemory:
             rng.randn(num_neurons, self._expanded_size).astype(np.float32)
             / np.sqrt(num_neurons)
         )
+        # Store initial column norm for Oja-like normalisation
+        self._init_col_norm: NDArray[np.float32] = np.maximum(
+            np.linalg.norm(self._w_dg, axis=0, keepdims=True),
+            1e-8,
+        ).astype(np.float32)
 
         self.transition_w: NDArray[np.float32] = np.zeros(
             (self._expanded_size, self._expanded_size), dtype=np.float32,
@@ -72,8 +81,21 @@ class SequenceMemory:
             return np.zeros(self._expanded_size, dtype=np.float32)
         # k-WTA: keep top-k, zero rest
         threshold = np.partition(projected, -self._k)[-self._k]
-        sparse = np.where(projected >= threshold, projected, 0.0)
-        return sparse.astype(np.float32)
+        sparse = np.where(projected >= threshold, projected, 0.0).astype(
+            np.float32,
+        )
+        # Competitive Hebbian learning (Rolls 2013; Treves & Rolls 1994):
+        # Winners strengthen their input connections → better pattern
+        # separation over time.  Column-normalised to prevent runaway.
+        dg_lr = self.config.dg_learning_rate
+        if dg_lr > 0 and np.any(sparse > 0):
+            dw = dg_lr * np.outer(pattern, sparse)  # (n_in, expanded)
+            self._w_dg += dw
+            # Column normalisation: keep ||column|| constant (Oja-like)
+            col_norms = np.linalg.norm(self._w_dg, axis=0, keepdims=True)
+            col_norms = np.maximum(col_norms, 1e-8)
+            self._w_dg *= (self._init_col_norm / col_norms)
+        return sparse
 
     def observe(self, current_pattern: NDArray[np.float32]) -> NDArray[np.float32]:
         """Record pattern and learn transition from previous."""

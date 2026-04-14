@@ -430,18 +430,24 @@ class CompetitiveConfig(BaseConfig):
 class PredictiveCodingConfig(BaseConfig):
     """Predictive Coding layer parameters.
 
-    Reference: Friston (2010), Rao & Ballard (1999)
+    Reference: Friston (2010), Rao & Ballard (1999), Bogacz (2017)
 
-    Single-step dynamics matching the spiking paradigm:
-      v += ACh × error_gradient + (1-ACh) × top_down
-    No inner relaxation loops.
+    Inner relaxation loop converges prediction error before membrane
+    integration.  Belief state (rate proxy r) is iteratively updated:
+      r ← r + η × (ACh × ∇_r ε + (1-ACh) × top_down)
+    where η = 1 / L (Lipschitz-bounded step, L estimated from W).
+    Bogacz (2017): 3-5 iterations typically sufficient for convergence.
     """
     feedback_strength: float = 0.5
     feedback_learning_rate: float = 0.005
     feedback_norm: bool = True
+    # Relaxation loop (Bogacz 2017)
+    n_relax_steps: int = 3           # Inner iterations per forward()
+    relax_tolerance: float = 1e-3    # Convergence: max|Δr| < tol → stop
 
     def __post_init__(self) -> None:
         assert self.feedback_learning_rate > 0, f"feedback_learning_rate must be positive, got {self.feedback_learning_rate}"
+        assert self.n_relax_steps >= 1, f"n_relax_steps must be >= 1, got {self.n_relax_steps}"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -459,6 +465,8 @@ class PyramidalConfig(BaseConfig):
       burst → 3-5× STDP eligibility boost
     """
     tau_apical: float = 150.0       # Apical membrane τ (ms) — was 50, should be 100-200
+    apical_delay_ms: int = 5        # Apical-to-soma propagation delay (ms)
+                                    # Stuart & Spruston (1998): 5-10 ms
     apical_threshold: float = 0.3   # Normalized Ca²⁺ spike threshold
     apical_boost: float = 10.0      # Somatic threshold reduction (mV) during plateau
     burst_stdp_factor: float = 3.0  # Payeur et al.: 3-5× boost
@@ -819,17 +827,37 @@ class AttentionConfig(BaseConfig):
 class WorkingMemoryConfig(BaseConfig):
     """Working Memory prefrontal attractor dynamics.
 
-    Reference: Goldman-Rakic (1995), O'Reilly & Frank (2006)
+    Reference: Goldman-Rakic (1995), O'Reilly & Frank (2006),
+               Durstewitz et al. (2000) "Neurocomputational models of WM"
 
-    WM content neurons: τ_m = 300ms for slow sustained dynamics.
+    WM content neurons: AdEx with PFC-like slow adaptation for sustained
+    firing (Durstewitz et al. 2000; Compte et al. 2000).
+      τ_w = 300 ms — slow spike-frequency adaptation allows persistent
+        activity without run-away.  Durstewitz et al. (2000) Table 1.
+      a = 2 nS  — mild subthreshold conductance (PFC intrinsic properties,
+        Hempel et al. 2000).
+      b = 20 pA — moderate spike-triggered adaptation; small enough to
+        allow sustained >5 Hz firing in attractor regime.
+        Compte et al. (2000) Fig. 3: PFC RS cells sustain 8–15 Hz.
     Gate neurons: striosomal MSNs (O'Reilly & Frank 2006) using AdEx.
     Dual gating: ACh (sensory) AND DA (update signal).
     """
-    tau_m: float = 300.0
+    # ── Content neuron AdEx membrane params (PFC pyramidal) ───────────
     v_rest: float = -70.0
     v_thresh: float = -55.0
     v_reset: float = -75.0
     refrac_period: int = 2
+    delta_t: float = 2.0             # mV, spike sharpness (Brette & Gerstner 2005)
+    v_spike_cutoff: float = -30.0    # mV, spike detection
+    g_L: float = 30.0                # nS, leak conductance (Destexhe & Paré 1999)
+    C_m: float = 281.0               # pF, membrane capacitance
+    # PFC-specific slow adaptation (Durstewitz et al. 2000; Compte et al. 2000)
+    tau_w: float = 300.0             # ms, SLOW adaptation for persistent activity
+    a: float = 2.0                   # nS, mild subthreshold (Hempel et al. 2000)
+    b: float = 20.0                  # pA, moderate spike-triggered
+    # Conductance-based synapse params
+    e_exc: float = 0.0               # mV, AMPA/NMDA reversal
+    g_syn_unitary: float = 0.43      # nS (Feldmeyer et al. 2002)
     # Gating thresholds (O'Reilly & Frank 2006: conjunction gate)
     ach_gate_threshold: float = 0.5
     da_gate_threshold: float = 0.4
@@ -871,8 +899,14 @@ class WorkingMemoryConfig(BaseConfig):
     gate_max_rate_hz: float = 40.0        # Hz, MSN sustained maximum
 
     # ── Derived ───────────────────────────────────────────────────────
-    mem_decay: float = field(init=False, default=0.0)
+    # Content neuron AdEx-derived
+    w_decay: float = field(init=False, default=0.0)
+    w_gain: float = field(init=False, default=0.0)
     content_decay: float = field(init=False, default=0.0)
+    psp_target: float = field(init=False, default=0.0)
+    driving_force_exc: float = field(init=False, default=0.0)
+    gap: float = field(init=False, default=0.0)
+    # Gate-derived
     gate_mem_decay: float = field(init=False, default=0.0)
     gate_rate_decay: float = field(init=False, default=0.0)
     gate_w_decay: float = field(init=False, default=0.0)
@@ -880,13 +914,30 @@ class WorkingMemoryConfig(BaseConfig):
     gate_max_rate_per_step: float = field(init=False, default=0.0)
 
     def __post_init__(self) -> None:
-        assert self.tau_m > 0, f"tau_m must be positive, got {self.tau_m}"
         assert self.v_reset < self.v_thresh, f"v_reset ({self.v_reset}) must be < v_thresh ({self.v_thresh})"
+        assert self.delta_t > 0, f"delta_t must be positive, got {self.delta_t}"
+        assert self.v_spike_cutoff > self.v_thresh, (
+            f"v_spike_cutoff ({self.v_spike_cutoff}) must be > v_thresh ({self.v_thresh})"
+        )
         assert self.gate_v_spike_cutoff > self.v_thresh, (
             f"gate_v_spike_cutoff ({self.gate_v_spike_cutoff}) must be > v_thresh ({self.v_thresh})"
         )
-        object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
-        object.__setattr__(self, 'content_decay', self.ctx.decay(self.tau_m))
+        assert self.tau_w > 0, f"tau_w must be positive, got {self.tau_w}"
+        assert self.g_L > 0, f"g_L must be positive, got {self.g_L}"
+        assert self.C_m > 0, f"C_m must be positive, got {self.C_m}"
+        # Content neuron AdEx adaptation decay
+        object.__setattr__(self, 'w_decay', self.ctx.decay(self.tau_w))
+        object.__setattr__(self, 'w_gain', self.ctx.complement(self.tau_w))
+        # Content decay for attractor trace (slow, same as effective τ)
+        # τ_eff for PFC ≈ C_m / g_L = 281/30 ≈ 9.4 ms (membrane)
+        # Content trace is slower: use tau_w for attractor stability
+        object.__setattr__(self, 'content_decay', self.ctx.decay(self.tau_w))
+        # Conductance-based PSP target (Feldmeyer 2002)
+        psp = self.g_syn_unitary * (self.e_exc - self.v_rest) / self.g_L
+        object.__setattr__(self, 'psp_target', psp)
+        object.__setattr__(self, 'driving_force_exc', self.e_exc - self.v_rest)
+        object.__setattr__(self, 'gap', abs(self.v_thresh - self.v_rest))
+        # Gate AdEx-derived
         object.__setattr__(self, 'gate_mem_decay', self.ctx.decay(self.gate_tau))
         object.__setattr__(self, 'gate_rate_decay', self.ctx.decay(self.gate_tau))
         object.__setattr__(self, 'gate_w_decay', self.ctx.decay(self.gate_tau_w))
@@ -928,6 +979,10 @@ class SequenceMemoryConfig(BaseConfig):
     # DG-like pattern separation (D5)
     expansion_factor: int = 4     # DG expansion ratio (Rolls 2013)
     sparsity_k: float = 0.1       # Fraction of active neurons after k-WTA
+    # DG Hebbian plasticity (Rolls 2013; Treves & Rolls 1994):
+    # DG granule cells learn input patterns via competitive Hebbian
+    # learning, improving pattern separation over random projection.
+    dg_learning_rate: float = 0.001  # Slow: DG learns over many exposures
 
     def __post_init__(self) -> None:
         assert self.learning_rate > 0, f"learning_rate must be positive, got {self.learning_rate}"

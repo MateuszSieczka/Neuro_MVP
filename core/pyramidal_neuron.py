@@ -126,6 +126,21 @@ class PyramidalLayer(CompetitiveLIFLayer):
         # ── ACh modulation ────────────────────────────────────────────
         self._ach_apical_scale: float = 1.0
 
+        # ── Apical delay buffer (Stuart & Spruston 1998) ─────────────
+        # Ring buffer: stores last `apical_delay_ms` timesteps of
+        # top-down prediction.  At each step the oldest entry is
+        # consumed as apical input, implementing propagation delay.
+        # Buffer size = delay + 1: write-then-read gives N-1 step
+        # delay, so +1 yields exact target delay.
+        delay_steps = max(1, int(self.pyr_cfg.apical_delay_ms / ncfg.ctx.dt))
+        buf_size = delay_steps + 1
+        self._apical_delay_len: int = buf_size
+        self._apical_delay_steps: int = delay_steps
+        self._apical_delay_buf: NDArray[np.float32] = np.zeros(
+            (buf_size, num_neurons), dtype=np.float32,
+        )
+        self._apical_delay_idx: int = 0
+
     # ------------------------------------------------------------------
     # Core dynamics
     # ------------------------------------------------------------------
@@ -146,8 +161,17 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.t_since_pre_spike[pre_binary > 0.5] = 0
         self.t_since_post_spike += 1
 
-        # ── 1. Apical integration (passive, slow) ────────────────────
-        apical_current = self.top_down_prediction.astype(np.float32)
+        # ── 1. Apical integration with delay (Stuart & Spruston 1998) ─
+        # Write current top-down signal into ring buffer
+        self._apical_delay_buf[self._apical_delay_idx] = (
+            self.top_down_prediction.astype(np.float32)
+        )
+        # Read oldest entry (delayed by apical_delay_ms)
+        read_idx = (self._apical_delay_idx + 1) % self._apical_delay_len
+        apical_current = self._apical_delay_buf[read_idx]
+        self._apical_delay_idx = read_idx
+
+        # Passive low-pass cable filter (τ_apical ≈ 150ms)
         apical_gain = ncfg.ctx.complement(pyr.tau_apical)
         self.v_apical = (
             self.v_apical * pyr.apical_decay
@@ -348,5 +372,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
         self.is_burst.fill(False)
         self.plateau_timer.fill(0)
         self.in_plateau.fill(False)
+        self._apical_delay_buf.fill(0.0)
+        self._apical_delay_idx = 0
         self._pyr_homeo_state.reset(self.neuron_cfg.v_thresh)
         self._ach_apical_scale = 1.0

@@ -22,8 +22,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import WorkingMemoryConfig, InhibitoryPoolConfig, SynapseConfig, init_weights
-from .interneuron import InhibitoryPool
+from .config import WorkingMemoryConfig, init_weights
 
 if TYPE_CHECKING:
     from .astrocyte import AstrocyteField
@@ -100,33 +99,6 @@ class WorkingMemoryModule:
             driving_force=cfg.driving_force_exc,
         )
         np.fill_diagonal(self.w_lateral, 0.0)  # No autapses (no self-connections)
-
-        # ── Feedback inhibition (Compte et al. 2000) ──────────────────
-        # PFC attractor requires E-I balance for bistability: strong
-        # recurrent excitation sustains a bump, while PV+ interneuron
-        # feedback prevents runaway.  Without inhibition, lateral_strength
-        # > 1.0 would cause seizure-like activity.
-        # PFC inhibitory parameters: τ_m slightly slower (~10ms vs 8ms
-        # for cortical basket cells, Gonzalez-Burgos et al. 2005).
-        _inh_cfg = InhibitoryPoolConfig(
-            ctx=cfg.ctx,
-            n_interneurons=max(4, num_neurons // 4),
-            tau_m_inh=10.0,
-            target_sparsity=0.20,
-        )
-        self.inh_pool = InhibitoryPool(num_neurons, config=_inh_cfg)
-
-        # ── NMDA slow recurrent trace (Wang 2001; Compte et al. 2000) ─
-        # PFC persistent activity relies on NMDA-dominated recurrent
-        # excitation with τ_NMDA≈100ms (Durstewitz et al. 2000).
-        # The slow NMDA trace provides a temporal bridge: even when
-        # only 2 neurons fire from the cue, the NMDA conductance
-        # accumulates over multiple timesteps and sustains activity
-        # after feedforward input ceases.
-        self._g_nmda_rec: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
-        self._nmda_decay: float = cfg.ctx.decay(100.0)  # τ_NMDA=100ms
 
         # ── Eligibility traces ────────────────────────────────────────
         self.e: NDArray[np.float32] = np.zeros(
@@ -335,16 +307,7 @@ class WorkingMemoryModule:
 
         # Recurrent contribution always active (attractor maintenance)
         # Lateral weights are Hebbian [0, 1]; treat as conductance gain
-        # AMPA component: fast, direct.
-        g_rec_ampa = self.content @ self.w_lateral * cfg.lateral_strength  # nS
-        # NMDA component: slow τ=100ms trace with Mg²⁺ block (Wang 2001)
-        # Provides temporal bridge for persistent activity across delays.
-        _nmda_compl = 1.0 - self._nmda_decay
-        self._g_nmda_rec = self._g_nmda_rec * self._nmda_decay + _nmda_compl * g_rec_ampa
-        mg_block = SynapseConfig.nmda_mg_block(self.v)
-        # AMPA:NMDA ratio from config (Wang 2001: PFC recurrent is NMDA-dominated)
-        ampa_frac = 1.0 - cfg.nmda_recurrent_ratio
-        g_rec = ampa_frac * g_rec_ampa + cfg.nmda_recurrent_ratio * self._g_nmda_rec * mg_block
+        g_rec = self.content @ self.w_lateral * cfg.lateral_strength  # nS
         I_rec = g_rec * (cfg.e_exc - self.v)                         # pA
 
         I_syn = I_ff + I_rec
@@ -390,17 +353,6 @@ class WorkingMemoryModule:
         self.v[self.has_spiked] = cfg.v_reset
         self.refrac_count[self.has_spiked] = cfg.refrac_period
         self.x_post[self.has_spiked] += 1.0
-
-        # ── Feedback inhibition (Compte et al. 2000) ─────────────────
-        # PV+ interneuron pool provides E→I→E feedback inhibition.
-        # Prevents runaway excitation from strong recurrent connectivity.
-        # Conductance-based: I_inh = g_inh × (E_inh − V), self-limiting
-        # as V approaches GABA-A reversal (Brunel & Wang 2003).
-        inh_current = self.inh_pool.step(
-            self.has_spiked.astype(np.float32), v_exc=self.v,
-        )
-        self.v -= inh_current
-        np.clip(self.v, -90.0, None, out=self.v)  # K+ reversal floor
 
         # ── Adaptation current w: τ_w dw/dt = a(V-E_L) - w; w += b ──
         self.w_adapt[self.has_spiked] += cfg.b
@@ -503,7 +455,6 @@ class WorkingMemoryModule:
         self.refrac_count.fill(0)
         self.has_spiked.fill(False)
         self.content.fill(0.0)
-        self._g_nmda_rec.fill(0.0)
         self.prediction_error.fill(1.0)
         self._gate_signal = 0.0
         self._ach_level = 0.0
@@ -515,5 +466,3 @@ class WorkingMemoryModule:
         self._gate_refrac.fill(0)
         self._gate_rate.fill(0.0)
         self._gate_w_adapt.fill(0.0)
-        # Reset inhibitory pool state
-        self.inh_pool.reset_state()

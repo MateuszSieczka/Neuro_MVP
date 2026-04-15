@@ -897,20 +897,9 @@ class WorkingMemoryConfig(BaseConfig):
     ach_gate_threshold: float = 0.5
     da_gate_threshold: float = 0.4
     # Lateral attractor
-    # Compte et al. (2000) PFC model: recurrent excitation must exceed
-    # AdEx rheobase for a small bump of ~5 neurons to sustain itself.
-    # Rheobase = g_L × (gap - Δ_T) = 30 × 13 = 390 pA.
-    # With N_active≈5, w_mean≈2 nS, driving_force=65 mV:
-    #   I_rec ≈ 5 × w × strength × DF ≈ 5 × 2 × 1.5 × 65 × 0.55 = 536 pA > 390 pA ✓
-    # Inhibitory feedback prevents runaway (added InhibitoryPool).
-    lateral_strength: float = 1.5
+    lateral_strength: float = 0.5
     lateral_lr: float = 0.01
     learning_rate: float = 0.01
-    # NMDA fraction of recurrent conductance (Wang 2001: PFC NMDA-dominated)
-    # PFC persistent activity relies on slow NMDA conductance τ≈100ms
-    # (Durstewitz et al. 2000).  0.65 = NMDA-dominated recurrence with
-    # 0.35 AMPA for fast spike coupling despite Mg²⁺ block at V_rest.
-    nmda_recurrent_ratio: float = 0.65
     # STDP traces
     tau_e: float = 20.0
     tau_pre: float = 20.0

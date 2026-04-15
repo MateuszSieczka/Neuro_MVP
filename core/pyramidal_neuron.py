@@ -229,6 +229,7 @@ class PyramidalLayer(CompetitiveLIFLayer):
 
         ctx = ncfg.ctx
         integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
+        np.clip(integrated_v, None, 50.0, out=integrated_v)  # cap phi1 runaway
 
         in_refrac = self.refrac_count > 0
         self.refrac_count[in_refrac] -= 1

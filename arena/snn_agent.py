@@ -125,7 +125,10 @@ class SNNAgent(Agent):
             bg_base_size = self._encoded_size
 
         # ── Compute layer sizes ───────────────────────────────────────
-        self._wm_num_neurons = max(8, state_size)
+        # PFC attractor requires sufficient population for stable bump
+        # (Compte et al. 2000: N ≥ 30 for bistable bump attractor).
+        # 32 matches BG MSN population per action (Georgopoulos 1986).
+        self._wm_num_neurons = max(32, state_size * 4)
         # Biologically: all afferent currents sum at the dendrite
         # (Alexander et al. 1986; Haber 2003).  WM→BG and cortex→BG
         # converge on the same MSN population via separate synapses.
@@ -146,8 +149,10 @@ class SNNAgent(Agent):
         _mean_input_rate = _sigma_factor * np.sqrt(2.0 * np.pi) / _n_per_dim
 
         # ── Create modules ────────────────────────────────────────────
+        _wm_sz = self._wm_num_neurons if self._use_working_memory else 0
         self.critic = SNNDeepCritic(bg_input_size, self._bg_config,
-                                     mean_input_rate=_mean_input_rate)
+                                     mean_input_rate=_mean_input_rate,
+                                     wm_size=_wm_sz)
         # internal_dim > 0 only when WM is active and needs a gate neuron.
         # Without WM, the internal neuron wastes capacity and
         # dilutes the motor population signal.
@@ -155,6 +160,7 @@ class SNNAgent(Agent):
         self.actor = D1D2Actor(
             bg_input_size, n_actions, _internal_dim, self._bg_config,
             mean_input_rate=_mean_input_rate,
+            wm_size=_wm_sz,
         )
 
         if self._use_working_memory:
@@ -364,12 +370,9 @@ class SNNAgent(Agent):
             self.working_memory.set_astrocyte(self._wm_astro)
             net.add_layer("working_memory", self.working_memory,
                           receptor_profile=PFC_RECEPTORS)
-            # Dendritic summation: PFC afferents add to cortical input
-            # via separate synapses on the same MSN population.
-            net.connect("working_memory", "critic",
-                        aggregation_mode="sum")
-            net.connect("working_memory", "actor",
-                        aggregation_mode="sum")
+            # WM→BG now uses dedicated projection weights inside
+            # SNNDeepCritic/D1D2Actor (Haber 2003).  No graph-level
+            # sum connection — avoids WM 8D→BG 105D dimension mismatch.
 
         if self._use_wm:
             net.add_layer("encoder", self.world_model.encoder,
@@ -496,6 +499,9 @@ class SNNAgent(Agent):
                     ach_level=self.neuromod.bottom_up_gain,
                     da_level=wm_da,
                 )
+                # Set WM content for dedicated BG projection (Haber 2003)
+                self.critic._wm_content = self.working_memory.content.copy()
+                self.actor._wm_content = self.working_memory.content.copy()
             encoded = self._poisson.encode(pop_rates)
             sensory = self._build_sensory_inputs(encoded, state_f32)
             self.network.step(
@@ -572,7 +578,11 @@ class SNNAgent(Agent):
         # Integrate over substeps to let the critic develop a
         # meaningful V(s') population activity.  Uses critic's own
         # τ_m (15ms) rather than the full MSN τ (25ms).
+        # WM content carries forward from act() — represents maintained
+        # cue information for V(s') estimation.
         for _sub in range(self._n_substeps_critic):
+            if self._use_working_memory:
+                self.critic._wm_content = self.working_memory.content.copy()
             next_encoded = self._poisson.encode(next_pop_rates)
             # Critic-only sensory: actor receives zeros so it does not
             # process next_state (Schultz 1997: BG does not preview the
@@ -634,16 +644,21 @@ class SNNAgent(Agent):
                 novelty=self._last_curiosity,
             )
 
-            # WM plasticity
+            # WM plasticity — TD error × gate signal (Braver & Cohen 2000)
+            # PFC synaptic updates are DA-gated: TD error provides the
+            # reward-relevance signal, gate_signal modulates by whether
+            # the gate was open (WM was actively maintaining).  This
+            # replaces world model PE which is orthogonal to WM utility.
             if self._use_working_memory:
-                wm_pe = np.zeros(
-                    self.working_memory.num_neurons, dtype=np.float32,
+                gate_s = self.working_memory._gate_signal
+                wm_td = np.full(
+                    self.working_memory.num_neurons,
+                    td_error_normed * gate_s,
+                    dtype=np.float32,
                 )
-                pe_len = min(len(pred_error), self.working_memory.num_neurons)
-                wm_pe[:pe_len] = pred_error[:pe_len]
-                self.working_memory.prediction_error = wm_pe
+                self.working_memory.prediction_error = np.abs(wm_td)
                 self.working_memory.update_weights(
-                    m_t=wm_m_t, pred_error=wm_pe,
+                    m_t=wm_m_t, pred_error=wm_td,
                 )
         else:
             # No world model: use raw TD error as prediction error signal.
@@ -726,21 +741,35 @@ class SNNAgent(Agent):
                 aug_state=aug_state,
             )
 
-        # ── 10. Sleep phase (end of episode OR ATP depletion) ──────────
-        # Consolidation vigor modulated by neuromodulatory state:
-        # VTA D2 autoreceptor adapts RPE gain, serotonin modulates
-        # temporal discount, oscillator gates Up/Down states.
-        # No arbitrary sleep_gain formula — the VTA's intrinsic
-        # dynamics handle adaptation (Tobler et al. 2005).
+        # ── 10. Sleep phase (ATP depletion OR episode-boundary rest) ───
         # ATP-triggered sleep enables continuous learning without
-        # episode boundaries (Kann & Kovács 2007; plan step 4.5).
-        # Sleep is triggered ONLY by metabolic depletion (_needs_sleep),
-        # not by episode boundaries.  Episode-boundary sleep conflates
-        # task segmentation (an RL artefact) with the homeostatic drive
-        # that biology uses.  For WM-dependent tasks, replaying without
-        # WM content would overwrite online cue→action associations.
+        # episode boundaries (Kann & Kovács 2007).
         _should_sleep = self._needs_sleep()
         if _should_sleep and self._use_wm and len(self.replay_buffer) > 0:
+            # Clear stale WM content so replay uses only stored states
+            if hasattr(self.bg.critic, '_wm_content'):
+                self.bg.critic._wm_content = None
+            if hasattr(self.bg.actor, '_wm_content'):
+                self.bg.actor._wm_content = None
+            self.replay_buffer.sleep_phase(
+                world_model=self.world_model,
+                neuromodulator=self.neuromod,
+                bg=self.bg,
+                oscillator=self.network.oscillator,
+            )
+
+        # ── 10b. Episode-boundary micro-replay (Foster & Wilson 2006) ─
+        # Hippocampal sharp-wave ripple replay occurs during brief rest
+        # periods between foraging bouts, not only during deep sleep.
+        # This micro-consolidation event bridges the credit assignment
+        # gap that STDP eligibility traces (τ=30ms) cannot span across
+        # 4-step delays.  Reduced replay intensity vs full sleep.
+        # Mutually exclusive with ATP sleep to prevent double-replay.
+        elif done and self._use_wm and len(self.replay_buffer) >= 4:
+            if hasattr(self.bg.critic, '_wm_content'):
+                self.bg.critic._wm_content = None
+            if hasattr(self.bg.actor, '_wm_content'):
+                self.bg.actor._wm_content = None
             self.replay_buffer.sleep_phase(
                 world_model=self.world_model,
                 neuromodulator=self.neuromod,
@@ -755,6 +784,20 @@ class SNNAgent(Agent):
     def reset(self) -> None:
         self.network.reset_state()
         self.vta.reset_state()
+        # ── Phasic neuromodulator reset (inter-trial interval proxy) ──
+        # In biological experiments, the inter-trial interval (~5-10s)
+        # allows phasic DA (τ=200ms), ACh (τ=25ms), and NE (τ=75ms) to
+        # decay back to baseline.  Without simulated ITI, phasic DA from
+        # the terminal reward/punishment bleeds into the next episode's
+        # first act() call, creating a positive feedback loop that
+        # destabilises WM gating (DA > threshold → gate opens regardless
+        # of cue; DA < threshold → gate locked shut → no encoding).
+        # Tonic DA and 5-HT persist: they track long-term reward rate
+        # (Grace 1991) and environment stability (Doya 2002) respectively.
+        _cfg = self.neuromod.config
+        self.neuromod.dopamine = _cfg.baseline_da
+        self.neuromod.acetylcholine = _cfg.baseline_ach
+        self.neuromod.noradrenaline = _cfg.baseline_ne
         if self._use_wm:
             self.world_model.reset_state()
             self.world_model.reset_error_history()

@@ -201,6 +201,7 @@ class ErrorNeuronLayer:
         )
         J_v = inv_Cm * (-gL + gL * exp_term)
         integrated = ctx.exp_euler_step(v, F_v, J_v)
+        np.clip(integrated, None, 50.0, out=integrated)  # cap phi1 runaway
         v_new = np.where(in_refrac, ncfg.v_reset, integrated)
 
         spiked = (v_new >= ncfg.v_spike_cutoff) & ~in_refrac

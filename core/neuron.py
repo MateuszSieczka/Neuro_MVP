@@ -318,6 +318,7 @@ class AdExLayer:
         J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
 
         integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
+        np.clip(integrated_v, None, 50.0, out=integrated_v)  # cap phi1 runaway
         self.v = np.where(in_refrac, ncfg.v_reset, integrated_v)
 
         # 5. Spike detection (v >= v_spike_cutoff, combined with adaptive thresh)

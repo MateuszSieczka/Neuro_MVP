@@ -1,41 +1,4 @@
-"""core — biologically grounded SNN primitives (JAX/Equinox).
-
-Legacy NumPy modules are being incrementally replaced. Only ported
-modules are re-exported here; subsystems still pending migration must
-be imported by their fully qualified path.
-"""
-
-from .simulation_context import SimulationContext, DEFAULT_CONTEXT
-from .config import (
-    NeuronConfig,
-    STDPConfig,
-    HomeostaticConfig,
-    ErrorNeuronConfig,
-    InhibitoryPoolConfig,
-    WorkingMemoryConfig,
-    NeuromodulatorConfig,
-    OscillatorConfig,
-    AstrocyteConfig,
-    AttentionConfig,
-    SequenceMemoryConfig,
-    WorldModelConfig,
-    EpisodicMemoryConfig,
-    ReplayBufferConfig,
-    ActiveInferenceConfig,
-    BasalGangliaConfig,
-    VTAConfig,
-    AgentConfig,
-    ReceptorType,
-    ReceptorProfile,
-    CORTICAL_L4_RECEPTORS,
-    CORTICAL_L5_RECEPTORS,
-    PFC_RECEPTORS,
-    STRIATUM_D1_RECEPTORS,
-    STRIATUM_D2_RECEPTORS,
-    STRIATUM_ACTOR_RECEPTORS,
-    init_weights,
-    compute_weight_std,
-)
+"""core — biologically grounded SNN primitives (JAX/Equinox)."""
 
 # -- JAX backend + state containers --
 from .backend import (
@@ -86,7 +49,7 @@ from .free_energy import (
 
 # -- Receptor pharmacology --
 from .receptor import (
-    ReceptorParams, init_receptor_params, hill_response,
+    ReceptorType, ReceptorParams, init_receptor_params, hill_response,
     receptor_effects, aggregate_effects, compute_layer_modulation,
     LayerModulation, RECEPTOR_ORDER,
 )
@@ -175,4 +138,11 @@ from .basal_ganglia import (
     init_actor_params, init_actor_state,
     actor_step, actor_select_action, actor_update,
     actor_reset_evidence, actor_reset_transient, action_entropy,
+)
+
+# -- Cortical microcircuit (L4 / L2-3 / L5) --
+from .cortex import (
+    CorticalAreaParams, CorticalAreaState, CorticalInputs, CorticalOutput,
+    init_cortical_area_params, init_cortical_area_state,
+    cortical_area_step, cortical_area_update, cortical_area_reset_transient,
 )

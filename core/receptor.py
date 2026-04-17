@@ -11,13 +11,36 @@ which mirrors the independent G-protein cascades (Gs, Gi, Gq).
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from typing import NamedTuple
 
 import equinox as eqx
 import jax.numpy as jnp
 
 from .backend import DTYPE, Array
-from .config import ReceptorType
+
+
+class ReceptorType(Enum):
+    """Neurotransmitter receptor subtypes."""
+    # Dopamine
+    D1 = auto()   # Excitatory, cAMP↑, Go pathway (Surmeier et al. 2007)
+    D2 = auto()   # Inhibitory, cAMP↓, NoGo pathway
+    # Acetylcholine
+    M1 = auto()   # Cortical excitatory (muscarinic)
+    M4 = auto()   # Striatal inhibitory (muscarinic)
+    NACHR = auto()  # Fast nicotinic (thalamic input gating)
+    # Noradrenaline
+    ALPHA1 = auto()
+    ALPHA2 = auto()
+    BETA = auto()
+    # Serotonin
+    HT1A = auto()
+    HT2A = auto()
+    # GABA / Glutamate (kept for completeness, unused in modulation vector)
+    GABA_A = auto()
+    GABA_B = auto()
+    AMPA = auto()
+    NMDA = auto()
 
 
 RECEPTOR_ORDER: tuple[ReceptorType, ...] = (

@@ -311,3 +311,5 @@ cython_debug/
 .vs/Neuro_MVP.slnx/copilot-chat/422d52dd/sessions/ae935a21-aee7-47af-b16b-96a722908272
 .vs/Neuro_MVP.slnx/copilot-chat/422d52dd/sessions/8e933690-7547-4f50-b9ca-ad2578665523
 predicted_errors.md
+sensory/__init__.py
+sensory/retina.py

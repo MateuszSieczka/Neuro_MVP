@@ -290,6 +290,7 @@ def minimal_brain_step(
     *,
     climbing_error: Array | None = None,
     reward: float | Array = 0.0,
+    td_error: float | Array = 0.0,
     novelty: float | Array | None = None,
     apply_cortex_stdp: bool = True,
     apply_cerebellum_update: bool = True,
@@ -395,7 +396,7 @@ def minimal_brain_step(
     nm_new = neuromodulator_step(
         state.neuromodulator, params.neuromodulator,
         prediction_error=pe_signal,
-        td_error=0.0,
+        td_error=td_error,
         reward=reward,
         novelty=novelty,
     )
@@ -435,3 +436,558 @@ def region_phase(osc_state: OscillatorState, phase_offset: Array) -> Array:
     coherently across the cortical hierarchy (Muller 2018 waves).
     """
     return jnp.mod(osc_state.theta_phase + phase_offset, 2.0 * jnp.pi)
+
+
+# =====================================================================
+# ActionBrain — Phase 3: closes the sense–act–learn–reward loop
+# =====================================================================
+#
+# Extends MinimalBrain with
+#   * basal_ganglia: D1/D2 actor + ventral-striatum critic
+#   * VTA: TD-style RPE broadcast to the DA bus
+#   * world_model: dense-coded forward model (inferior olive proxy)
+#   * fixed random projection sensory PE → Purkinje cell climbing fibres
+#
+# Timing discipline
+# -----------------
+# 1 "decision cycle" = ``substeps`` brain ``dt``s (default 20 ms = 20 dt).
+# Inside the cycle the cortex, thalamus and cerebellum iterate; BG
+# MSN spike counts accumulate (Gold & Shadlen 2007 evidence integration);
+# the actor produces an action at the end of the cycle.
+#
+# Transition learning uses the TD(0) sliding-window pattern:
+#   * V(s_t) was stored in VTA at the end of the PREVIOUS perceive
+#     (``vta_store_prediction``).
+#   * At the START of the current perceive we have r_{t}, s_{t+1} (the
+#     body just reported them). The critic has been iterated on s_{t+1}
+#     so ``critic.activation`` now approximates V(s_{t+1}).
+#   * rpe = r_t + γ·V(s_{t+1}) · (1−done_t) − V(s_t)  (``vta_compute_rpe``)
+#   * Weights update (critic + actor + VTA value readout).
+#   * World model update with (s_t, a_t, s_{t+1}) → PE → climbing signal.
+#   * Then perceive s_{t+1} for ``substeps`` dt; store V(s_{t+1}); pick a_{t+1}.
+#
+# Intrinsic drives
+# ----------------
+# The total reward broadcast to VTA / neuromodulator:
+#   r_total = r_extrinsic + β_c · curiosity − β_h · (1 − atp_mean)
+# with β_c = 0.1 (Pathak 2017 ICM curiosity weight lower bound) and
+# β_h = 0.05 (homeostatic drives are a small modulation; Keramati &
+# Gutkin 2014). These are reference-paper defaults; no task tuning.
+#
+# References
+# ----------
+# Frank (2005); Collins & Frank (2014); Schultz (1997); Tobler et al.
+# (2005); Wolpert et al. (1998); Sutton & Barto (2018) TD(0);
+# Gold & Shadlen (2007); Pathak et al. (2017) ICM; Keramati & Gutkin
+# (2014) homeostatic RL; Schweighofer et al. (2008) 5-HT·γ.
+
+
+from .basal_ganglia import (
+    CriticParams, CriticState,
+    init_critic_params, init_critic_state,
+    critic_step, critic_update, critic_reset_transient,
+    ActorParams, ActorState, ActorInputs,
+    init_actor_params, init_actor_state,
+    actor_step, actor_select_action, actor_update,
+    actor_reset_evidence, actor_reset_transient,
+)
+from .vta import (
+    VTAParams, VTAState,
+    init_vta_params, init_vta_state,
+    vta_store_prediction, vta_compute_rpe, vta_update, vta_reset_transient,
+)
+from .world_model import (
+    WorldModelParams, WorldModelState,
+    init_world_model_params, init_world_model_state,
+    wm_predict, wm_update, wm_curiosity_signal, wm_reset_transient,
+)
+
+
+# ---------------------------------------------------------------------
+# Params
+# ---------------------------------------------------------------------
+
+
+class ActionBrainParams(eqx.Module):
+    """All MinimalBrain params + action/value/world machinery."""
+
+    # Region modules (body-agnostic)
+    thalamus_relay: RelayParams
+    thalamus_trn: TRNParams
+    cortex: CorticalAreaParams
+    cerebellum: CerebellumParams
+    oscillator: OscillatorParams
+    neuromodulator: NeuromodulatorParams
+    critic: CriticParams
+    actor: ActorParams
+    vta: VTAParams
+    world_model: WorldModelParams
+
+    # Inter-region projections (L5 → CT drive, L5 → mossy fibre)
+    w_l5_ct: Array              # (n_l5, n_ct)
+    w_l5_mossy: Array           # (n_l5, mossy_size)
+
+    # Inferior-olive proxy: sensory PE → climbing fibres (Purkinje)
+    w_io_pc: Array              # (sensory_size, n_purkinje)
+
+    # Traveling-wave phase offsets (radians)
+    phase_offset_thalamus: Array
+    phase_offset_cortex: Array
+    phase_offset_cerebellum: Array
+
+    # Intrinsic-drive coefficients (paper-documented, not task-tuned)
+    beta_curiosity: Array       # Pathak 2017 ICM lower bound
+    beta_homeostasis: Array     # Keramati & Gutkin 2014
+
+    # Static
+    n_actions: int = eqx.field(static=True)
+    sensory_size: int = eqx.field(static=True)
+    substeps: int = eqx.field(static=True)
+    delay_ct_steps: int = eqx.field(static=True)
+    delay_mossy_steps: int = eqx.field(static=True)
+
+
+class ActionBrainState(eqx.Module):
+    """All MinimalBrain state + BG/VTA/WM state + decision bookkeeping."""
+
+    thalamus_relay: RelayState
+    thalamus_trn: TRNState
+    cortex: CorticalAreaState
+    cerebellum: CerebellumState
+    oscillator: OscillatorState
+    neuromodulator: NeuromodulatorState
+    critic: CriticState
+    actor: ActorState
+    vta: VTAState
+    world_model: WorldModelState
+
+    delay_ct: DelayBuffer
+    delay_mossy: DelayBuffer
+
+    # Last committed action (one-hot) kept so wm_update can observe
+    # (s_t, a_t, s_{t+1}) at the next cycle. Scalar int for logging.
+    last_action: Array          # (n_actions,) one-hot
+    last_action_id: Array       # scalar int32
+    last_sensory: Array         # (sensory_size,)
+    last_rpe: Array             # scalar — diagnostic only
+    last_total_reward: Array    # scalar — diagnostic only
+
+
+class ActionBrainOutput(NamedTuple):
+    state: ActionBrainState
+    action: Array               # scalar int32 — the newly committed action
+    rpe: Array                  # scalar — RPE for the previous transition
+    total_reward: Array         # scalar — extrinsic + intrinsic
+    curiosity: Array            # scalar — world-model curiosity ∈ [0, 1]
+    cortex_belief: Array        # (n_l23_state,)
+    cortex_l5_rate: Array       # (n_l5,)
+    cerebellum_nuclei: Array    # (n_dn,)
+    relay_spikes: Array
+    theta_phase: Array
+    neuromod: NeuromodulatorState
+
+
+def init_action_brain_params(
+    ctx: BackendContext,
+    *,
+    sensory_size: int,
+    n_actions: int,
+    # thalamus
+    n_tc: int = 64,
+    n_ct: int = 32,
+    n_trn: int = 32,
+    # cortex
+    cortex_n_l4: int = 64,
+    cortex_n_l23_state: int = 64,
+    cortex_n_l23_error: int = 64,
+    cortex_n_l5: int = 32,
+    # cerebellum
+    mossy_size: int = 32,
+    cerebellum_n_purkinje: int = 32,
+    # BG
+    critic_hidden: int = 64,
+    actor_n_per_action: int = 4,
+    # world model
+    wm_hidden: int = 64,
+    wm_n_error: int = 64,
+    wm_n_neurons_per_dim: int = 8,
+    # delays
+    delay_ct_ms: float = 2.0,
+    delay_mossy_ms: float = 10.0,
+    # waves
+    phase_offsets_rad: tuple[float, float, float] = (0.0, 0.15, 0.3),
+    # inter-region weights
+    w_l5_ct_mean: float = 0.5,
+    w_l5_mossy_mean: float = 0.5,
+    w_io_pc_sigma: float = 0.3,
+    # decision cycle
+    substeps: int = 20,
+    # intrinsic drives (paper-grounded, not task-tuned)
+    beta_curiosity: float = 0.1,
+    beta_homeostasis: float = 0.05,
+    seed: int = 0,
+) -> ActionBrainParams:
+    """Build an ActionBrain params pytree.
+
+    The sensory and action sizes come from the body (``body.sensory_size``,
+    ``body.n_actions``). Region sizes and substep count are policy
+    choices, not task-specific. 20 substeps ≈ 20 ms is the canonical
+    cortical decision interval (Schall 2002; Gold & Shadlen 2007).
+    """
+    tr_p = init_relay_params(
+        ctx, n_afferent=sensory_size, n_tc=n_tc, n_ct=n_ct,
+    )
+    trn_p = init_trn_params(ctx, n_tc_total=n_tc, n_ct=n_ct, n_trn=n_trn)
+    cx_p = init_cortical_area_params(
+        ctx, input_size=n_tc,
+        n_l4=cortex_n_l4, n_l23_state=cortex_n_l23_state,
+        n_l23_error=cortex_n_l23_error, n_l5=cortex_n_l5,
+    )
+    cb_p = init_cerebellum_params(
+        ctx, mossy_size=mossy_size, n_purkinje=cerebellum_n_purkinje,
+    )
+    osc_p = init_oscillator_params()
+    nm_p = init_neuromodulator_params(ctx)
+
+    critic_p = init_critic_params(
+        ctx, state_size=cortex_n_l23_state + sensory_size,
+        hidden_size=critic_hidden,
+    )
+    actor_p = init_actor_params(
+        ctx, state_size=cortex_n_l23_state + sensory_size,
+        motor_dim=n_actions,
+        n_per_action=actor_n_per_action,
+    )
+    vta_p = init_vta_params(ctx, hidden_size=critic_hidden)
+    wm_p = init_world_model_params(
+        ctx, state_size=sensory_size, action_size=n_actions,
+        hidden_size=wm_hidden, n_error=wm_n_error,
+        n_neurons_per_dim=wm_n_neurons_per_dim,
+    )
+
+    master = jax.random.PRNGKey(seed)
+    k1, k2, k3 = split_key(master, 3)
+    w_l5_ct = jnp.abs(
+        jax.random.normal(k1, (cortex_n_l5, n_ct), dtype=DTYPE)
+    ) * jnp.asarray(w_l5_ct_mean, DTYPE)
+    w_l5_mossy = jnp.abs(
+        jax.random.normal(k2, (cortex_n_l5, mossy_size), dtype=DTYPE)
+    ) * jnp.asarray(w_l5_mossy_mean, DTYPE)
+    # Inferior olive: signed projection. One IO neuron per sensory
+    # dimension converges onto ~n_purkinje/sensory_size PCs; we model
+    # as a dense Gaussian map (Marr 1969 abstract connectivity).
+    w_io_pc = jax.random.normal(
+        k3, (sensory_size, cerebellum_n_purkinje), dtype=DTYPE,
+    ) * jnp.asarray(w_io_pc_sigma, DTYPE)
+
+    d_ct = max(1, int(round(delay_ct_ms / ctx.dt)))
+    d_mossy = max(1, int(round(delay_mossy_ms / ctx.dt)))
+
+    f = lambda x: jnp.asarray(x, DTYPE)
+    return ActionBrainParams(
+        thalamus_relay=tr_p, thalamus_trn=trn_p,
+        cortex=cx_p, cerebellum=cb_p,
+        oscillator=osc_p, neuromodulator=nm_p,
+        critic=critic_p, actor=actor_p, vta=vta_p, world_model=wm_p,
+        w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy, w_io_pc=w_io_pc,
+        phase_offset_thalamus=f(phase_offsets_rad[0]),
+        phase_offset_cortex=f(phase_offsets_rad[1]),
+        phase_offset_cerebellum=f(phase_offsets_rad[2]),
+        beta_curiosity=f(beta_curiosity),
+        beta_homeostasis=f(beta_homeostasis),
+        n_actions=int(n_actions),
+        sensory_size=int(sensory_size),
+        substeps=int(substeps),
+        delay_ct_steps=d_ct, delay_mossy_steps=d_mossy,
+    )
+
+
+def init_action_brain_state(
+    key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
+) -> ActionBrainState:
+    keys = split_key(key, 8)
+    tr_s = init_relay_state(keys[0], params.thalamus_relay)
+    trn_s = init_trn_state(keys[1], params.thalamus_trn)
+    cx_s = init_cortical_area_state(keys[2], params.cortex)
+    cb_s = init_cerebellum_state(keys[3], params.cerebellum)
+    osc_s = init_oscillator_state()
+    nm_s = init_neuromodulator_state(params.neuromodulator)
+    critic_s = init_critic_state(keys[4], params.critic)
+    actor_s = init_actor_state(keys[5], params.actor)
+    vta_s = init_vta_state(keys[6], params.vta)
+    wm_s = init_world_model_state(keys[7], params.world_model)
+
+    n_ct = params.thalamus_relay.n_ct
+    mossy_size = params.cerebellum.mossy_size
+    return ActionBrainState(
+        thalamus_relay=tr_s, thalamus_trn=trn_s,
+        cortex=cx_s, cerebellum=cb_s,
+        oscillator=osc_s, neuromodulator=nm_s,
+        critic=critic_s, actor=actor_s, vta=vta_s, world_model=wm_s,
+        delay_ct=init_delay_buffer(n_ct, params.delay_ct_steps, dtype=dtype),
+        delay_mossy=init_delay_buffer(
+            mossy_size, params.delay_mossy_steps, dtype=dtype,
+        ),
+        last_action=jnp.zeros(params.n_actions, dtype),
+        last_action_id=jnp.asarray(0, jnp.int32),
+        last_sensory=jnp.zeros(params.sensory_size, dtype),
+        last_rpe=jnp.asarray(0.0, dtype),
+        last_total_reward=jnp.asarray(0.0, dtype),
+    )
+
+
+# ---------------------------------------------------------------------
+# Internal: single ``dt`` of the perception cortex loop with BG/WM/critic
+# ---------------------------------------------------------------------
+
+
+def _perceive_substep(
+    state: ActionBrainState,
+    params: ActionBrainParams,
+    ctx: BackendContext,
+    sensory: Array,
+    td_error: Array,
+    novelty: Array,
+) -> tuple[ActionBrainState, tuple[Array, Array, Array]]:
+    """One ``dt`` of perception: thalamus, cortex, cerebellum, critic,
+    actor, world-model prediction, neuromodulator.
+
+    Returns the advanced state plus the current-step cortex/thalamus
+    readouts ``(cortex_belief, cortex_l5_rate, relay_spikes)`` so the
+    scanning caller can expose them without peeking at internal region
+    fields.
+    """
+    # Rebuild the MinimalBrain-shaped subtree and step it. This reuses
+    # the exact wiring (delay buffers, neuromod, oscillator) already
+    # validated in Phase 2.
+    mb_state = MinimalBrainState(
+        thalamus_relay=state.thalamus_relay,
+        thalamus_trn=state.thalamus_trn,
+        cortex=state.cortex, cerebellum=state.cerebellum,
+        oscillator=state.oscillator, neuromodulator=state.neuromodulator,
+        delay_ct=state.delay_ct, delay_mossy=state.delay_mossy,
+    )
+    mb_params = MinimalBrainParams(
+        thalamus_relay=params.thalamus_relay,
+        thalamus_trn=params.thalamus_trn,
+        cortex=params.cortex, cerebellum=params.cerebellum,
+        oscillator=params.oscillator, neuromodulator=params.neuromodulator,
+        w_l5_ct=params.w_l5_ct, w_l5_mossy=params.w_l5_mossy,
+        phase_offset_thalamus=params.phase_offset_thalamus,
+        phase_offset_cortex=params.phase_offset_cortex,
+        phase_offset_cerebellum=params.phase_offset_cerebellum,
+        delay_ct_steps=params.delay_ct_steps,
+        delay_mossy_steps=params.delay_mossy_steps,
+    )
+    mb_out = minimal_brain_step(
+        mb_state, mb_params, ctx, sensory,
+        climbing_error=None,
+        reward=jnp.asarray(0.0, DTYPE),      # reward only at learn phase
+        td_error=td_error,                    # phasic DA follows VTA rpe
+        novelty=novelty,                      # ACh tracks curiosity
+        apply_cortex_stdp=True,
+        apply_cerebellum_update=False,        # no IO signal during perceive
+    )
+
+    # BG critic/actor read cortico-thalamic convergent drive: cortex
+    # L2/3 belief (continuous rate) concatenated with the raw sensory
+    # afferent vector. This models the parallel thalamostriatal
+    # pathway (Smith 2004; McFarland & Haber 2002) that bypasses cortex
+    # and lets striatum learn directly from subcortical sensory input.
+    striatal_drive = jnp.concatenate([mb_out.cortex_belief, sensory], axis=0)
+    critic_out = critic_step(
+        state.critic, params.critic, ctx, striatal_drive,
+    )
+    actor_out = actor_step(
+        state.actor, params.actor, ctx, striatal_drive,
+        inputs=ActorInputs(
+            da=mb_out.neuromod.dopamine,
+            tonic_da=mb_out.neuromod.tonic_da,
+            epistemic_drive=novelty,
+        ),
+    )
+
+    # World-model forward prediction (no weight updates — happens at learn)
+    wm_out = wm_predict(
+        state.world_model, params.world_model, ctx,
+        sensory, state.last_action,
+        ach=mb_out.neuromod.acetylcholine,
+    )
+
+    return ActionBrainState(
+        thalamus_relay=mb_out.state.thalamus_relay,
+        thalamus_trn=mb_out.state.thalamus_trn,
+        cortex=mb_out.state.cortex,
+        cerebellum=mb_out.state.cerebellum,
+        oscillator=mb_out.state.oscillator,
+        neuromodulator=mb_out.state.neuromodulator,
+        critic=critic_out.state,
+        actor=actor_out.state,
+        vta=state.vta,
+        world_model=wm_out.state,
+        delay_ct=mb_out.state.delay_ct,
+        delay_mossy=mb_out.state.delay_mossy,
+        last_action=state.last_action,
+        last_action_id=state.last_action_id,
+        last_sensory=state.last_sensory,
+        last_rpe=state.last_rpe,
+        last_total_reward=state.last_total_reward,
+    ), (mb_out.cortex_belief, mb_out.cortex_l5_rate, mb_out.relay_spikes)
+
+
+# ---------------------------------------------------------------------
+# Top-level: perceive→learn→perceive cycle (one body decision)
+# ---------------------------------------------------------------------
+
+
+def action_brain_step(
+    state: ActionBrainState,
+    params: ActionBrainParams,
+    ctx: BackendContext,
+    sensory: Array,
+    prev_reward: float | Array,
+    prev_done: float | Array,
+    key: PRNGKey,
+) -> ActionBrainOutput:
+    """Run one full decision cycle on sensory ``s_{t+1}``.
+
+    Inputs:
+      * ``sensory``      : ``s_{t+1}`` just received from body.act(a_t).
+      * ``prev_reward``  : ``r_t`` emitted during that transition.
+      * ``prev_done``    : terminal flag for the transition.
+      * ``key``          : PRNG for action sampling (tie-break).
+
+    Output:
+      * ``action``       : the newly committed ``a_{t+1}``.
+      * Diagnostics including the RPE that corrected the previous
+        transition, the aggregated intrinsic+extrinsic total reward,
+        curiosity, and selected cortical readouts.
+
+    Side effect: the world model is *updated* with the realised
+    transition (s_t, a_t, s_{t+1}), and the cerebellum receives the
+    resulting sensory-prediction error as its climbing signal.
+
+    All operations are pure; JIT via ``jax.lax.scan`` for the substep
+    loop inside perception.
+    """
+    r_ext = jnp.asarray(prev_reward, DTYPE)
+    done = jnp.asarray(prev_done, DTYPE)
+
+    # --- 1. Perceive s_{t+1} first so critic.activation = V(s_{t+1}).
+    # Clear BG evidence at the start of a new decision window so
+    # spike counts accumulate cleanly over this window only.
+    state = eqx.tree_at(
+        lambda s: s.actor,
+        state,
+        actor_reset_evidence(state.actor),
+    )
+
+    # During perception the phasic-DA / ACh drives carry the *previous*
+    # cycle's RPE and curiosity (neuromod bus has finite lag; new
+    # estimates are available only after we have finished perceiving
+    # and computed the transition error).
+    prev_rpe = state.last_rpe
+    prev_curiosity = wm_curiosity_signal(state.world_model, params.world_model)
+
+    def scan_body(st: ActionBrainState, _):
+        new_st, readouts = _perceive_substep(
+            st, params, ctx, sensory,
+            td_error=prev_rpe, novelty=prev_curiosity,
+        )
+        return new_st, readouts
+
+    state, readouts_hist = jax.lax.scan(
+        scan_body, state, None, length=params.substeps,
+    )
+    belief_hist, l5_rate_hist, relay_hist = readouts_hist
+    cortex_belief = belief_hist[-1]
+    cortex_l5_rate = l5_rate_hist[-1]
+    relay_spikes = relay_hist[-1]
+
+    # --- 2. Close the loop on the PREVIOUS transition --------------
+    # 2a. World-model learning on (s_t, a_t, s_{t+1}) \u2014 sensory PE
+    #     serves as the cerebellar climbing signal.
+    wm_out = wm_update(
+        state.world_model, params.world_model, ctx,
+        state.last_sensory, state.last_action, sensory,
+        m_t=1.0,
+        ach=state.neuromodulator.acetylcholine,
+    )
+    sensory_pe = wm_out.prediction_error                 # (sensory_size,)
+    climbing = sensory_pe @ params.w_io_pc               # (n_purkinje,)
+    cb_state = cerebellum_update(
+        state.cerebellum, params.cerebellum, climbing, modulator=1.0,
+    )
+
+    # 2b. Intrinsic drives feed r_total.
+    curiosity = wm_curiosity_signal(wm_out.state, params.world_model)
+    atp_mean = jnp.mean(wm_out.state.astro.atp)
+    atp_deficit = jnp.clip(1.0 - atp_mean, 0.0, 1.0)
+    r_total = (
+        r_ext
+        + params.beta_curiosity * curiosity
+        - params.beta_homeostasis * atp_deficit
+    )
+
+    # 2c. TD(0) RPE: V(s_t)=state.vta.stored_v, V(s_{t+1})=critic.activation
+    #     (just computed by the perceive scan above).
+    vta_out = vta_compute_rpe(
+        state.vta, params.vta,
+        critic_activation=state.critic.activation,
+        reward=r_total,
+        is_terminal=done,
+        serotonin=state.neuromodulator.serotonin,
+        n_substeps=params.substeps,
+    )
+    rpe = vta_out.rpe
+
+    # 2d. Weight updates driven by this RPE.
+    vta_state = vta_update(vta_out.state, params.vta, rpe)
+    critic_state = critic_update(state.critic, params.critic, rpe)
+    actor_state = actor_update(
+        state.actor, params.actor, rpe, state.last_action_id,
+    )
+
+    # --- 3. Store V(s_{t+1}) in VTA for next cycle's TD target. -----
+    vta_state = vta_store_prediction(vta_state, critic_state.activation)
+
+    # --- 4. Select a_{t+1} from the BG evidence accumulated in scan.
+    action_id = actor_select_action(actor_state, params.actor, key)
+    action_oh = (
+        jnp.arange(params.n_actions) == action_id
+    ).astype(DTYPE)
+
+    cerebellum_nuclei = cb_state.dn_rate
+
+    new_state = ActionBrainState(
+        thalamus_relay=state.thalamus_relay,
+        thalamus_trn=state.thalamus_trn,
+        cortex=state.cortex,
+        cerebellum=cb_state,
+        oscillator=state.oscillator,
+        neuromodulator=state.neuromodulator,
+        critic=critic_state,
+        actor=actor_state,
+        vta=vta_state,
+        world_model=wm_out.state,
+        delay_ct=state.delay_ct, delay_mossy=state.delay_mossy,
+        last_action=action_oh,
+        last_action_id=action_id,
+        last_sensory=sensory.astype(DTYPE),
+        last_rpe=rpe,
+        last_total_reward=r_total,
+    )
+
+    return ActionBrainOutput(
+        state=new_state,
+        action=action_id,
+        rpe=rpe,
+        total_reward=r_total,
+        curiosity=curiosity,
+        cortex_belief=cortex_belief,
+        cortex_l5_rate=cortex_l5_rate,
+        cerebellum_nuclei=cerebellum_nuclei,
+        relay_spikes=relay_spikes,
+        theta_phase=state.oscillator.theta_phase,
+        neuromod=state.neuromodulator,
+    )

@@ -65,7 +65,7 @@ def _rheobase_cond_scale(
     e_exc: float = 0.0,
     ampa_frac: float = 0.75,
     target_rate: float = 0.05,
-    headroom: float = 1.58,
+    headroom: float = 2.0,
 ) -> float:
     """Boost factor so expected steady-state input drives AdEx to rheobase.
 

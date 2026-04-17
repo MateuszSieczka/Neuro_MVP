@@ -102,7 +102,7 @@ class RelayState(eqx.Module):
 
 def _relay_cond_scale(tc: NeuronParams, fan_in: int, e_exc: float,
                       expected_rate: float, raw_w_mean: float = 0.5,
-                      headroom: float = 1.3) -> float:
+                      headroom: float = 1.6) -> float:
     """Boost so ``expected_rate`` input drives TC cells to rheobase.
 
     Converts dimensionless raw weights (half-normal, mean ``raw_w_mean``)

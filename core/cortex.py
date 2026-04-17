@@ -173,12 +173,16 @@ def _rheobase_cond_scale(
     e_exc: float = 0.0,
     ampa_frac: float = 0.75,
     input_rate: float = 0.05,
-    headroom: float = 1.58,
+    headroom: float = 2.0,
 ) -> float:
     """Boost so expected pre-synaptic drive reaches AdEx rheobase.
 
     ``input_rate`` is the *expected fraction of presynaptic units firing
     per dt*, NOT this layer's own target output sparsity.
+
+    Safety factor ``headroom = 2.0`` (Destexhe 2009; Naud & Gerstner
+    2012) absorbs both the half-normal weight variability and small
+    mismatches between expected and realised upstream firing rates.
     """
     gap = float(abs(ncfg.v_thresh - ncfg.v_rest))
     i_rheo = float(ncfg.g_L) * (gap - float(ncfg.delta_t))

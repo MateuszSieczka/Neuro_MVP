@@ -168,4 +168,7 @@ from .brain_graph import (
     MinimalBrainParams, MinimalBrainState, MinimalBrainOutput,
     init_minimal_brain_params, init_minimal_brain_state,
     minimal_brain_step, region_phase,
+    ActionBrainParams, ActionBrainState, ActionBrainOutput,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_step,
 )

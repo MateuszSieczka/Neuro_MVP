@@ -146,3 +146,26 @@ from .cortex import (
     init_cortical_area_params, init_cortical_area_state,
     cortical_area_step, cortical_area_update, cortical_area_reset_transient,
 )
+
+# -- Cerebellum (generic forward model, Marr-Albus-Ito) --
+from .cerebellum import (
+    CerebellumParams, CerebellumState, CerebellumOutput,
+    init_cerebellum_params, init_cerebellum_state,
+    cerebellum_step, cerebellum_update, cerebellum_reset_transient,
+)
+
+# -- Thalamus (relay nuclei + TRN) --
+from .thalamus import (
+    RelayParams, RelayState, TRNParams, TRNState, ThalamicOutput,
+    init_relay_params, init_relay_state,
+    init_trn_params, init_trn_state,
+    thalamic_step, relay_reset_transient, trn_reset_transient,
+)
+
+# -- Brain graph (wiring primitives + reference MinimalBrain) --
+from .brain_graph import (
+    DelayBuffer, init_delay_buffer, delay_push_pop,
+    MinimalBrainParams, MinimalBrainState, MinimalBrainOutput,
+    init_minimal_brain_params, init_minimal_brain_state,
+    minimal_brain_step, region_phase,
+)

@@ -1,259 +1,320 @@
-"""
-Episodic Memory — hippocampal one-shot binding with interference forgetting.
+"""Hippocampal episodic memory — pure JAX.
 
-Reference:
-  Rolls (2013)  "Pattern completion and separation in the hippocampus"
-  O'Neill et al. (2010)  Hippocampal replay
-  McClelland, McNaughton & O'Reilly (1995)  Complementary learning systems
+Rolls (2013) “Pattern completion and separation in the hippocampus”;
+O’Neill et al. (2010); McClelland et al. (1995).
 
-Changes from legacy:
-  1. Interference-based forgetting: new memories overwrite most similar
-     (not oldest FIFO). Consolidated memories resist overwrite.
-  2. DG-like sparse encoding: random projection + threshold for pattern
-     separation before storage.
-  3. Uses EpisodicMemoryConfig from config.py (dg_sparsity, consolidation).
+Fixed-capacity structure-of-arrays:
+- ``keys``          (capacity, dg_dim)  DG-sparse encodings
+- ``states``        (capacity, state_dim)
+- ``next_states``   (capacity, state_dim)
+- ``actions``       (capacity,)          integer (one-hot indices fit here;
+                                          continuous actions stored separately)
+- ``rewards``       (capacity,)
+- ``saliences``     (capacity,)
+- ``replay_counts`` (capacity,)
+- ``valid``         (capacity,)          bool mask
+- ``write_ptr``     scalar               next eligible empty slot
+
+Legacy behaviour preserved:
+- NE-gated storage (skip when ``ne_level < ne_threshold``).
+- Novelty check via cosine similarity against all valid stored DG keys.
+- Interference-based forgetting: overwrite the most-similar
+  *non-consolidated* memory (``replay_count < consolidation_threshold``);
+  if none qualify, overwrite the least-salient slot.
+
+JAX differences:
+- Python ``list.append`` → scalar ``write_ptr`` that saturates at
+  ``capacity``; subsequent writes go through the interference rule.
+- The whole write path is JIT-safe (no Python conditions).
+- ``try_store`` returns a new state plus a boolean indicator.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import NamedTuple
 
-import numpy as np
-from numpy.typing import NDArray
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 
-from .config import EpisodicMemoryConfig
-
-
-# =====================================================================
-# Data container
-# =====================================================================
-
-@dataclass
-class Episode:
-    """A single episodic memory trace."""
-    state: NDArray[np.float32]
-    action: int | NDArray[np.float32]
-    reward: float
-    next_state: NDArray[np.float32]
-    salience: float = 1.0
-    prediction_error: NDArray[np.float32] | None = None
-    encoder_e_bu: NDArray[np.float32] | None = None
-    encoder_spikes: NDArray[np.float32] | None = None
-    aug_state: NDArray[np.float32] | None = None
-    # Consolidation tracking
-    replay_count: int = 0
-
-    def __post_init__(self) -> None:
-        self.state = np.asarray(self.state, dtype=np.float32).copy()
-        self.next_state = np.asarray(self.next_state, dtype=np.float32).copy()
-        if self.aug_state is not None:
-            self.aug_state = np.asarray(self.aug_state, dtype=np.float32).copy()
-        if self.prediction_error is not None:
-            self.prediction_error = np.asarray(self.prediction_error, dtype=np.float32).copy()
-        if self.encoder_e_bu is not None:
-            self.encoder_e_bu = np.asarray(self.encoder_e_bu, dtype=np.float32).copy()
-        if self.encoder_spikes is not None:
-            self.encoder_spikes = np.asarray(self.encoder_spikes, dtype=np.float32).copy()
+from .backend import DTYPE, Array, PRNGKey
 
 
 # =====================================================================
-# Episodic Memory
+# Params / state
 # =====================================================================
 
-class EpisodicMemory:
-    """One-shot episodic memory with interference forgetting and DG sparse coding.
 
-    Storage is gated by NE level ≥ threshold AND novelty.
-    Forgetting: new memory overwrites the most similar existing memory
-    (not the oldest). Consolidated memories (replay_count ≥ threshold)
-    resist overwrite.
+class EpisodicParams(eqx.Module):
+    """Static hyperparameters + fixed sizes."""
+
+    ne_threshold: Array
+    similarity_thresh: Array    # (1 − similarity) → novelty
+    dg_sparsity: Array
+    consolidation_threshold: Array  # scalar int replay count
+    capacity: int = eqx.field(static=True)
+    state_dim: int = eqx.field(static=True)
+    dg_dim: int = eqx.field(static=True)
+    dg_k: int = eqx.field(static=True)
+
+
+def init_episodic_params(
+    state_dim: int,
+    *,
+    capacity: int = 500,
+    ne_threshold: float = 0.3,
+    similarity_thresh: float = 0.85,
+    dg_sparsity: float = 0.05,
+    dg_expansion_factor: int = 5,
+    consolidation_threshold: int = 3,
+) -> EpisodicParams:
+    dg_dim = state_dim * dg_expansion_factor
+    dg_k = max(1, int(dg_sparsity * dg_dim))
+    f = lambda x: jnp.asarray(x, DTYPE)
+    return EpisodicParams(
+        ne_threshold=f(ne_threshold),
+        similarity_thresh=f(similarity_thresh),
+        dg_sparsity=f(dg_sparsity),
+        consolidation_threshold=jnp.asarray(consolidation_threshold, jnp.int32),
+        capacity=capacity, state_dim=state_dim,
+        dg_dim=dg_dim, dg_k=dg_k,
+    )
+
+
+class EpisodicState(eqx.Module):
+    """Fixed-capacity SoA buffer + DG projection matrix."""
+
+    dg_projection: Array         # (state_dim, dg_dim)
+    keys: Array                  # (capacity, dg_dim)
+    states: Array                # (capacity, state_dim)
+    next_states: Array           # (capacity, state_dim)
+    actions: Array               # (capacity,) int32
+    rewards: Array               # (capacity,)
+    saliences: Array             # (capacity,)
+    replay_counts: Array         # (capacity,) int32
+    valid: Array                 # (capacity,) bool
+    write_ptr: Array             # scalar int32 — index of next empty slot
+
+
+def init_episodic_state(
+    key: PRNGKey, params: EpisodicParams, *, dtype=DTYPE,
+) -> EpisodicState:
+    """Gaussian DG projection with unit-variance columns (Rolls 2013)."""
+    dg = jax.random.normal(
+        key, (params.state_dim, params.dg_dim), dtype=dtype,
+    ) / jnp.sqrt(jnp.asarray(params.state_dim, dtype))
+    C = params.capacity
+    return EpisodicState(
+        dg_projection=dg,
+        keys=jnp.zeros((C, params.dg_dim), dtype=dtype),
+        states=jnp.zeros((C, params.state_dim), dtype=dtype),
+        next_states=jnp.zeros((C, params.state_dim), dtype=dtype),
+        actions=jnp.zeros(C, dtype=jnp.int32),
+        rewards=jnp.zeros(C, dtype=dtype),
+        saliences=jnp.zeros(C, dtype=dtype),
+        replay_counts=jnp.zeros(C, dtype=jnp.int32),
+        valid=jnp.zeros(C, dtype=jnp.bool_),
+        write_ptr=jnp.asarray(0, jnp.int32),
+    )
+
+
+# =====================================================================
+# DG encoding
+# =====================================================================
+
+
+def dg_encode(state: EpisodicState, params: EpisodicParams, x: Array) -> Array:
+    """``state → sparse binary DG code`` via top-k thresholding."""
+    projected = x.astype(DTYPE) @ state.dg_projection
+    # Top-k threshold: the (k)-th largest value.
+    sorted_desc = jnp.sort(projected)[::-1]
+    threshold = sorted_desc[params.dg_k - 1]
+    return (projected >= threshold).astype(DTYPE)
+
+
+def _cos_sim(a: Array, B: Array, valid: Array) -> Array:
+    """Cosine sim of ``a`` against each row of ``B``, masked by ``valid``.
+
+    Invalid rows return ``-1`` (can never beat a valid positive sim).
     """
+    a_norm = jnp.linalg.norm(a) + 1e-8
+    B_norm = jnp.linalg.norm(B, axis=1) + 1e-8
+    sim = (B @ a) / (B_norm * a_norm)
+    return jnp.where(valid, sim, jnp.asarray(-1.0, DTYPE))
 
-    def __init__(
-        self,
-        state_dim: int,
-        config: EpisodicMemoryConfig | None = None,
-    ) -> None:
-        self.config = config or EpisodicMemoryConfig()
-        self.state_dim = state_dim
-        cfg = self.config
 
-        self._keys: list[NDArray[np.float32]] = []
-        self._episodes: list[Episode] = []
+# =====================================================================
+# Storage
+# =====================================================================
 
-        # ── DG-like sparse encoding (Rolls 2013) ─────────────────────
-        # Random projection: state → expanded sparse code
-        dg_dim = state_dim * cfg.dg_expansion_factor
-        self._dg_projection: NDArray[np.float32] = np.random.randn(
-            state_dim, dg_dim,
-        ).astype(np.float32) * (1.0 / np.sqrt(state_dim))
-        self._dg_dim = dg_dim
-        self._dg_sparsity = cfg.dg_sparsity
 
-    # ------------------------------------------------------------------
-    # DG sparse encoding
-    # ------------------------------------------------------------------
+class StoreOutput(NamedTuple):
+    state: EpisodicState
+    stored: Array                # bool scalar
+    slot: Array                  # int32 scalar — index used (−0 if no-op)
 
-    def _dg_encode(self, state: NDArray[np.float32]) -> NDArray[np.float32]:
-        """Pattern separation: state → sparse binary DG code."""
-        projected = state @ self._dg_projection
-        # Keep top-k% as active (competitive threshold)
-        k = max(1, int(self._dg_sparsity * self._dg_dim))
-        threshold = np.partition(projected, -k)[-k] if projected.size > k else 0.0
-        sparse = (projected >= threshold).astype(np.float32)
-        return sparse
 
-    # ------------------------------------------------------------------
-    # Storage (NE-gated, interference forgetting)
-    # ------------------------------------------------------------------
+def try_store(
+    state: EpisodicState, params: EpisodicParams,
+    s: Array, a: int | Array, r: float | Array, s_next: Array,
+    ne_level: float | Array,
+) -> StoreOutput:
+    """NE-gated, novelty-gated, interference-forgetting write.
 
-    def try_store(
-        self,
-        state: NDArray[np.float32],
-        action: int | NDArray[np.float32],
-        reward: float,
-        next_state: NDArray[np.float32],
-        ne_level: float,
-        prediction_error: NDArray[np.float32] | None = None,
-        encoder_e_bu: NDArray[np.float32] | None = None,
-        encoder_spikes: NDArray[np.float32] | None = None,
-        aug_state: NDArray[np.float32] | None = None,
-    ) -> bool:
-        """Store an episode if NE-gated and novel. Returns True if stored."""
-        if ne_level < self.config.ne_threshold:
-            return False
+    Decision tree (all JIT-safe via masks):
+      1. ``stored = (ne ≥ ne_threshold) AND novel``.
+      2. ``slot =`` first empty if any; else most-similar non-consolidated;
+         else least-salient slot overall.
+      3. If ``stored``: write all SoA fields at ``slot``.
 
-        state_f32 = np.asarray(state, dtype=np.float32)
-        dg_key = self._dg_encode(state_f32)
+    Returns the new state plus a boolean indicator and the slot used.
+    """
+    ne = jnp.asarray(ne_level, DTYPE)
+    s_f = s.astype(DTYPE)
+    s_next_f = s_next.astype(DTYPE)
+    a_int = jnp.asarray(a, jnp.int32)
+    r_f = jnp.asarray(r, DTYPE)
 
-        if not self._is_novel(dg_key):
-            return False
+    key = dg_encode(state, params, s_f)
+    sims = _cos_sim(key, state.keys, state.valid)
+    max_sim = jnp.max(sims)
+    novel = max_sim < params.similarity_thresh
 
-        episode = Episode(
-            state=state_f32,
-            action=action,
-            reward=reward,
-            next_state=next_state,
-            salience=float(np.clip(ne_level, 0.0, 1.0)),
-            prediction_error=prediction_error,
-            encoder_e_bu=encoder_e_bu,
-            encoder_spikes=encoder_spikes,
-            aug_state=aug_state,
-        )
+    ne_gate = ne >= params.ne_threshold
+    stored = ne_gate & novel
 
-        if len(self._episodes) < self.config.capacity:
-            self._keys.append(dg_key.copy())
-            self._episodes.append(episode)
-        else:
-            # Interference-based forgetting: overwrite most similar
-            # non-consolidated memory
-            idx = self._find_interference_target(dg_key)
-            if idx is not None:
-                self._keys[idx] = dg_key.copy()
-                self._episodes[idx] = episode
-            else:
-                # All memories consolidated: overwrite least salient
-                sals = [ep.salience for ep in self._episodes]
-                idx_min = int(np.argmin(sals))
-                self._keys[idx_min] = dg_key.copy()
-                self._episodes[idx_min] = episode
+    # Pick slot.
+    empty_mask = ~state.valid
+    any_empty = jnp.any(empty_mask)
+    empty_slot = jnp.argmax(empty_mask.astype(jnp.int32))
 
-        return True
+    non_consolidated = state.replay_counts < params.consolidation_threshold
+    cand_mask = state.valid & non_consolidated
+    # Sim subset: valid∩non-consolidated; others ⇒ -1.
+    cand_sims = jnp.where(cand_mask, sims, jnp.asarray(-1.0, DTYPE))
+    any_candidate = jnp.any(cand_mask)
+    cand_slot = jnp.argmax(cand_sims)
 
-    def _find_interference_target(
-        self,
-        dg_key: NDArray[np.float32],
-    ) -> int | None:
-        """Find the most similar non-consolidated memory to overwrite."""
-        cfg = self.config
-        best_sim = -1.0
-        best_idx: int | None = None
-        key_norm = np.linalg.norm(dg_key)
-        if key_norm < 1e-8:
-            return None
+    # Fallback: least-salient overall valid slot.
+    sal_key = jnp.where(state.valid, state.saliences, jnp.asarray(jnp.inf, DTYPE))
+    least_salient = jnp.argmin(sal_key)
 
-        for i, stored_key in enumerate(self._keys):
-            # Skip consolidated memories
-            if self._episodes[i].replay_count >= cfg.consolidation_threshold:
-                continue
-            stored_norm = np.linalg.norm(stored_key)
-            if stored_norm < 1e-8:
-                continue
-            sim = float(np.dot(dg_key, stored_key) / (key_norm * stored_norm))
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = i
+    slot = jnp.where(
+        any_empty, empty_slot,
+        jnp.where(any_candidate, cand_slot, least_salient),
+    ).astype(jnp.int32)
 
-        return best_idx
+    # Masked write: if stored, overwrite the slot; else identity update.
+    def _set_row(arr: Array, row: Array, idx: Array) -> Array:
+        return arr.at[idx].set(row)
 
-    # ------------------------------------------------------------------
-    # Recall (CA3-like pattern completion)
-    # ------------------------------------------------------------------
+    def _set_scalar(arr: Array, val: Array, idx: Array) -> Array:
+        return arr.at[idx].set(val)
 
-    def recall(
-        self,
-        cue: NDArray[np.float32],
-        top_k: int = 1,
-    ) -> list[Episode]:
-        """Pattern-completion recall: find top_k most similar episodes."""
-        if not self._episodes:
-            return []
+    keys_new = jnp.where(
+        stored, _set_row(state.keys, key, slot), state.keys,
+    )
+    states_new = jnp.where(
+        stored, _set_row(state.states, s_f, slot), state.states,
+    )
+    nexts_new = jnp.where(
+        stored, _set_row(state.next_states, s_next_f, slot), state.next_states,
+    )
+    actions_new = jnp.where(
+        stored, _set_scalar(state.actions, a_int, slot), state.actions,
+    )
+    rewards_new = jnp.where(
+        stored, _set_scalar(state.rewards, r_f, slot), state.rewards,
+    )
+    sal_val = jnp.clip(ne, 0.0, 1.0)
+    sals_new = jnp.where(
+        stored, _set_scalar(state.saliences, sal_val, slot), state.saliences,
+    )
+    # Reset replay count on overwrite.
+    rc_new = jnp.where(
+        stored,
+        _set_scalar(state.replay_counts, jnp.asarray(0, jnp.int32), slot),
+        state.replay_counts,
+    )
+    valid_new = jnp.where(
+        stored, _set_scalar(state.valid, jnp.asarray(True), slot), state.valid,
+    )
+    # write_ptr tracks empty-slot count (monotone, capped at capacity).
+    wp_new = jnp.minimum(
+        state.write_ptr + stored.astype(jnp.int32) * any_empty.astype(jnp.int32),
+        jnp.asarray(params.capacity, jnp.int32),
+    )
 
-        cue_dg = self._dg_encode(np.asarray(cue, dtype=np.float32))
-        cue_norm = np.linalg.norm(cue_dg)
-        if cue_norm < 1e-8:
-            return []
+    new_state = eqx.tree_at(
+        lambda st: (
+            st.keys, st.states, st.next_states, st.actions, st.rewards,
+            st.saliences, st.replay_counts, st.valid, st.write_ptr,
+        ),
+        state,
+        (
+            keys_new, states_new, nexts_new, actions_new, rewards_new,
+            sals_new, rc_new, valid_new, wp_new,
+        ),
+    )
+    return StoreOutput(state=new_state, stored=stored, slot=slot)
 
-        similarities: list[float] = []
-        for key in self._keys:
-            key_norm = np.linalg.norm(key)
-            if key_norm < 1e-8:
-                similarities.append(-1.0)
-            else:
-                similarities.append(float(np.dot(cue_dg, key) / (cue_norm * key_norm)))
 
-        sorted_idx = np.argsort(similarities)[::-1]
-        top_k = min(top_k, len(self._episodes))
-        return [self._episodes[i] for i in sorted_idx[:top_k]]
+# =====================================================================
+# Recall + consolidation
+# =====================================================================
 
-    def recall_all(self) -> list[Episode]:
-        """Return all stored episodes (for sleep consolidation)."""
-        return list(self._episodes)
 
-    def mark_replayed(self, episode: Episode) -> None:
-        """Increment replay count for consolidation tracking."""
-        episode.replay_count += 1
+class RecallOutput(NamedTuple):
+    indices: Array           # (top_k,)
+    similarities: Array      # (top_k,)
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
 
-    @property
-    def size(self) -> int:
-        return len(self._episodes)
+def recall(
+    state: EpisodicState, params: EpisodicParams,
+    cue: Array, top_k: int = 1,
+) -> RecallOutput:
+    """Return ``top_k`` slot indices sorted by cosine similarity.
 
-    def clear(self) -> None:
-        self._keys.clear()
-        self._episodes.clear()
+    Invalid rows score ``-1``; callers must gate on ``similarities`` if
+    they need a positive match.
+    """
+    cue_key = dg_encode(state, params, cue)
+    sims = _cos_sim(cue_key, state.keys, state.valid)
+    # Use negative sort to get descending order.
+    neg_sorted_idx = jnp.argsort(-sims)
+    idx = neg_sorted_idx[:top_k]
+    return RecallOutput(indices=idx, similarities=sims[idx])
 
-    def _is_novel(self, dg_key: NDArray[np.float32]) -> bool:
-        """True if DG key is sufficiently different from all stored keys."""
-        if not self._keys:
-            return True
-        key_norm = np.linalg.norm(dg_key)
-        if key_norm < 1e-8:
-            return False
-        for stored in self._keys:
-            stored_norm = np.linalg.norm(stored)
-            if stored_norm < 1e-8:
-                continue
-            cos_sim = float(np.dot(dg_key, stored) / (key_norm * stored_norm))
-            if cos_sim >= self.config.similarity_thresh:
-                return False
-        return True
 
-    def __len__(self) -> int:
-        return len(self._episodes)
+def mark_replayed(state: EpisodicState, idx: Array) -> EpisodicState:
+    """Increment ``replay_counts[idx]`` (for consolidation bookkeeping)."""
+    rc = state.replay_counts.at[idx].add(1)
+    return eqx.tree_at(lambda s: s.replay_counts, state, rc)
 
-    def __repr__(self) -> str:
-        return f"EpisodicMemory(size={self.size}/{self.config.capacity})"
+
+def episodic_size(state: EpisodicState) -> Array:
+    """Number of currently valid episodes."""
+    return jnp.sum(state.valid.astype(jnp.int32))
+
+
+def episodic_clear(state: EpisodicState, params: EpisodicParams) -> EpisodicState:
+    """Drop all episodes; keep the DG projection."""
+    C = params.capacity
+    return eqx.tree_at(
+        lambda s: (
+            s.keys, s.states, s.next_states, s.actions, s.rewards,
+            s.saliences, s.replay_counts, s.valid, s.write_ptr,
+        ),
+        state,
+        (
+            jnp.zeros((C, params.dg_dim), DTYPE),
+            jnp.zeros((C, params.state_dim), DTYPE),
+            jnp.zeros((C, params.state_dim), DTYPE),
+            jnp.zeros(C, jnp.int32),
+            jnp.zeros(C, DTYPE),
+            jnp.zeros(C, DTYPE),
+            jnp.zeros(C, jnp.int32),
+            jnp.zeros(C, jnp.bool_),
+            jnp.asarray(0, jnp.int32),
+        ),
+    )

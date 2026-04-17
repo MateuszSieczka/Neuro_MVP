@@ -8,7 +8,7 @@ from arena.environments import TMazeEnv
 from arena.snn_agent import SNNAgent
 
 results = []
-for seed in range(5):
+for seed in range(3):
     np.random.seed(seed * 17 + 5)
     env = TMazeEnv()
     agent = SNNAgent(
@@ -19,7 +19,7 @@ for seed in range(5):
 
     t0 = time.time()
     rewards = []
-    for ep in range(600):
+    for ep in range(2000):
         state = env.reset(seed=ep)
         agent.reset()
         total = 0.0
@@ -32,11 +32,11 @@ for seed in range(5):
             if done:
                 break
         rewards.append(total)
-        if (ep + 1) % 200 == 0:
-            m = np.mean(rewards[-100:])
-            print(f"  Seed {seed} ep {ep+1}: last100={m:.2f}")
+        if (ep + 1) %25 == 0:
+            m = np.mean(rewards[-25:])
+            print(f"  Seed {seed} ep {ep+1}: last25={m:.2f}")
 
-    late = float(np.mean(rewards[-100:]))
+    late = float(np.mean(rewards[-25:]))
     elapsed = time.time() - t0
     print(f"Seed {seed}: late_mean={late:.2f} elapsed={elapsed:.0f}s")
     results.append(late)

@@ -57,14 +57,6 @@ class ReceptorType(Enum):
     NMDA = auto()   # Slow, voltage-dependent (Mg²⁺ block)
 
 
-class SynapseType(Enum):
-    """Synapse conductance models."""
-    AMPA = auto()
-    NMDA = auto()
-    GABA_A = auto()
-    GABA_B = auto()
-
-
 # =====================================================================
 # SimulationContext-aware base
 # =====================================================================
@@ -143,14 +135,8 @@ class NeuronConfig(BaseConfig):
     e_exc: float = 0.0            # Excitatory reversal potential (mV)
 
     # ── Derived (computed in __post_init__) ───────────────────────────
-    # Membrane decay factor per timestep (LIF-compat, used by subclasses)
-    mem_decay: float = field(init=False, default=0.0)
-    # Membrane gain complement (1 - decay)
-    mem_gain: float = field(init=False, default=0.0)
     # Threshold gap: v_thresh - v_rest (mV) — used for weight scaling
     gap: float = field(init=False, default=0.0)
-    # Minimum current to reach threshold from rest in one tau_m
-    i_thresh: float = field(init=False, default=0.0)
     # Adaptation decay: exp(-dt / tau_w)
     w_decay: float = field(init=False, default=0.0)
     # Adaptation gain: 1 - exp(-dt / tau_w)
@@ -173,13 +159,8 @@ class NeuronConfig(BaseConfig):
         assert self.tau_w > 0, f"tau_w must be positive, got {self.tau_w}"
         assert self.g_L > 0, f"g_L must be positive, got {self.g_L}"
         assert self.C_m > 0, f"C_m must be positive, got {self.C_m}"
-        object.__setattr__(self, 'mem_decay', self.ctx.decay(self.tau_m))
-        object.__setattr__(self, 'mem_gain', self.ctx.complement(self.tau_m))
         gap = abs(self.v_thresh - self.v_rest)
         object.__setattr__(self, 'gap', gap)
-        # I_thresh: current that brings v from rest to thresh in one tau_m
-        # v_thresh = v_rest + I × (1 - decay) => I = gap / (1 - decay)
-        object.__setattr__(self, 'i_thresh', gap * (1.0 - self.mem_decay))
         # AdEx adaptation decay factors
         object.__setattr__(self, 'w_decay', self.ctx.decay(self.tau_w))
         object.__setattr__(self, 'w_gain', self.ctx.complement(self.tau_w))
@@ -356,136 +337,19 @@ class SynapseConfig(BaseConfig):
             object.__setattr__(self, f'{prefix}_norm', 1.0 / raw_peak)
 
     @staticmethod
-    def nmda_mg_block(v: float | np.ndarray) -> float | np.ndarray:
+    def nmda_mg_block(v: float | np.ndarray, mg: float = 1.0) -> float | np.ndarray:
         """NMDA voltage-dependent Mg²⁺ block factor B(V).
 
         B(V) = 1 / (1 + [Mg²⁺]/3.57 × exp(-0.062 × V))
 
+        Args:
+            v: Membrane potential (mV).
+            mg: Extracellular Mg²⁺ concentration (mM). Default 1.0.
+
         Reference: Jahr & Stevens (1990)
         """
-        return 1.0 / (1.0 + (1.0 / 3.57) * np.exp(np.clip(-0.062 * v, -20.0, 20.0)))
+        return 1.0 / (1.0 + (mg / 3.57) * np.exp(np.clip(-0.062 * v, -20.0, 20.0)))
 
-
-@dataclass(frozen=True, kw_only=True)
-class CompetitiveConfig(BaseConfig):
-    """k-WTA parameters derived from target sparsity and population size.
-
-    Conductance-based inhibition (Brunel & Wang 2003):
-      ΔV = g_inh × (E_inh − V)
-    Self-limits as V → E_inh (GABA-A reversal = −75 mV).
-
-    Key derivation:
-      k_winners = ceil(target_sparsity × num_neurons)
-      g_inh = gap × (N/k) × strength / (V_thresh − E_inh)
-    where denominator = driving force at threshold (20 mV for default params).
-    At V = V_thresh: full inhibitory drive ≡ old heuristic strength.
-    At V → E_inh: drive → 0 (self-limiting, Brunel & Wang 2003).
-    """
-    target_sparsity: float = 0.15  # Fraction of neurons active per window
-    inhibition_strength: float = 1.5  # Multiplier on g_inh (1.0 = just-sufficient)
-    window_ms: float = 100.0  # k-WTA evaluation window (ms)
-    # GABA-A reversal potential (Buhl et al. 1995: −75 ± 3 mV in cortex)
-    e_inh: float = -75.0
-
-    def __post_init__(self) -> None:
-        assert 0 < self.target_sparsity < 1, f"target_sparsity must be in (0, 1), got {self.target_sparsity}"
-        assert self.inhibition_strength > 0, f"inhibition_strength must be positive, got {self.inhibition_strength}"
-        assert self.window_ms > 0, f"window_ms must be positive, got {self.window_ms}"
-
-    @staticmethod
-    def derive_k(target_sparsity: float, num_neurons: int) -> int:
-        """Compute k_winners from target sparsity and population size."""
-        return max(1, math.ceil(target_sparsity * num_neurons))
-
-    @staticmethod
-    def derive_g_inh(
-        gap: float,
-        v_thresh: float,
-        e_inh: float,
-        num_neurons: int,
-        k_winners: int,
-        strength: float = 1.5,
-    ) -> float:
-        """Derive inhibitory conductance for conductance-based k-WTA.
-
-        Chosen so that at V = V_thresh the inhibitory voltage step equals
-        the old heuristic ``gap × N/k × strength``.  At V → E_inh the
-        driving force vanishes — faithfully modelling GABA-A shunting
-        inhibition (Brunel & Wang 2003).
-
-        g_inh = gap × (N/k) × strength / (V_thresh − E_inh)
-
-        Reference: Brunel & Wang (2003) "What determines the frequency
-        of fast network oscillations with irregular neural discharges?"
-        """
-        driving_force = max(v_thresh - e_inh, 1e-6)
-        return gap * (num_neurons / max(k_winners, 1)) * strength / driving_force
-
-
-# =====================================================================
-# Predictive Coding & Pyramidal
-# =====================================================================
-
-@dataclass(frozen=True, kw_only=True)
-class PredictiveCodingConfig(BaseConfig):
-    """Predictive Coding layer parameters.
-
-    Reference: Friston (2010), Rao & Ballard (1999), Bogacz (2017)
-
-    Inner relaxation loop converges prediction error before membrane
-    integration.  Belief state (rate proxy r) is iteratively updated:
-      r ← r + η × (ACh × ∇_r ε + (1-ACh) × top_down)
-    where η = 1 / L (Lipschitz-bounded step, L estimated from W).
-    Bogacz (2017): 3-5 iterations typically sufficient for convergence.
-    """
-    feedback_strength: float = 0.5
-    feedback_learning_rate: float = 0.005
-    feedback_norm: bool = True
-    # Relaxation loop (Bogacz 2017)
-    n_relax_steps: int = 3           # Inner iterations per forward()
-    relax_tolerance: float = 1e-3    # Convergence: max|Δr| < tol → stop
-
-    def __post_init__(self) -> None:
-        assert self.feedback_learning_rate > 0, f"feedback_learning_rate must be positive, got {self.feedback_learning_rate}"
-        assert self.n_relax_steps >= 1, f"n_relax_steps must be >= 1, got {self.n_relax_steps}"
-
-
-@dataclass(frozen=True, kw_only=True)
-class PyramidalConfig(BaseConfig):
-    """Multi-compartment pyramidal neuron parameters.
-
-    Reference: Larkum, Zhu & Bhatt (1999), Payeur et al. (2021)
-
-    Apical trunk: passive cable with Ca²⁺ spike mechanism.
-      tau_apical = 100-200ms (electrotonically remote from soma)
-      Ca²⁺ activation: m_Ca = sigmoid((V_apical - V_half) / k_ca)
-      BAC firing: soma spike + apical Ca²⁺ spike within temporal window → burst
-
-    Burst-dependent plasticity (Payeur et al. 2021):
-      burst → 3-5× STDP eligibility boost
-    """
-    tau_apical: float = 150.0       # Apical membrane τ (ms) — was 50, should be 100-200
-    apical_delay_ms: int = 5        # Apical-to-soma propagation delay (ms)
-                                    # Stuart & Spruston (1998): 5-10 ms
-    apical_threshold: float = 0.3   # Normalized Ca²⁺ spike threshold
-    apical_boost: float = 10.0      # Somatic threshold reduction (mV) during plateau
-    burst_stdp_factor: float = 3.0  # Payeur et al.: 3-5× boost
-    apical_lr: float = 0.005        # Apical weight Hebbian learning rate
-    plateau_duration_ms: int = 50   # Ca²⁺ plateau duration (ms)
-    background_noise_std: float = 2.0  # Membrane noise σ (mV)
-    # Ca²⁺ spike voltage-dependent activation (Larkum 2013)
-    ca_v_half: float = 0.4  # Half-activation of apical Ca²⁺ channel
-    ca_k: float = 0.1       # Activation steepness
-    # Top-down prediction scaling for generate_prediction()
-    feedback_strength: float = 0.5
-
-    # ── Derived ───────────────────────────────────────────────────────
-    apical_decay: float = field(init=False, default=0.0)
-
-    def __post_init__(self) -> None:
-        assert self.tau_apical > 0, f"tau_apical must be positive, got {self.tau_apical}"
-        assert self.burst_stdp_factor > 0, f"burst_stdp_factor must be positive, got {self.burst_stdp_factor}"
-        object.__setattr__(self, 'apical_decay', self.ctx.decay(self.tau_apical))
 
 
 @dataclass(frozen=True, kw_only=True)

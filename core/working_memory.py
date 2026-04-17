@@ -1,468 +1,427 @@
-"""
-Working Memory — prefrontal attractor dynamics with dual ACh+DA gating.
+"""Prefrontal working memory — pure JAX.
 
-Reference:
-  Goldman-Rakic (1995)  Prefrontal persistent activity
-  O'Reilly & Frank (2006)  "Making working memory work"
-  Durstewitz et al. (2000)  "Neurocomputational models of working memory"
-  Compte et al. (2000)  Synaptic mechanisms of persistent activity
+Goldman-Rakic (1995); O’Reilly & Frank (2006); Durstewitz et al. (2000);
+Compte et al. (2000); Brette & Gerstner (2005); Feldmeyer et al. (2002).
 
-Changes from legacy:
-  1. Dual gating: ACh (sensory) AND DA (update signal) — conjunction gate
-  2. Uses WorkingMemoryConfig from config.py (derived decays)
-  3. Gate opens only when BOTH ACh ≥ threshold AND DA ≥ threshold
-  4. Content neurons: AdEx with PFC-like slow adaptation (τ_w=300ms)
-  5. Conductance-based synapses: I = g × (E_exc - V) (Ohm's law)
+Architecture:
+- **Content neurons** (``n`` AdEx PFC pyramidals, τ_w=300 ms slow
+  adaptation) with feedforward ``w_ff`` + dense recurrent ``w_lateral``.
+  Conductance-based synapses: ``I = g · (E_exc − V)``.
+- **Gate neurons** (``n_gate`` AdEx MSN-like, τ=25 ms) driven by
+  ``ACh · DA · drive_calibrated``. Drive is derived from the AdEx
+  rheobase so the population only fires above both thresholds
+  (O’Reilly & Frank 2006 conjunction gate).
+- Gate rate EMA ⇒ ``gate_signal ∈ [0, 1]`` that multiplicatively
+  scales the ``w_ff`` conductance during content integration.
+
+Differences from legacy:
+- Astrocyte coupling dropped here; will re-emerge in Phase 2 cortex
+  composition layer.
+- Python ``if gate > 0.01`` branches replaced with always-on tensor ops
+  (``gate`` factor already multiplies the update; the threshold was
+  only a compute optimisation and is JIT-incompatible).
+- Pre-mask uses the raw external spike vector (0/1) instead of the
+  legacy ``ext > 0.1`` threshold — functionally identical for binary
+  spikes.
+- Lateral Hebbian learning is kept two-factor (no neuromodulation),
+  matching Goldman-Rakic’s attractor-bootstrapping story, but its rate
+  is now an explicit parameter.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import NamedTuple
 
-import numpy as np
-from numpy.typing import NDArray
+import equinox as eqx
+import jax
+import jax.numpy as jnp
 
-from .config import WorkingMemoryConfig, init_weights
+from .backend import DTYPE, Array, PRNGKey, BackendContext, split_key
+from .state import NeuronParams, NeuronState, init_neuron_state
+from .neuron import init_neuron_params, neuron_step
 
-if TYPE_CHECKING:
-    from .astrocyte import AstrocyteField
+
+# =====================================================================
+# Params / state
+# =====================================================================
 
 
-class WorkingMemoryModule:
-    """Persistent WM via recurrent attractor dynamics with dual gating.
+class WMParams(eqx.Module):
+    """Content + gate AdEx params + WM-specific scalars."""
 
-    Dual gating (O'Reilly & Frank 2006):
-      ACh gates sensory input (bottom-up relevance)
-      DA gates update signal (reward PE → new context important)
-      Gate = spiking MSN population: ACh and DA modulate excitability
-      via receptor-like dynamics.  Both must exceed threshold for the
-      gate neurons to fire → conjunction gate from biophysics.
+    content: NeuronParams
+    gate: NeuronParams
+
+    # Conductance-based synapse
+    e_exc: Array
+    driving_force_exc: Array   # E_exc − V_rest
+
+    # Lateral attractor
+    lateral_strength: Array    # multiplies recurrent conductance
+    lateral_lr: Array          # Hebbian lateral LR
+    content_decay: Array       # low-pass on spikes for attractor trace
+
+    # Feedforward three-factor STDP
+    ff_lr: Array
+    trace_decay: Array         # eligibility e decay
+    pre_decay: Array
+    post_decay: Array
+
+    # Gate drive
+    gate_drive: Array          # calibrated from AdEx rheobase
+    gate_noise_std_mV: Array   # Destexhe 2003
+    gate_max_rate_per_step: Array
+    gate_rate_decay: Array
+
+    # Static sizes
+    n_in: int = eqx.field(static=True)
+    n: int = eqx.field(static=True)
+    n_gate: int = eqx.field(static=True)
+
+
+def _rheobase_drive(
+    gap_mV: float, delta_t: float, C_m: float, tau: float,
+    a: float, ach_thr: float, da_thr: float,
+) -> float:
+    """Gate drive that barely reaches rheobase + adaptation equilibrium at
+    both thresholds (ACh = ach_thr, DA = da_thr)."""
+    g_L_eff = C_m / tau
+    i_rheo = g_L_eff * (gap_mV - delta_t)
+    w_adapt_eq = a * gap_mV
+    denom = max(ach_thr, 0.01) * max(da_thr, 0.01)
+    return float((i_rheo + w_adapt_eq) / denom)
+
+
+def init_wm_params(
+    ctx: BackendContext,
+    n_in: int,
+    n: int,
+    *,
+    n_gate: int = 32,
+    # Content PFC AdEx (Durstewitz 2000)
+    v_rest: float = -70.0,
+    v_thresh: float = -55.0,
+    v_reset: float = -75.0,
+    v_spike_cutoff: float = -30.0,
+    delta_t: float = 2.0,
+    C_m: float = 281.0,
+    g_L: float = 30.0,
+    tau_w: float = 300.0,
+    a_content: float = 2.0,
+    b_content: float = 20.0,
+    refrac_period_ms: float = 2.0,
+    # Gate MSN AdEx (Humphries 2006)
+    gate_tau: float = 25.0,
+    gate_C_m: float = 281.0,
+    gate_delta_t: float = 2.0,
+    gate_v_spike_cutoff: float = -30.0,
+    gate_tau_w: float = 144.0,
+    gate_a: float = 4.0,
+    gate_b: float = 80.5,
+    gate_noise_mV: float = 1.0,
+    gate_max_rate_hz: float = 40.0,
+    # Synapse
+    e_exc: float = 0.0,
+    # Attractor + plasticity
+    lateral_strength: float = 0.5,
+    lateral_lr: float = 0.01,
+    ff_lr: float = 0.01,
+    tau_e: float = 20.0,
+    tau_pre: float = 20.0,
+    tau_post: float = 20.0,
+    ach_gate_threshold: float = 0.5,
+    da_gate_threshold: float = 0.4,
+) -> WMParams:
+    f = lambda x: jnp.asarray(x, DTYPE)
+
+    content_p = init_neuron_params(
+        ctx,
+        v_rest=v_rest, v_thresh=v_thresh, v_reset=v_reset,
+        v_spike_cutoff=v_spike_cutoff, delta_t=delta_t,
+        C_m=C_m, g_L=g_L, tau_w=tau_w,
+        a=a_content, b=b_content,
+        refrac_period_ms=refrac_period_ms,
+    )
+    # Gate MSNs: g_L computed from C_m/tau so exp-Euler matches legacy.
+    gate_g_L = gate_C_m / gate_tau
+    gate_p = init_neuron_params(
+        ctx,
+        v_rest=v_rest, v_thresh=v_thresh, v_reset=v_reset,
+        v_spike_cutoff=gate_v_spike_cutoff, delta_t=gate_delta_t,
+        C_m=gate_C_m, g_L=gate_g_L, tau_w=gate_tau_w,
+        a=gate_a, b=gate_b,
+        refrac_period_ms=refrac_period_ms,
+    )
+
+    gap = abs(v_thresh - v_rest)
+    drive = _rheobase_drive(
+        gap, gate_delta_t, gate_C_m, gate_tau, gate_a,
+        ach_gate_threshold, da_gate_threshold,
+    )
+
+    return WMParams(
+        content=content_p,
+        gate=gate_p,
+        e_exc=f(e_exc),
+        driving_force_exc=f(e_exc - v_rest),
+        lateral_strength=f(lateral_strength),
+        lateral_lr=f(lateral_lr),
+        content_decay=f(ctx.decay(tau_w)),
+        ff_lr=f(ff_lr),
+        trace_decay=f(ctx.decay(tau_e)),
+        pre_decay=f(ctx.decay(tau_pre)),
+        post_decay=f(ctx.decay(tau_post)),
+        gate_drive=f(drive),
+        gate_noise_std_mV=f(gate_noise_mV),
+        gate_max_rate_per_step=f(gate_max_rate_hz * ctx.dt / 1000.0),
+        gate_rate_decay=f(ctx.decay(gate_tau)),
+        n_in=n_in, n=n, n_gate=n_gate,
+    )
+
+
+class WMState(eqx.Module):
+    """Content + gate AdEx states, weights, eligibility, content trace."""
+
+    content: NeuronState
+    gate: NeuronState
+    gate_rate: Array          # (n_gate,) EMA of gate spikes
+    gate_signal: Array        # scalar [0, 1]
+    w_ff: Array               # (n_in, n) feedforward weights (nS)
+    w_lateral: Array          # (n, n) dense recurrent (nS)
+    e: Array                  # (n_in, n) eligibility trace
+    x_pre: Array              # (n_in,)
+    x_post: Array             # (n,)
+    content_trace: Array      # (n,) low-pass spike trace
+
+
+def init_wm_state(
+    key: PRNGKey, params: WMParams,
+    *,
+    ff_psp_mV: float | None = None,
+    lat_psp_mV: float | None = None,
+    dtype=DTYPE,
+) -> WMState:
+    """Initialise WM with PSP-targeted half-normal weights.
+
+    ``ff_psp_mV`` / ``lat_psp_mV`` default to ``gap/2`` and ``gap/3``
+    respectively (thalamic → PFC unitary EPSPs 5–10 mV, Cruikshank
+    et al. 2012; Gil & Bhatt 1999). Per-synapse conductance is derived
+    from ``g = PSP · g_L / (E_exc − V_rest)`` and realised as a
+    half-normal ``|N(0, σ)|`` with ``E[|w|] = g``. Gate neurons start
+    in the up-state (V_T − 2 mV, Wilson & Kawaguchi 1996) so ACh·DA
+    drive can fire them within 2–3 ms.
     """
+    k_ff, k_lat = split_key(key, 2)
+    n_in, n, n_gate = params.n_in, params.n, params.n_gate
+    gap = float(abs(params.content.v_thresh - params.content.v_rest))
+    if ff_psp_mV is None:
+        ff_psp_mV = gap / 2.0
+    if lat_psp_mV is None:
+        lat_psp_mV = gap / 3.0
+    # Half-normal: E[|N(0, σ)|] = σ·√(2/π) ≈ 0.7979·σ.
+    sqrt_2_over_pi = float(jnp.sqrt(2.0 / jnp.pi))
+    g_L = float(params.content.g_L)
+    df = float(params.driving_force_exc)
+    g_ff = ff_psp_mV * g_L / df
+    g_lat = lat_psp_mV * g_L / df
+    sigma_ff = g_ff / sqrt_2_over_pi
+    sigma_lat = g_lat / sqrt_2_over_pi
+    w_ff = jnp.abs(
+        jax.random.normal(k_ff, (n_in, n), dtype=dtype) * sigma_ff
+    )
+    w_lat = jnp.abs(
+        jax.random.normal(k_lat, (n, n), dtype=dtype) * sigma_lat
+    )
+    # No autapses.
+    w_lat = w_lat * (1.0 - jnp.eye(n, dtype=dtype))
 
-    # ── NetworkGraph layer interface ─────────────────────────────
+    content_state = init_neuron_state(n, v_rest=float(params.content.v_rest))
+    gate_state = init_neuron_state(
+        n_gate, v_rest=float(params.gate.v_thresh - 2.0),  # up-state
+    )
 
-    @property
-    def num_inputs(self) -> int:
-        return self.num_external_inputs
+    return WMState(
+        content=content_state,
+        gate=gate_state,
+        gate_rate=jnp.zeros(n_gate, dtype=dtype),
+        gate_signal=jnp.asarray(0.0, dtype),
+        w_ff=w_ff,
+        w_lateral=w_lat,
+        e=jnp.zeros((n_in, n), dtype=dtype),
+        x_pre=jnp.zeros(n_in, dtype=dtype),
+        x_post=jnp.zeros(n, dtype=dtype),
+        content_trace=jnp.zeros(n, dtype=dtype),
+    )
 
-    def __init__(
-        self,
-        num_external_inputs: int,
-        num_neurons: int,
-        config: WorkingMemoryConfig | None = None,
-    ) -> None:
-        self.config = config or WorkingMemoryConfig()
-        self.num_neurons = num_neurons
-        self.num_external_inputs = num_external_inputs
-        cfg = self.config
 
-        # ── Membrane state ────────────────────────────────────────────
-        self.v: NDArray[np.float32] = np.full(
-            num_neurons, cfg.v_rest, dtype=np.float32,
-        )
-        self.has_spiked: NDArray[np.bool_] = np.zeros(num_neurons, dtype=bool)
-        self.refrac_count: NDArray[np.int32] = np.zeros(num_neurons, dtype=np.int32)
-        # AdEx adaptation current (Durstewitz et al. 2000)
-        self.w_adapt: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
+# =====================================================================
+# Step
+# =====================================================================
 
-        # ── Synaptic weights (nS, conductance-based; Feldmeyer 2002) ─
-        # WM receives sparse low-dimensional input (raw state, not
-        # population-coded): typically 1-3 out of N inputs active per
-        # step.  Each synapse must be strong enough that 2 active inputs
-        # approach threshold.  Calibrate PSP to gap/2 so that 2 co-active
-        # inputs produce ~gap mV total depolarisation → threshold.
-        # This matches thalamic→PFC unitary EPSPs: 5-10 mV
-        # (Cruikshank et al. 2012; Gil & Bhatt 1999).
-        _wm_psp = cfg.gap / 2.0
-        self.w_ff: NDArray[np.float32] = init_weights(
-            num_external_inputs, num_neurons,
-            psp_target=_wm_psp,
-            excitatory=True,
-            g_L=cfg.g_L,
-            driving_force=cfg.driving_force_exc,
-        )
-        # Recurrent connectivity for attractor dynamics (Compte et al.
-        # 2000; Goldman-Rakic 1995).  PFC persistent activity requires
-        # pre-existing recurrent excitation — lateral weights cannot
-        # bootstrap from zero because without firing there is no
-        # Hebbian learning signal (chicken-and-egg problem).
-        # Lateral PSP scaled to gap/3: recurrent alone shouldn't cause
-        # runaway firing, but 3 co-active neighbours → threshold.
-        _lat_psp = cfg.gap / 3.0
-        self.w_lateral: NDArray[np.float32] = init_weights(
-            num_neurons, num_neurons,
-            psp_target=_lat_psp,
-            excitatory=True,
-            g_L=cfg.g_L,
-            driving_force=cfg.driving_force_exc,
-        )
-        np.fill_diagonal(self.w_lateral, 0.0)  # No autapses (no self-connections)
 
-        # ── Eligibility traces ────────────────────────────────────────
-        self.e: NDArray[np.float32] = np.zeros(
-            (num_external_inputs, num_neurons), dtype=np.float32,
-        )
-        self.x_pre: NDArray[np.float32] = np.zeros(
-            num_external_inputs, dtype=np.float32,
-        )
-        self.x_post: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
+class WMOutput(NamedTuple):
+    state: WMState
+    spikes: Array             # (n,) content spikes
+    gate_signal: Array        # scalar
 
-        # ── Precomputed decays from config ────────────────────────────
-        self._trace_decay: float = cfg.ctx.decay(cfg.tau_e)
-        self._pre_decay: float = cfg.ctx.decay(cfg.tau_pre)
-        self._post_decay: float = cfg.ctx.decay(cfg.tau_post)
-        self._content_decay: float = cfg.content_decay
 
-        # ── Gate state: striosomal MSN population (O'Reilly & Frank 2006) ─
-        # Population of AdEx MSN-like gate neurons.  ACh and DA each
-        # provide excitatory drive; conjunction arises because neither
-        # alone exceeds firing threshold.
-        # Population size from config (default 32, same as BG action
-        # channel — gate is a binary action: open/close).
-        ng = cfg.n_gate
-        self._n_gate: int = ng
-        # Gate MSNs initialise in up-state (Wilson & Kawaguchi 1996;
-        # Stern et al. 1998): V ≈ V_T − 2 mV.  In-vivo MSNs
-        # alternate between down-state (−80 mV) and up-state
-        # (−55 mV); starting in up-state lets the gate respond
-        # within 2-3 ms when ACh × DA drive arrives.
-        _gate_v_init = cfg.v_thresh - 2.0  # up-state
-        self._gate_v: NDArray[np.float32] = np.full(
-            ng, _gate_v_init, dtype=np.float32,
-        )
-        self._gate_spikes: NDArray[np.bool_] = np.zeros(ng, dtype=bool)
-        self._gate_refrac: NDArray[np.int32] = np.zeros(ng, dtype=np.int32)
-        self._gate_rate: NDArray[np.float32] = np.zeros(ng, dtype=np.float32)
-        # AdEx adaptation current for gate neurons
-        self._gate_w_adapt: NDArray[np.float32] = np.zeros(
-            ng, dtype=np.float32,
-        )
-        # Gate membrane/rate decays from config (derived from gate_tau)
-        self._gate_mem_decay: float = cfg.gate_mem_decay
-        self._gate_rate_decay: float = cfg.gate_rate_decay
-        # Drive calibration: at both thresholds, total synaptic current
-        # should just reach AdEx rheobase + steady-state adaptation.
-        # AdEx rheobase ≈ g_L × (V_T - E_L - Δ_T) (Brette & Gerstner 2005)
-        # where the -Δ_T accounts for the exponential spike initiation
-        # lowering the effective threshold.
-        # Adaptation at threshold: w_eq = a × (V_T - E_L) — the steady-
-        # state subthreshold adaptation current that builds up as V
-        # approaches V_T.  Without this term, the gate current balances
-        # against rheobase but the accumulated adaptation absorbs the
-        # margin, creating a stable sub-threshold equilibrium where
-        # gate neurons can never spike (observed: V stalls at ~-55 mV).
-        _g_L_eff = cfg.gate_C_m / cfg.gate_tau
-        _gap = cfg.v_thresh - cfg.v_rest  # 15 mV
-        _i_rheo = _g_L_eff * (_gap - cfg.gate_delta_t)
-        _w_adapt_at_thresh = cfg.gate_a * _gap
-        self._gate_drive: float = (_i_rheo + _w_adapt_at_thresh) / (
-            max(cfg.ach_gate_threshold, 0.01) * max(cfg.da_gate_threshold, 0.01)
-        )
-        self._gate_signal: float = 0.0
-        self._ach_level: float = 0.0
-        self._da_level: float = 0.0
+def _gate_step(
+    state: WMState, params: WMParams, ctx: BackendContext,
+    ach: Array, da: Array, key: PRNGKey,
+) -> WMState:
+    """Advance the AdEx MSN gate population and its rate EMA."""
+    gp = params.gate
+    # Scalar drive: ACh · DA · gate_drive, applied uniformly to gate pop.
+    drive_scalar = ach * da * params.gate_drive
+    drive = jnp.broadcast_to(drive_scalar, (params.n_gate,))
+    # Membrane-noise current (Destexhe 2003): I_n ~ N(0, g_L · σ_V).
+    noise = jax.random.normal(key, (params.n_gate,), dtype=DTYPE) * (
+        gp.g_L * params.gate_noise_std_mV
+    )
+    i_syn = drive + noise
+    g_syn = jnp.zeros_like(i_syn)  # drive is already current-mode here
 
-        # ── Content: low-pass filtered activity (attractor trace) ─────
-        self.content: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
+    new_gate, gate_spikes = neuron_step(
+        state.gate, gp, ctx, i_syn=i_syn, g_syn=g_syn,
+    )
+    # Population rate EMA → normalise to [0, 1].
+    rate = (
+        state.gate_rate * params.gate_rate_decay
+        + gate_spikes * (1.0 - params.gate_rate_decay)
+    )
+    raw_signal = jnp.mean(rate)
+    gate_signal = jnp.clip(
+        raw_signal / jnp.maximum(params.gate_max_rate_per_step, 1e-8),
+        0.0, 1.0,
+    )
+    return eqx.tree_at(
+        lambda s: (s.gate, s.gate_rate, s.gate_signal),
+        state,
+        (new_gate, rate, gate_signal),
+    )
 
-        # ── Prediction error placeholder ──────────────────────────────
-        self.prediction_error: NDArray[np.float32] = np.ones(
-            num_neurons, dtype=np.float32,
-        )
 
-        # ── Receptor dose-response modulation (D2) ───────────────────
-        self._receptor_gain: float = 1.0
-        self._receptor_lr: float = 1.0
+def _content_step(
+    state: WMState, params: WMParams, ctx: BackendContext,
+    external_input: Array, receptor_gain: Array,
+) -> WMOutput:
+    """Advance the PFC content population under gated ff + attractor drive."""
+    cp = params.content
+    gate = state.gate_signal
+    ext = external_input.astype(DTYPE)
 
-        # ── Astrocyte field (De Pittà et al. 2011) ──────────────────
-        self._astrocyte: AstrocyteField | None = None
-        self._zone_idx: NDArray[np.int32] | None = None
+    # Conductance-based input (gate-scaled, receptor-modulated).
+    g_ff = gate * receptor_gain * (ext @ state.w_ff)            # (n,)
+    I_ff = g_ff * (params.e_exc - state.content.v)
 
-    # ------------------------------------------------------------------
-    # Dual gating (O'Reilly & Frank 2006)
-    # ------------------------------------------------------------------
+    # Recurrent attractor: lateral_strength · content_trace @ w_lat.
+    g_rec = params.lateral_strength * (state.content_trace @ state.w_lateral)
+    I_rec = g_rec * (params.e_exc - state.content.v)
 
-    def gate(self, ach_level: float, da_level: float = 1.0) -> None:
-        """AdEx MSN conjunction gate (O'Reilly & Frank 2006).
+    i_syn = I_ff + I_rec
+    g_syn = g_ff + g_rec
 
-        Gate neuron population receives ACh and DA as excitatory drives.
-        Both must be above threshold for total current to reach rheobase
-        and produce spikes → conjunction from biophysics, not sigmoid.
-        Gate signal = population firing rate normalised by MSN max rate.
+    new_content, spikes = neuron_step(
+        state.content, cp, ctx, i_syn=i_syn, g_syn=g_syn,
+    )
 
-        Uses AdEx neuron model (Brette & Gerstner 2005) consistent with
-        the rest of the network — same equations as D1D2Actor MSNs.
-        """
-        cfg = self.config
-        self._ach_level = float(ach_level)
-        self._da_level = float(da_level)
+    # STDP traces (pre on inputs, post on content spikes).
+    x_pre = state.x_pre * params.pre_decay + ext * gate
+    x_post = state.x_post * params.post_decay + spikes
 
-        # Multiplicative conjunction: ACh × DA × drive.
-        # At thresholds: current ≈ gap → barely fires.
-        # Above: fires reliably.  Below: no spikes.
-        gate_current = float(ach_level * da_level) * self._gate_drive
+    # Eligibility: decay + event-driven outer products, scaled by gate.
+    e = state.e * params.trace_decay
+    e = e + gate * (x_pre[:, None] * spikes[None, :])
+    e = e + gate * (ext[:, None] * x_post[None, :])
 
-        ng = self._n_gate
+    # Content trace (low-pass for attractor readout).
+    ct = state.content_trace * params.content_decay + spikes
 
-        # ── AdEx integration for gate neurons (Brette & Gerstner 2005) ─
-        in_refrac = self._gate_refrac > 0
-        self._gate_refrac[in_refrac] -= 1
+    new_state = eqx.tree_at(
+        lambda s: (s.content, s.x_pre, s.x_post, s.e, s.content_trace),
+        state,
+        (new_content, x_pre, x_post, e, ct),
+    )
+    return WMOutput(state=new_state, spikes=spikes, gate_signal=gate)
 
-        # Effective g_L for MSN Up-state (τ = gate_tau)
-        g_L_eff = cfg.gate_C_m / cfg.gate_tau
-        inv_Cm = 1.0 / cfg.gate_C_m
 
-        # Current noise: g_L × σ_V (Destexhe et al. 2003)
-        noise = np.random.normal(
-            0, g_L_eff * cfg.gate_noise_std, ng,
-        ).astype(np.float32)
+def wm_step(
+    state: WMState, params: WMParams, ctx: BackendContext,
+    external_input: Array,
+    ach: float | Array, da: float | Array,
+    key: PRNGKey,
+    receptor_gain: float | Array = 1.0,
+) -> WMOutput:
+    """One WM tick: gate population update → content AdEx + STDP traces."""
+    ach_a = jnp.asarray(ach, DTYPE)
+    da_a = jnp.asarray(da, DTYPE)
+    rg = jnp.asarray(receptor_gain, DTYPE)
+    state = _gate_step(state, params, ctx, ach_a, da_a, key)
+    return _content_step(state, params, ctx, external_input, rg)
 
-        # AdEx membrane dynamics:
-        # C dV/dt = -g_L(V-E_L) + g_L Δ_T exp((V-V_T)/Δ_T) + I - w
-        exp_term = np.exp(np.clip(
-            (self._gate_v - cfg.v_thresh) / cfg.gate_delta_t,
-            -20.0, 10.0,
-        ))
-        F = inv_Cm * (
-            -g_L_eff * (self._gate_v - cfg.v_rest)
-            + g_L_eff * cfg.gate_delta_t * exp_term
-            + gate_current + noise - self._gate_w_adapt
-        )
-        J = inv_Cm * (-g_L_eff + g_L_eff * exp_term)
-        # Exponential Euler step (same integrator as D1D2Actor)
-        # Clip J×dt to prevent overflow in exp(): |J×dt| > 20 means
-        # the linearisation has broken down and we fall back to forward Euler.
-        dt = cfg.ctx.dt
-        Jdt = J * dt
-        Jdt_clipped = np.clip(Jdt, -20.0, 20.0)
-        integrated = np.where(
-            np.abs(Jdt) > 1e-6,
-            self._gate_v + F / J * (np.exp(Jdt_clipped) - 1.0),
-            self._gate_v + F * dt,
-        )
-        self._gate_v = np.where(in_refrac, cfg.v_reset, integrated)
 
-        # Spike detection at v_spike_cutoff (above V_T)
-        self._gate_spikes = (
-            (self._gate_v >= cfg.gate_v_spike_cutoff) & ~in_refrac
-        )
-        self._gate_v[self._gate_spikes] = cfg.v_reset
-        self._gate_refrac[self._gate_spikes] = cfg.refrac_period
+# =====================================================================
+# Learning
+# =====================================================================
 
-        # Adaptation current (w): τ_w dw/dt = a(V-E_L) - w; w += b on spike
-        self._gate_w_adapt[self._gate_spikes] += cfg.gate_b
-        self._gate_w_adapt = (
-            self._gate_w_adapt * cfg.gate_w_decay
-            + cfg.gate_a * (self._gate_v - cfg.v_rest) * cfg.gate_w_gain
-        )
 
-        # Rate EMA → smooth gate signal
-        rc = 1.0 - self._gate_rate_decay
-        self._gate_rate = (
-            self._gate_rate * self._gate_rate_decay
-            + self._gate_spikes.astype(np.float32) * rc
-        )
-        # Normalise: population mean rate / max sustained MSN rate
-        # (Humphries et al. 2006; Planert et al. 2010: up-state MSN 40 Hz)
-        raw_signal = float(np.mean(self._gate_rate))
-        self._gate_signal = float(np.clip(
-            raw_signal / cfg.gate_max_rate_per_step, 0.0, 1.0,
-        ))
+def wm_update_ff(
+    state: WMState, params: WMParams,
+    m_t: float | Array,
+    pred_error: Array,
+    receptor_lr: float | Array = 1.0,
+) -> WMState:
+    """Three-factor STDP on ``w_ff``: Δw = lr·m_t·receptor_lr·e·ε(j).
 
-    # ------------------------------------------------------------------
-    # Core dynamics
-    # ------------------------------------------------------------------
+    ``pred_error`` broadcasts over the post axis (``(n,)``).
+    """
+    m = jnp.asarray(m_t, DTYPE)
+    rlr = jnp.asarray(receptor_lr, DTYPE)
+    err = pred_error.astype(DTYPE)
+    dw = params.ff_lr * m * rlr * state.e * err[None, :]
+    return eqx.tree_at(lambda s: s.w_ff, state, state.w_ff + dw)
 
-    def forward(self, external_input: NDArray[np.float32]) -> NDArray[np.float32]:
-        """One timestep of WM dynamics with AdEx integration.
 
-        Feedforward conductance scaled by soft gate signal [0, 1].
-        Recurrent attractor always active for content maintenance.
-        Conductance-based: I = g × (E_exc - V) (Ohm's law).
-        AdEx: exponential spike initiation + spike-frequency adaptation
-        with PFC-like slow τ_w=300ms (Durstewitz et al. 2000).
+def wm_update_lateral(state: WMState, params: WMParams) -> WMState:
+    """Two-factor Hebbian on ``w_lateral`` with row-max soft normalisation.
 
-        Returns:
-            (num_neurons,) spike array as float32.
-        """
-        cfg = self.config
-        gate = self._gate_signal
-        ctx = cfg.ctx
+    Only active when at least two content neurons spiked (otherwise
+    the outer product contributes nothing and we skip the normalisation
+    scan to save compute — but still JIT-friendly via ``jnp.where``).
+    """
+    active = state.content.spikes
+    # Hebbian outer, no autapses.
+    dw = params.lateral_lr * (active[:, None] * active[None, :])
+    n = params.n
+    dw = dw * (1.0 - jnp.eye(n, dtype=DTYPE))
+    w = state.w_lateral + dw
+    # Soft row-max normalisation (keep rows with max > 1).
+    row_max = jnp.max(w, axis=1, keepdims=True)
+    scale = jnp.where(row_max > 1.0, row_max, jnp.asarray(1.0, DTYPE))
+    w = w / scale
+    w = w * (1.0 - jnp.eye(n, dtype=DTYPE))
+    return eqx.tree_at(lambda s: s.w_lateral, state, w)
 
-        # ── Trace decay ───────────────────────────────────────────────
-        self.x_pre *= self._pre_decay
-        self.x_post *= self._post_decay
 
-        # ── Conductance-based input (scaled by gate + receptor gain) ──
-        ext_f32 = external_input.astype(np.float32)
-        g_ff = gate * self._receptor_gain * (ext_f32 @ self.w_ff)  # nS
-        I_ff = g_ff * (cfg.e_exc - self.v)                         # pA
-        self.x_pre += np.clip(ext_f32, 0.0, 1.0) * gate
-
-        # Recurrent contribution always active (attractor maintenance)
-        # Lateral weights are Hebbian [0, 1]; treat as conductance gain
-        g_rec = self.content @ self.w_lateral * cfg.lateral_strength  # nS
-        I_rec = g_rec * (cfg.e_exc - self.v)                         # pA
-
-        I_syn = I_ff + I_rec
-
-        # ── AdEx membrane integration (Brette & Gerstner 2005) ────────
-        in_refrac = self.refrac_count > 0
-        self.refrac_count[in_refrac] -= 1
-
-        # Astrocyte ATP modulation: threshold rises + leak increases
-        # as ATP depletes (Na⁺/K⁺-ATPase slowdown, Kann & Kovács 2007).
-        eff_v_thresh = cfg.v_thresh
-        eff_g_L = cfg.g_L
-        if self._astrocyte is not None:
-            zc = self._zone_idx
-            eff_v_thresh = cfg.v_thresh + self._astrocyte.threshold_shift[zc]
-            eff_g_L = cfg.g_L * self._astrocyte.leak_gain[zc]
-
-        inv_Cm = 1.0 / cfg.C_m
-        exp_term = np.exp(np.clip(
-            (self.v - eff_v_thresh) / cfg.delta_t,
-            -20.0, 10.0,
-        ))
-        F = inv_Cm * (
-            -eff_g_L * (self.v - cfg.v_rest)
-            + eff_g_L * cfg.delta_t * exp_term
-            + I_syn - self.w_adapt
-        )
-        J = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
-
-        # Exponential Euler step (same integrator as rest of network)
-        dt = ctx.dt
-        Jdt = J * dt
-        Jdt_clipped = np.clip(Jdt, -20.0, 20.0)
-        integrated = np.where(
-            np.abs(Jdt) > 1e-6,
-            self.v + F / J * (np.exp(Jdt_clipped) - 1.0),
-            self.v + F * dt,
-        )
-        self.v = np.where(in_refrac, cfg.v_reset, integrated)
-
-        # ── Spike detection at v_spike_cutoff ─────────────────────────
-        self.has_spiked = (self.v >= cfg.v_spike_cutoff) & ~in_refrac
-        self.v[self.has_spiked] = cfg.v_reset
-        self.refrac_count[self.has_spiked] = cfg.refrac_period
-        self.x_post[self.has_spiked] += 1.0
-
-        # ── Adaptation current w: τ_w dw/dt = a(V-E_L) - w; w += b ──
-        self.w_adapt[self.has_spiked] += cfg.b
-        self.w_adapt = (
-            self.w_adapt * cfg.w_decay
-            + cfg.a * (self.v - cfg.v_rest) * cfg.w_gain
-        )
-
-        # ── Eligibility traces (feedforward, gate-scaled) ───────────
-        self.e *= self._trace_decay
-        if gate > 0.01:
-            if np.any(self.has_spiked):
-                self.e[:, self.has_spiked] += gate * self.x_pre[:, np.newaxis]
-            pre_active = ext_f32 > 0.1
-            if np.any(pre_active):
-                self.e[pre_active, :] += gate * self.x_post[np.newaxis, :]
-
-        # ── Content update + lateral learning ─────────────────────────
-        self.content = (
-            self.content * self._content_decay
-            + self.has_spiked.astype(np.float32)
-        )
-        self._update_lateral_weights()
-
-        return self.has_spiked.astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # NetworkGraph-compatible neuromodulator setters
-    # ------------------------------------------------------------------
-
-    def set_ach_level(self, ach: float) -> None:
-        """ACh level for gating (re-evaluated on next gate() call)."""
-        self._ach_level = float(ach)
-
-    def set_astrocyte(
-        self,
-        astrocyte: AstrocyteField,
-        zone_idx: NDArray[np.int32] | None = None,
-    ) -> None:
-        """Attach astrocyte for ATP-based threshold/leak modulation."""
-        self._astrocyte = astrocyte
-        if zone_idx is not None:
-            self._zone_idx = zone_idx
-        else:
-            self._zone_idx = np.linspace(
-                0, astrocyte.n_zones - 1, self.num_neurons,
-            ).astype(np.int32)
-
-    def set_ne_level(self, ne: float) -> None:
-        """NE level — no direct effect on WM dynamics."""
-        pass
-
-    def set_receptor_modulation(self, gain_mod: float, lr_mod: float) -> None:
-        """Apply receptor dose-response modulation (Hill equation effects)."""
-        self._receptor_gain = float(gain_mod)
-        self._receptor_lr = float(lr_mod)
-
-    # ------------------------------------------------------------------
-    # Lateral Hebbian learning
-    # ------------------------------------------------------------------
-
-    def _update_lateral_weights(self) -> None:
-        """Hebbian co-activation: neurons that fire together wire together."""
-        active = self.has_spiked.astype(np.float32)
-        if np.sum(active) < 2:
-            return
-
-        dw = self.config.lateral_lr * np.outer(active, active)
-        np.fill_diagonal(dw, 0.0)
-        self.w_lateral += dw
-
-        # Soft normalisation
-        row_max = np.max(self.w_lateral, axis=1, keepdims=True)
-        scale = np.where(row_max > 1.0, row_max, 1.0)
-        self.w_lateral /= scale
-        np.fill_diagonal(self.w_lateral, 0.0)
-
-    # ------------------------------------------------------------------
-    # Weight update (three-factor rule)
-    # ------------------------------------------------------------------
-
-    def update_weights(self, m_t: float, pred_error: NDArray[np.float32]) -> None:
-        """Three-factor STDP for feedforward weights."""
-        if np.isclose(m_t, 0.0):
-            return
-        dw = self.config.learning_rate * m_t * self._receptor_lr * self.e * pred_error
-        self.w_ff += dw
-
-    # ------------------------------------------------------------------
-    # State management
-    # ------------------------------------------------------------------
-
-    def reset_state(self) -> None:
-        """Reset transient state. Learned weights preserved."""
-        self.v.fill(self.config.v_rest)
-        self.w_adapt.fill(0.0)
-        self.e.fill(0.0)
-        self.x_pre.fill(0.0)
-        self.x_post.fill(0.0)
-        self.refrac_count.fill(0)
-        self.has_spiked.fill(False)
-        self.content.fill(0.0)
-        self.prediction_error.fill(1.0)
-        self._gate_signal = 0.0
-        self._ach_level = 0.0
-        self._da_level = 0.0
-        # Reset gate neuron state — up-state init (Wilson & Kawaguchi 1996)
-        _gate_v_init = self.config.v_thresh - 2.0
-        self._gate_v.fill(_gate_v_init)
-        self._gate_spikes.fill(False)
-        self._gate_refrac.fill(0)
-        self._gate_rate.fill(0.0)
-        self._gate_w_adapt.fill(0.0)
+def wm_reset_transient(state: WMState, params: WMParams) -> WMState:
+    """Clear dynamic state (V, traces, content); keep learned weights."""
+    n, n_in, n_gate = params.n, params.n_in, params.n_gate
+    cp = params.content
+    gp = params.gate
+    return eqx.tree_at(
+        lambda s: (
+            s.content, s.gate, s.gate_rate, s.gate_signal,
+            s.e, s.x_pre, s.x_post, s.content_trace,
+        ),
+        state,
+        (
+            init_neuron_state(n, v_rest=float(cp.v_rest)),
+            init_neuron_state(n_gate, v_rest=float(gp.v_thresh - 2.0)),
+            jnp.zeros(n_gate, DTYPE),
+            jnp.asarray(0.0, DTYPE),
+            jnp.zeros((n_in, n), DTYPE),
+            jnp.zeros(n_in, DTYPE),
+            jnp.zeros(n, DTYPE),
+            jnp.zeros(n, DTYPE),
+        ),
+    )

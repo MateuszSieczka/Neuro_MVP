@@ -24,7 +24,6 @@ from core.basal_ganglia import (
     D1D2Actor,
     SNNDeepCritic,
 )
-from core.columnar import build_columnar_network, split_input
 from core.astrocyte import AstrocyteField
 from core.config import (
     AgentConfig,
@@ -83,17 +82,13 @@ class SNNAgent(Agent):
         agent_cfg: AgentConfig | None = None,
         use_world_model: bool = True,
         use_working_memory: bool = True,
-        use_columnar: bool = False,
-        receptive_field_size: int | None = None,
-        neurons_per_column: int | None = None,
-        assoc_neurons: int | None = None,
+
     ) -> None:
         self.state_size = state_size
         self.n_actions = n_actions
         self._agent_cfg = agent_cfg or AgentConfig()
         self._use_wm = use_world_model
         self._use_working_memory = use_working_memory and use_world_model
-        self._use_columnar = use_columnar
 
         self._bg_config = bg_config or BasalGangliaConfig()
         self._poisson = PoissonEncoder()
@@ -112,17 +107,7 @@ class SNNAgent(Agent):
         )
         self._encoded_size: int = self._pop_encoder.output_size
 
-        # ── Columnar-mode derived dimensions ──────────────────────────
-        if self._use_columnar:
-            self._rf_size = receptive_field_size or 4
-            self._neurons_per_col = neurons_per_column or max(8, self._rf_size)
-            self._assoc_neurons = assoc_neurons or max(32, state_size // 2)
-            bg_base_size = self._assoc_neurons
-        else:
-            self._rf_size = 0
-            self._neurons_per_col = 0
-            self._assoc_neurons = 0
-            bg_base_size = self._encoded_size
+        bg_base_size = self._encoded_size
 
         # ── Compute layer sizes ───────────────────────────────────────
         self._wm_num_neurons = max(8, state_size)
@@ -207,10 +192,6 @@ class SNNAgent(Agent):
             osc_config=OscillatorConfig(ctx=self._bg_config.ctx),
             ctx=self._bg_config.ctx,
         )
-        self._attention = None  # SpatialAttentionController (columnar only)
-        self._column_names: list[str] = []
-        self._kwta_names: list[str] = []
-        self._assoc_name: str = ""
         self._build_graph()
 
         # ── VTA dopaminergic circuit (Eshel et al. 2015) ──────────────
@@ -332,33 +313,12 @@ class SNNAgent(Agent):
         """Register all modules as layers and wire connections."""
         net = self.network
 
-        # ── Columnar layers (PC → k-WTA → assoc) ─────────────────────
-        if self._use_columnar:
-            _, col_names, kwta_names, assoc_name, attn = build_columnar_network(
-                input_dim=self.state_size,
-                receptive_field_size=self._rf_size,
-                neurons_per_column=self._neurons_per_col,
-                assoc_neurons=self._assoc_neurons,
-                net=net,
-            )
-            self._column_names = col_names
-            self._kwta_names = kwta_names
-            self._assoc_name = assoc_name
-            self._attention = attn
-
         # Critic and Actor get their own TD-based updates
         net.add_layer("critic", self.critic,
                        receptor_profile=STRIATUM_D1_RECEPTORS)
         net.add_layer("actor", self.actor,
                        receptor_profile=STRIATUM_ACTOR_RECEPTORS)
         net.mark_td_updated("critic", "actor")
-
-        # ── Columnar: assoc → BG via feedforward ─────────────────────
-        if self._use_columnar:
-            net.connect(self._assoc_name, "critic",
-                        aggregation_mode="sum")
-            net.connect(self._assoc_name, "actor",
-                        aggregation_mode="sum")
 
         if self._use_working_memory:
             self.working_memory.set_astrocyte(self._wm_astro)
@@ -386,29 +346,15 @@ class SNNAgent(Agent):
     ) -> dict[str, NDArray[np.float32]]:
         """Build sensory_inputs dict for network.step().
 
-        In flat mode: critic/actor receive Poisson-encoded state directly.
-        In columnar mode: columns receive receptive field slices; BG
-        receives from association layer via graph feedforward.
+        BG receives encoded state directly.
+        WM contribution arrives through graph sum (no padding).
         """
         sensory: dict[str, NDArray[np.float32]] = {}
 
-        if self._use_columnar:
-            # Split encoded state across column receptive fields
-            col_sensory = split_input(
-                encoded, self._column_names, self._rf_size,
-            )
-            sensory.update(col_sensory)
-
-            # WM receives Poisson-encoded raw state (matching state_size)
-            if self._use_working_memory:
-                sensory["working_memory"] = self._poisson.encode(raw_state)
-        else:
-            # Flat mode: BG receives encoded state directly
-            # WM contribution arrives through graph sum (no padding).
-            sensory["critic"] = encoded
-            sensory["actor"] = encoded
-            if self._use_working_memory:
-                sensory["working_memory"] = self._poisson.encode(raw_state)
+        sensory["critic"] = encoded
+        sensory["actor"] = encoded
+        if self._use_working_memory:
+            sensory["working_memory"] = self._poisson.encode(raw_state)
 
         if self._use_wm:
             sensory["encoder"] = self.world_model._build_input(
@@ -433,20 +379,12 @@ class SNNAgent(Agent):
         """
         sensory: dict[str, NDArray[np.float32]] = {}
 
-        if self._use_columnar:
-            col_sensory = split_input(
-                encoded, self._column_names, self._rf_size,
-            )
-            sensory.update(col_sensory)
-            if self._use_working_memory:
-                sensory["working_memory"] = self._poisson.encode(raw_state)
-        else:
-            sensory["critic"] = encoded
-            if self._use_working_memory:
-                sensory["working_memory"] = self._poisson.encode(raw_state)
-            # Actor explicitly receives zeros — no next-state processing
-            actor_size = self.actor.num_inputs
-            sensory["actor"] = np.zeros(actor_size, dtype=np.float32)
+        sensory["critic"] = encoded
+        if self._use_working_memory:
+            sensory["working_memory"] = self._poisson.encode(raw_state)
+        # Actor explicitly receives zeros — no next-state processing
+        actor_size = self.actor.num_inputs
+        sensory["actor"] = np.zeros(actor_size, dtype=np.float32)
 
         if self._use_wm:
             sensory["encoder"] = self.world_model._build_input(
@@ -501,8 +439,20 @@ class SNNAgent(Agent):
             self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
-                attention=self._attention,
+                attention=None,
             )
+            # Update astrocyte fields with per-step spike rates
+            # (De Pittà et al. 2011: Ca²⁺ accumulation ∝ rate²)
+            self._critic_astro.update(
+                self.critic.spikes_hidden.astype(np.float32),
+            )
+            self._actor_astro.update(
+                self.actor.spikes_d1.astype(np.float32),
+            )
+            if self._use_working_memory:
+                self._wm_astro.update(
+                    self.working_memory.has_spiked.astype(np.float32),
+                )
         self._last_encoded_state = encoded.copy()
 
         # VTA: capture V(s) in VP pathway after critic integration.
@@ -581,7 +531,7 @@ class SNNAgent(Agent):
             outputs = self.network.step(
                 sensory_inputs=sensory,
                 neuromodulator=self.neuromod,
-                attention=self._attention,
+                attention=None,
             )
 
         # ── VTA RPE computation (replaces algebraic TD error) ─────
@@ -641,7 +591,6 @@ class SNNAgent(Agent):
                 )
                 pe_len = min(len(pred_error), self.working_memory.num_neurons)
                 wm_pe[:pe_len] = pred_error[:pe_len]
-                self.working_memory.prediction_error = wm_pe
                 self.working_memory.update_weights(
                     m_t=wm_m_t, pred_error=wm_pe,
                 )
@@ -707,7 +656,6 @@ class SNNAgent(Agent):
                 aug_next_state=aug_next_state,
                 salience=self.neuromod.competition_sharpness,
                 recorded_da=self.neuromod.learning_rate_modulation,
-                curiosity=self._last_curiosity,
                 done=done,
             )
             self.replay_buffer.store(exp)

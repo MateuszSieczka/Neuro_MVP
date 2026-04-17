@@ -1,187 +1,187 @@
-"""
-Spatial Attention -- top-down + bottom-up saliency with IOR.
+"""Spatial attention — pure JAX (Reynolds & Heeger 2009 divisive normalisation
++ Posner & Cohen 1984 inhibition-of-return + Aston-Jones & Cohen 2005 NE gain).
 
-Reference:
-  Reynolds & Heeger (2009)  Normalization model of attention
-  Posner & Cohen (1984)     Inhibition of return
-  Aston-Jones & Cohen (2005) NE and attentional gain (inverse-U)
+Legacy stateful ``SpatialAttentionController`` is replaced with a pytree
+``AttentionState`` and a functional :func:`attention_step` that returns the
+next state plus per-column multiplicative gains.
 
-Changes from legacy:
-  1. Bottom-up saliency (prediction error magnitude per column)
-  2. Inhibition of Return (IOR): tau_IOR ~ 400ms inhibitory trace
-  3. Divisive normalization replaces softmax (Reynolds & Heeger 2009)
-  4. NE modulates multiplicative gain, not softmax temperature
-  5. Uses AttentionConfig from config.py (derived IOR decay)
+Top-down projection weights ``w_attn`` of shape ``(n_assoc, n_columns)``
+are part of the state so that attention plasticity composes with the rest
+of the learning update step under ``eqx.tree_at``.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from numpy.typing import NDArray
+from typing import NamedTuple
 
-from .config import AttentionConfig
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+from .backend import DTYPE, Array, PRNGKey, BackendContext
 
 
-class SpatialAttentionController:
-    """Per-column attention gains from top-down + bottom-up signals.
+class AttentionParams(eqx.Module):
+    """Derived hyperparameters (Reynolds & Heeger 2009; Posner & Cohen 1984)."""
 
-    Total saliency = alpha x bottom_up + (1-alpha) x top_down
-    alpha modulated by task engagement (tonic DA).
-    NE modulates multiplicative gain (Aston-Jones & Cohen 2005).
-    IOR suppresses previously attended columns.
-    Top-down normalization via divisive inhibition (Reynolds & Heeger 2009).
+    gain_strength: Array
+    divisive_sigma: Array
+    ne_optimal: Array
+    ne_gain_strength: Array
+    bottom_up_weight: Array
+    ior_strength: Array
+    ior_decay: Array
+    smoothing_decay: Array
+    learning_rate: Array
+
+
+def init_attention_params(
+    ctx: BackendContext,
+    *,
+    gain_strength: float = 2.0,
+    divisive_sigma: float = 1.0,
+    ne_optimal: float = 0.5,
+    ne_gain_strength: float = 2.0,
+    bottom_up_weight: float = 0.4,
+    ior_tau: float = 400.0,
+    ior_strength: float = 0.3,
+    smoothing_decay: float = 0.9,
+    learning_rate: float = 0.005,
+    dtype=DTYPE,
+) -> AttentionParams:
+    def f(x): return jnp.asarray(x, dtype)
+    return AttentionParams(
+        gain_strength=f(gain_strength),
+        divisive_sigma=f(divisive_sigma),
+        ne_optimal=f(ne_optimal),
+        ne_gain_strength=f(ne_gain_strength),
+        bottom_up_weight=f(bottom_up_weight),
+        ior_strength=f(ior_strength),
+        ior_decay=f(ctx.decay(ior_tau)),
+        smoothing_decay=f(smoothing_decay),
+        learning_rate=f(learning_rate),
+    )
+
+
+class AttentionState(eqx.Module):
+    """Transient attention state + learned top-down projection."""
+
+    attn_weights: Array
+    ior_trace: Array
+    w_attn: Array
+
+
+def init_attention_state(
+    key: PRNGKey,
+    n_assoc: int,
+    n_columns: int,
+    *,
+    w_init_scale: float = 0.1,
+    dtype=DTYPE,
+) -> AttentionState:
+    w_attn = jax.random.uniform(
+        key, (n_assoc, n_columns),
+        minval=-w_init_scale, maxval=w_init_scale, dtype=dtype,
+    )
+    return AttentionState(
+        attn_weights=jnp.full((n_columns,), 1.0 / n_columns, dtype=dtype),
+        ior_trace=jnp.zeros((n_columns,), dtype=dtype),
+        w_attn=w_attn,
+    )
+
+
+class AttentionOutput(NamedTuple):
+    state: AttentionState
+    gains: Array
+    attn_distribution: Array
+
+
+def _divisive_norm(td_raw: Array, sigma: Array) -> Array:
+    """Reynolds & Heeger (2009) R_i = c_i² / (σ² + Σ c_j²)."""
+    td_rect = jax.nn.relu(td_raw)
+    td_sq = td_rect * td_rect
+    denom = sigma * sigma + jnp.sum(td_sq) + jnp.asarray(1e-8, DTYPE)
+    return td_sq / denom
+
+
+def attention_step(
+    state: AttentionState,
+    params: AttentionParams,
+    assoc_activity: Array,
+    bottom_up_errors: Array | None = None,
+    *,
+    global_ach: float | Array = 0.5,
+    ne_level: float | Array = 0.5,
+) -> AttentionOutput:
+    """One attention update.
+
+    * Top-down saliency = ``assoc_activity @ w_attn`` with NE inverse-U gain,
+      then divisive normalisation.
+    * Bottom-up saliency = ``|bottom_up_errors|`` normalised to sum 1
+      (zero if ``None``).
+    * Mix with weight ``bottom_up_weight``.
+    * IOR suppresses recently attended columns.
+    * Temporal smoothing of the distribution.
+    * Column gain = ``1 + ACh · (w_i − mean(w)) · gain_strength`` (floor 0.1).
     """
+    act = assoc_activity.astype(DTYPE)
+    ach = jnp.asarray(global_ach, DTYPE)
+    ne = jnp.asarray(ne_level, DTYPE)
 
-    def __init__(
-        self,
-        assoc_neurons: int,
-        n_columns: int,
-        column_names: list[str],
-        config: AttentionConfig | None = None,
-        assoc_name: str = "assoc",
-    ) -> None:
-        self.config = config or AttentionConfig()
-        self.assoc_neurons = assoc_neurons
-        self.n_columns = n_columns
-        self.column_names = list(column_names)
-        self.assoc_name = assoc_name
-        cfg = self.config
+    td_raw = act @ state.w_attn
+    ne_proximity = jnp.maximum(0.0, 1.0 - (ne - params.ne_optimal) ** 2)
+    ne_gain = 1.0 + params.ne_gain_strength * ne_proximity
+    td_norm = _divisive_norm(td_raw * ne_gain, params.divisive_sigma)
 
-        # ── Top-down projection weights ───────────────────────────────
-        self.w_attn: NDArray[np.float32] = np.random.uniform(
-            -0.1, 0.1, (assoc_neurons, n_columns),
-        ).astype(np.float32)
+    if bottom_up_errors is None:
+        bu_norm = jnp.zeros_like(td_norm)
+    else:
+        bu_abs = jnp.abs(bottom_up_errors).astype(DTYPE)
+        bu_norm = bu_abs / (jnp.sum(bu_abs) + jnp.asarray(1e-8, DTYPE))
 
-        # ── Smoothed attention distribution ───────────────────────────
-        self._attn_weights: NDArray[np.float32] = np.full(
-            n_columns, 1.0 / n_columns, dtype=np.float32,
-        )
+    alpha = params.bottom_up_weight
+    combined = alpha * bu_norm + (1.0 - alpha) * td_norm
 
-        # ── IOR trace per column (Posner & Cohen 1984) ────────────────
-        self._ior_trace: NDArray[np.float32] = np.zeros(
-            n_columns, dtype=np.float32,
-        )
-        self._ior_decay: float = cfg.ior_decay
+    combined = jax.nn.relu(combined * (1.0 - params.ior_strength * state.ior_trace))
+    combined = combined / (jnp.sum(combined) + jnp.asarray(1e-8, DTYPE))
 
-        # ── Bottom-up saliency (prediction error per column) ──────────
-        self._bu_saliency: NDArray[np.float32] = np.zeros(
-            n_columns, dtype=np.float32,
-        )
+    attn = (
+        state.attn_weights * params.smoothing_decay
+        + combined * (1.0 - params.smoothing_decay)
+    )
 
-        # ── Per-column gain outputs ───────────────────────────────────
-        self.column_gains: dict[str, float] = {
-            name: 1.0 for name in column_names
-        }
+    mean_w = jnp.mean(attn)
+    ior_input = jax.nn.relu(attn - mean_w)
+    ior = state.ior_trace * params.ior_decay + ior_input * (1.0 - params.ior_decay)
+    ior = jnp.clip(ior, 0.0, 1.0)
 
-    # ------------------------------------------------------------------
-    # Core computation
-    # ------------------------------------------------------------------
+    mean_a = jnp.mean(attn)
+    gain_mod = (attn - mean_a) * params.gain_strength
+    gains = jnp.maximum(1.0 + ach * gain_mod, jnp.asarray(0.1, DTYPE))
 
-    def compute(
-        self,
-        assoc_activity: NDArray[np.float32],
-        global_ach: float = 0.5,
-        ne_level: float = 0.5,
-        bottom_up_errors: NDArray[np.float32] | None = None,
-    ) -> dict[str, float]:
-        """Compute per-column attention gains.
+    new_state = AttentionState(
+        attn_weights=attn,
+        ior_trace=ior,
+        w_attn=state.w_attn,
+    )
+    return AttentionOutput(state=new_state, gains=gains, attn_distribution=attn)
 
-        Args:
-            assoc_activity:    Association layer activity (assoc_neurons,).
-            global_ach:        ACh level scales overall attention effect.
-            ne_level:          NE level modulates top-down gain (inverse-U).
-            bottom_up_errors:  Per-column prediction error magnitude (n_columns,).
-        """
-        act = assoc_activity.astype(np.float32)
-        cfg = self.config
 
-        # ── Top-down saliency ─────────────────────────────────────────
-        td_raw = act @ self.w_attn  # (n_columns,)
+def attention_learn(
+    state: AttentionState,
+    params: AttentionParams,
+    assoc_activity: Array,
+    column_mean_rates: Array,
+    gains: Array,
+    *,
+    clip_abs: float = 2.0,
+) -> AttentionState:
+    """Hebbian update of top-down weights.
 
-        # ── NE gain modulation (Aston-Jones & Cohen 2005) ─────────────
-        # Inverse-U: NE at optimal → maximal gain (focused attention).
-        # At extremes (low or high NE) → reduced gain (diffuse mode).
-        ne_proximity = max(0.0, 1.0 - (ne_level - cfg.ne_optimal) ** 2)
-        ne_gain = 1.0 + cfg.ne_gain_strength * ne_proximity
-        td_gained = td_raw * ne_gain
-
-        # ── Divisive normalization (Reynolds & Heeger 2009) ───────────
-        # R_i = c_i^2 / (sigma^2 + sum(c_j^2))
-        # Rectify: neurons cannot have negative firing rates.
-        td_rect = np.maximum(td_gained, 0.0)
-        td_sq = td_rect ** 2
-        sigma_sq = cfg.divisive_sigma ** 2
-        td_norm = td_sq / (sigma_sq + np.sum(td_sq) + 1e-8)
-
-        # ── Bottom-up saliency (surprise) ─────────────────────────────
-        if bottom_up_errors is not None:
-            self._bu_saliency = np.abs(bottom_up_errors).astype(np.float32)
-            bu_norm = self._bu_saliency / (np.sum(self._bu_saliency) + 1e-8)
-        else:
-            bu_norm = np.zeros(self.n_columns, dtype=np.float32)
-
-        # ── Mix: alpha x bottom_up + (1 - alpha) x top_down ──────────
-        alpha = cfg.bottom_up_weight
-        combined = alpha * bu_norm + (1.0 - alpha) * td_norm
-
-        # ── Apply IOR suppression ─────────────────────────────────────
-        combined = combined * (1.0 - cfg.ior_strength * self._ior_trace)
-        combined = np.maximum(combined, 0.0)
-
-        # Re-normalize
-        total = np.sum(combined) + 1e-8
-        combined = combined / total
-
-        # ── Temporal smoothing ────────────────────────────────────────
-        self._attn_weights = (
-            self._attn_weights * cfg.decay
-            + combined.astype(np.float32) * (1.0 - cfg.decay)
-        )
-
-        # ── IOR update: attended columns accumulate inhibitory trace ──
-        self._ior_trace *= self._ior_decay
-        # Columns above mean attention → accumulate IOR
-        mean_w = float(np.mean(self._attn_weights))
-        ior_input = np.maximum(self._attn_weights - mean_w, 0.0)
-        self._ior_trace += ior_input * (1.0 - self._ior_decay)
-        np.clip(self._ior_trace, 0.0, 1.0, out=self._ior_trace)
-
-        # ── Gain: baseline + ACh × attention modulation ───────────────
-        mean_a = float(np.mean(self._attn_weights))
-        gain_modulation = (self._attn_weights - mean_a) * cfg.gain_strength
-        gains = 1.0 + global_ach * gain_modulation
-        gains = np.maximum(gains, 0.1).astype(np.float32)
-
-        self.column_gains = {
-            name: float(gains[i]) for i, name in enumerate(self.column_names)
-        }
-        return self.column_gains
-
-    def update(
-        self,
-        assoc_activity: NDArray[np.float32],
-        column_activities: dict[str, NDArray[np.float32]],
-    ) -> None:
-        """Hebbian update of top-down attention projection weights."""
-        act = assoc_activity.astype(np.float32)
-        cfg = self.config
-
-        for i, name in enumerate(self.column_names):
-            if name in column_activities:
-                col_rate = float(np.mean(column_activities[name]))
-                gain = self.column_gains.get(name, 1.0)
-                signal = col_rate * (gain - 1.0)
-                self.w_attn[:, i] += cfg.learning_rate * act * signal
-        np.clip(self.w_attn, -2.0, 2.0, out=self.w_attn)
-
-    def reset_state(self) -> None:
-        """Reset transient state. Learned weights preserved."""
-        self._attn_weights.fill(1.0 / self.n_columns)
-        self._ior_trace.fill(0.0)
-        self._bu_saliency.fill(0.0)
-        self.column_gains = {name: 1.0 for name in self.column_names}
-
-    @property
-    def attention_distribution(self) -> NDArray[np.float32]:
-        """Current smoothed attention weights (n_columns,)."""
-        return self._attn_weights.copy()
+    ``Δw[:, c] = lr · assoc · col_rate[c] · (gain[c] − 1)``.
+    """
+    act = assoc_activity.astype(DTYPE)
+    signal = column_mean_rates.astype(DTYPE) * (gains - 1.0)
+    dw = params.learning_rate * jnp.outer(act, signal)
+    w_new = jnp.clip(state.w_attn + dw, -clip_abs, clip_abs)
+    return eqx.tree_at(lambda s: s.w_attn, state, w_new)

@@ -1,213 +1,225 @@
 """
-Astrocyte Field — local precision estimation via Ca²⁺ dynamics.
+Astrocyte field — pure functional Ca²⁺ / D-Serine / ATP dynamics.
 
 Reference:
-  De Pittà, Volman, Berry & Ben-Jacob (2011) "Computational quest for
-      understanding the role of astrocyte signaling"
-  Araque et al. (2014) Tripartite synapse
+  De Pittà, Volman, Berry & Ben-Jacob (2011) — Ca²⁺ → D-Serine sigmoid.
+  Araque et al. (2014) — tripartite synapse.
+  Attwell & Laughlin (2001) — Na⁺/K⁺-ATPase ≈ 10⁹ ATP/spike.
 
-Changes from legacy:
-  1. Uses AstrocyteConfig from config.py (τ_ca=5000ms, biological range)
-  2. Sigmoid D-Serine release (not step-function threshold)
-  3. Gap junction Ca²⁺ wave propagation (1D diffusion between zones)
-  4. Derived decays from SimulationContext
+State (per zone, shape ``(n_zones,)``):
+    calcium   — second-messenger integrator, τ_ca ≈ 5 s
+    d_serine  — gliotransmitter readout, sigmoid of Ca²⁺, τ ≈ 200 ms
+    atp       — normalised energy pool, [0, 1], τ ≈ 200 s
 
-Architecture:
-  One AstrocyteField per neural region (encoder, decoder, BG, etc.).
-  Each field covers n_zones, where each zone monitors a group of synapses.
-  Ca²⁺ integrates local prediction error energy → precision estimate.
-  D-Serine release modulates NMDA gain (graded, sigmoid).
-  Gap junctions propagate Ca²⁺ waves across syncytium.
+Outputs consumed by the neuron layer (all shape ``(n_zones,)``, then
+indexed by ``zone_idx`` when feeding ``AstroMod``):
+    precision        = 1 / (1 + Ca)
+    synaptic_gain    = baseline + (max-baseline) · d_serine
+    threshold_shift  = atp_threshold_shift · (1 − atp)
+    leak_gain        = 1 + atp_leak_gain · (1 − atp)
+    metabolic_lr     = 1 + metabolic_scale · Ca
+
+All operations are jit/vmap-safe; gap-junction diffusion uses an
+explicit Laplacian with Neumann BCs.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from numpy.typing import NDArray
+import equinox as eqx
+import jax.numpy as jnp
 
-from .config import AstrocyteConfig
+from .backend import DTYPE, Array, BackendContext
+from .state import AstrocyteState
 
 
-class AstrocyteField:
-    """Field of astrocytes providing local precision estimation.
+# ======================================================================
+# Parameters
+# ======================================================================
 
-    Ca²⁺ dynamics:
-      dCa/dt = -Ca/τ_ca + accumulation × |PE|²
-      τ_ca = 5000ms (biological: 2-10s)
 
-    D-Serine release (sigmoid, De Pittà et al. 2011):
-      release_rate = d_serine_max × σ((Ca - ca_threshold) / ca_release_k)
-      NOT an all-or-nothing step function.
+class AstrocyteParams(eqx.Module):
+    """Astrocyte constants — precomputed decay factors for the hot path."""
 
-    Gap junction diffusion (1D):
-      dCa_i += D × (Ca_{i-1} + Ca_{i+1} - 2×Ca_i)
+    ca_decay: Array
+    ca_accumulation: Array
+    ca_threshold: Array
+    ca_release_k: Array
+    d_serine_max: Array
+    d_serine_decay: Array
+
+    gap_junction_D: Array
+
+    atp_max: Array
+    atp_regen_rate: Array       # per ms
+    atp_spike_cost: Array       # per spike per ms
+    atp_threshold_shift: Array  # max mV shift at zero ATP
+    atp_leak_gain: Array        # max g_L multiplier increase at zero ATP
+
+    gain_baseline: Array
+    gain_max: Array
+    metabolic_scale: Array
+
+
+def init_astrocyte_params(
+    ctx: BackendContext,
+    *,
+    tau_ca: float = 5000.0,
+    ca_accumulation: float = 0.1,
+    ca_threshold: float = 0.5,
+    ca_release_k: float = 0.15,
+    d_serine_max: float = 0.3,
+    tau_d_serine: float = 200.0,
+    gap_junction_D: float = 0.01,
+    atp_max: float = 1.0,
+    atp_regen_rate: float = 5e-6,
+    atp_spike_cost: float = 1.5e-5,
+    atp_threshold_shift: float = 10.0,
+    atp_leak_gain: float = 0.5,
+    gain_baseline: float = 1.0,
+    gain_max: float = 2.0,
+    metabolic_scale: float = 0.5,
+) -> AstrocyteParams:
+    f = lambda x: jnp.asarray(x, DTYPE)
+    return AstrocyteParams(
+        ca_decay=ctx.decay(tau_ca),
+        ca_accumulation=f(ca_accumulation),
+        ca_threshold=f(ca_threshold),
+        ca_release_k=f(max(ca_release_k, 1e-6)),
+        d_serine_max=f(d_serine_max),
+        d_serine_decay=ctx.decay(tau_d_serine),
+        gap_junction_D=f(gap_junction_D),
+        atp_max=f(atp_max),
+        atp_regen_rate=f(atp_regen_rate),
+        atp_spike_cost=f(atp_spike_cost),
+        atp_threshold_shift=f(atp_threshold_shift),
+        atp_leak_gain=f(atp_leak_gain),
+        gain_baseline=f(gain_baseline),
+        gain_max=f(gain_max),
+        metabolic_scale=f(metabolic_scale),
+    )
+
+
+# ======================================================================
+# Zone aggregation (neuron → zone mapping)
+# ======================================================================
+
+
+def aggregate_to_zones(
+    values: Array, zone_idx: Array, n_zones: int,
+) -> Array:
+    """Mean-reduce ``values`` by zone assignment.
+
+    ``zone_idx`` is an int32 array of shape matching ``values`` giving
+    the zone index of each element.  Returns a ``(n_zones,)`` array.
+
+    Implemented as two segment_sums (sum + count) for jit safety.
     """
+    import jax
+    sums = jax.ops.segment_sum(values.astype(DTYPE), zone_idx, num_segments=n_zones)
+    counts = jax.ops.segment_sum(
+        jnp.ones_like(values, dtype=DTYPE), zone_idx, num_segments=n_zones,
+    )
+    return sums / jnp.maximum(counts, 1.0)
 
-    def __init__(
-        self,
-        n_zones: int | None = None,
-        config: AstrocyteConfig | None = None,
-    ) -> None:
-        self.config = config or AstrocyteConfig()
-        cfg = self.config
-        n = n_zones if n_zones is not None else cfg.n_zones
-        self.n_zones: int = n
 
-        # ── Ca²⁺ state per zone ───────────────────────────────────────
-        self.calcium: NDArray[np.float32] = np.zeros(n, dtype=np.float32)
+# ======================================================================
+# Dynamics
+# ======================================================================
 
-        # ── D-Serine (gliotransmitter) level per zone ─────────────────
-        self.d_serine: NDArray[np.float32] = np.zeros(n, dtype=np.float32)
 
-        # ── ATP energy budget per zone (Krok 1.3) ────────────────────
-        self.atp: NDArray[np.float32] = np.full(
-            n, cfg.atp_max, dtype=np.float32,
-        )
+def _gap_junction_laplacian(ca: Array) -> Array:
+    """1D Laplacian with Neumann (zero-flux) BCs via ghost points.
 
-        # ── Precomputed decays from config ────────────────────────────
-        self._ca_decay: float = cfg.ca_decay
-        self._d_serine_decay: float = cfg.d_serine_decay
+    Interior: Ca[i-1] + Ca[i+1] − 2·Ca[i]
+    Boundary: ghost-point reflection — 2·(neighbour − edge).
+    For ``n_zones ≤ 2`` returns zeros (degenerate chain).
+    """
+    n = ca.shape[0]
+    if n <= 2:
+        return jnp.zeros_like(ca)
+    interior = jnp.zeros_like(ca).at[1:-1].set(ca[:-2] + ca[2:] - 2.0 * ca[1:-1])
+    interior = interior.at[0].set(2.0 * (ca[1] - ca[0]))
+    interior = interior.at[-1].set(2.0 * (ca[-2] - ca[-1]))
+    return interior
 
-    def update(self, spike_rates: NDArray[np.float32]) -> None:
-        """Update Ca²⁺ and ATP from local spike rates.
 
-        Ca²⁺ accumulates proportionally to spike rate² — energy proxy
-        (De Pittà et al. 2011). This is the SLOW channel only;
-        fast epistemic signalling uses error_neuron.error_rate → D1
-        directly (no astrocyte involvement).
+def astrocyte_step(
+    state: AstrocyteState,
+    params: AstrocyteParams,
+    ctx: BackendContext,
+    zone_rates: Array,
+) -> AstrocyteState:
+    """One astrocyte update step.
 
-        ATP dynamics (Krok 1.3):
-          Regeneration: first-order recovery with saturation.
-          Cost: proportional to spike count per zone.
-          Modulates V_T (threshold_shift) and g_L (leak_gain) continuously.
+    Args:
+        state: current ``AstrocyteState``.
+        params: precomputed ``AstrocyteParams``.
+        ctx: backend context (``ctx.dt`` in ms).
+        zone_rates: ``(n_zones,)`` aggregated spike rate per zone
+            (produced by ``aggregate_to_zones`` from per-neuron spike
+            output).  Values ≥ 0.
 
-        Args:
-            spike_rates: (n_zones,) or (n_synapses,) firing rate vector.
-        """
-        raw_rates, rates_sq = self._to_zones(spike_rates)
-        cfg = self.config
-        dt = cfg.ctx.dt
+    Returns: new ``AstrocyteState``.
+    """
+    rates = jnp.abs(zone_rates).astype(DTYPE)
+    rates_sq = rates * rates
+    dt = ctx.dt
 
-        # ── Ca²⁺ dynamics: accumulation ∝ rate² (De Pittà et al. 2011) ─
-        self.calcium = (
-            self.calcium * self._ca_decay
-            + cfg.ca_accumulation * rates_sq * (1.0 - self._ca_decay)
-        )
+    # ── Ca²⁺ accumulation (De Pittà 2011): weighted EMA of rate² ──────
+    one_minus_decay = 1.0 - params.ca_decay
+    ca = (
+        state.calcium * params.ca_decay
+        + params.ca_accumulation * rates_sq * one_minus_decay
+    )
 
-        # ── Gap junction diffusion (ghost-point Neumann BC) ───────────
-        if self.n_zones > 2 and cfg.gap_junction_D > 0:
-            laplacian = np.zeros_like(self.calcium)
-            laplacian[1:-1] = (
-                self.calcium[:-2] + self.calcium[2:] - 2.0 * self.calcium[1:-1]
-            )
-            # Ghost-point Neumann BC (zero-flux, no edge accumulation)
-            laplacian[0] = 2.0 * (self.calcium[1] - self.calcium[0])
-            laplacian[-1] = 2.0 * (self.calcium[-2] - self.calcium[-1])
-            self.calcium += cfg.gap_junction_D * laplacian
-            np.maximum(self.calcium, 0.0, out=self.calcium)
+    # ── Gap-junction diffusion (1D Laplacian, Neumann BCs) ─────────────
+    ca = ca + params.gap_junction_D * _gap_junction_laplacian(ca)
+    ca = jnp.maximum(ca, 0.0)
 
-        # ── Sigmoid D-Serine release (De Pittà et al. 2011) ──────────
-        self.d_serine *= self._d_serine_decay
-        sigmoid_arg = (self.calcium - cfg.ca_threshold) / max(cfg.ca_release_k, 1e-6)
-        release_rate = cfg.d_serine_max / (1.0 + np.exp(-sigmoid_arg))
-        self.d_serine += release_rate.astype(np.float32)
-        np.clip(self.d_serine, 0.0, 1.0, out=self.d_serine)
+    # ── D-Serine release: sigmoid of Ca²⁺ (De Pittà 2011) ─────────────
+    sigmoid_arg = (ca - params.ca_threshold) / params.ca_release_k
+    release = params.d_serine_max / (1.0 + jnp.exp(-sigmoid_arg))
+    d_ser = state.d_serine * params.d_serine_decay + release
+    d_ser = jnp.clip(d_ser, 0.0, 1.0)
 
-        # ── ATP dynamics (Krok 1.3) ───────────────────────────────────
-        # Regeneration: first-order recovery with saturation
-        self.atp += cfg.atp_regen_rate * (cfg.atp_max - self.atp) * dt
-        # Cost: Na⁺/K⁺-ATPase ≈ 10⁹ ATP/spike (Attwell & Laughlin 2001)
-        # Directly proportional to spike rate per zone, no squaring.
-        self.atp -= cfg.atp_spike_cost * raw_rates * dt
-        np.clip(self.atp, 0.0, cfg.atp_max, out=self.atp)
+    # ── ATP dynamics: regen − spike cost ──────────────────────────────
+    atp = state.atp + params.atp_regen_rate * (params.atp_max - state.atp) * dt
+    atp = atp - params.atp_spike_cost * rates * dt
+    atp = jnp.clip(atp, 0.0, params.atp_max)
 
-    def _to_zones(
-        self, values: NDArray[np.float32],
-    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-        """Map arbitrary-length spike rate array to n_zones.
+    return AstrocyteState(
+        calcium=ca.astype(DTYPE),
+        d_serine=d_ser.astype(DTYPE),
+        atp=atp.astype(DTYPE),
+    )
 
-        Returns:
-            (raw_rates, rates_squared) — raw for ATP cost, squared for Ca²⁺.
-        """
-        rates = np.abs(values).astype(np.float32)
-        if rates.shape[0] == self.n_zones:
-            return rates, rates ** 2
-        n = rates.shape[0]
-        zone_size = max(1, n // self.n_zones)
-        raw = np.zeros(self.n_zones, dtype=np.float32)
-        sq = np.zeros(self.n_zones, dtype=np.float32)
-        for i in range(self.n_zones):
-            start = i * zone_size
-            end = min(start + zone_size, n)
-            if start < n:
-                chunk = rates[start:end]
-                raw[i] = float(np.mean(chunk))
-                sq[i] = float(np.mean(chunk ** 2))
-        return raw, sq
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+# ======================================================================
+# Readouts (consumed by neuron_step via AstroMod)
+# ======================================================================
 
-    @property
-    def precision(self) -> NDArray[np.float32]:
-        """Per-zone precision (inverse uncertainty).
 
-        High Ca²⁺ = high error = low precision → learn more.
-        Low Ca²⁺ = low error = high precision → consolidate.
-        """
-        return (1.0 / (1.0 + self.calcium)).astype(np.float32)
+def precision(state: AstrocyteState) -> Array:
+    """Per-zone precision = 1/(1+Ca).  Low Ca ⇒ high precision."""
+    return (1.0 / (1.0 + state.calcium)).astype(DTYPE)
 
-    @property
-    def synaptic_gain(self) -> NDArray[np.float32]:
-        """Per-zone NMDA gain from D-Serine (graded, not binary)."""
-        cfg = self.config
-        gain_range = cfg.gain_max - cfg.gain_baseline
-        return (cfg.gain_baseline + gain_range * self.d_serine).astype(np.float32)
 
-    @property
-    def threshold_shift(self) -> NDArray[np.float32]:
-        """Per-zone spike threshold shift (mV) due to ATP depletion.
+def synaptic_gain(state: AstrocyteState, params: AstrocyteParams) -> Array:
+    """NMDA gain from D-Serine, linear in [gain_baseline, gain_max]."""
+    span = params.gain_max - params.gain_baseline
+    return (params.gain_baseline + span * state.d_serine).astype(DTYPE)
 
-        Biology: ATP↓ → Na⁺/K⁺-ATPase slows → ionic gradients weaken
-        → spike initiation threshold rises (Na⁺ channels need stronger
-        depolarisation). Continuous effect, no binary gate.
 
-        Returns 0 mV at full ATP, +atp_threshold_shift mV at zero ATP.
-        """
-        cfg = self.config
-        return (cfg.atp_threshold_shift * (1.0 - self.atp)).astype(np.float32)
+def threshold_shift(state: AstrocyteState, params: AstrocyteParams) -> Array:
+    """Per-zone V_T shift (mV) from ATP depletion."""
+    return (params.atp_threshold_shift * (1.0 - state.atp)).astype(DTYPE)
 
-    @property
-    def leak_gain(self) -> NDArray[np.float32]:
-        """Per-zone leak conductance multiplier due to ATP depletion.
 
-        Biology: ATP↓ → Na/K pump slows → resting potential depolarises
-        → but K⁺ gradient weakens → net: faster potential decay
-        → less temporal integration of inputs.
+def leak_gain(state: AstrocyteState, params: AstrocyteParams) -> Array:
+    """Per-zone g_L multiplier from ATP depletion."""
+    return (1.0 + params.atp_leak_gain * (1.0 - state.atp)).astype(DTYPE)
 
-        Returns 1.0 at full ATP, 1.0 + atp_leak_gain at zero ATP.
-        """
-        cfg = self.config
-        return (1.0 + cfg.atp_leak_gain * (1.0 - self.atp)).astype(np.float32)
 
-    @property
-    def metabolic_lr(self) -> NDArray[np.float32]:
-        """Per-zone learning rate multiplier (metabolic support ∝ Ca²⁺)."""
-        return (1.0 + self.config.metabolic_scale * self.calcium).astype(np.float32)
-
-    @property
-    def mean_precision(self) -> float:
-        """Scalar summary: mean precision across zones."""
-        return float(np.mean(self.precision))
-
-    @property
-    def mean_calcium(self) -> float:
-        """Scalar summary: mean Ca²⁺ level."""
-        return float(np.mean(self.calcium))
-
-    def reset_state(self) -> None:
-        """Reset transient state between episodes."""
-        self.calcium.fill(0.0)
-        self.d_serine.fill(0.0)
-        self.atp.fill(self.config.atp_max)
+def metabolic_lr(state: AstrocyteState, params: AstrocyteParams) -> Array:
+    """Learning-rate multiplier ∝ Ca²⁺ (high error ⇒ learn faster)."""
+    return (1.0 + params.metabolic_scale * state.calcium).astype(DTYPE)

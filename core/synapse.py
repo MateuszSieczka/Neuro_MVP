@@ -1,186 +1,233 @@
 """
-Synapse — conductance-based synaptic models (AMPA, NMDA, GABA-A, GABA-B).
+Synapse — pure JAX functional dual-exponential conductance channels.
 
-Reference: Jahr & Stevens (1990), Destexhe et al. (1998)
+The legacy ``SynapticChannels`` (NumPy, mutable ``np.ndarray``) is
+replaced by free functions that consume and return ``SynapticState``
+pytrees.  No class state, no aliasing — every step is explicit.
 
-Replaces the flat weight × spike model with biophysically grounded
-conductance channels. Each synapse type has:
-  - Conductance variable g that decays with a type-specific time constant
-  - Rise triggered by presynaptic spike (instantaneous for simplicity)
-  - Current: I_syn = g × (V - E_rev) for conductance-based
-    or simplified current-based: I_syn = g (charge per spike)
+Channels (Destexhe et al. 1998, Jahr & Stevens 1990):
+    AMPA  — fast excitatory,   τ_r≈0.4 ms,  τ_d≈2 ms
+    NMDA  — slow excitatory,   τ_r≈10 ms,   τ_d≈100 ms,  Mg²⁺-gated
+    GABA-A — fast inhibitory,  τ_r≈0.25 ms, τ_d≈5 ms
+    GABA-B — slow inhibitory,  τ_r≈30 ms,   τ_d≈100 ms
 
-For computational efficiency in large networks, we use the current-based
-approximation where weights represent PSP amplitude (mV-equivalent),
-but with proper temporal dynamics (dual-exponential or single-exponential
-decay per channel type).
+Dual-exponential kinetics (Roth & van Rossum 2009, eq 7):
+    g(t) = N · (exp(-t/τ_d) - exp(-t/τ_r))
+    t_peak = τ_r τ_d / (τ_d - τ_r) · ln(τ_d / τ_r)
+    N = 1 / (exp(-t_peak/τ_d) - exp(-t_peak/τ_r))
 
-NMDA retains explicit voltage dependence via Mg²⁺ block factor.
+Implementation: maintain a decay-side trace ``g_x`` and a rise-side
+trace ``g_x_rise``; a spike increments both by ``N · w``; decay both
+exponentially; the effective conductance at step ``t`` is
+``max(g_x - g_x_rise, 0)``.
+
+NMDA voltage-dependent Mg²⁺ block (Jahr & Stevens 1990):
+    B(V) = 1 / (1 + [Mg²⁺]/3.57 · exp(-0.062 V))
+
+All functions are jit-safe and side-effect-free.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import equinox as eqx
+import jax.numpy as jnp
 
-import numpy as np
-from numpy.typing import NDArray
-
-from .config import SynapseConfig, NeuronConfig
-from .simulation_context import SimulationContext, DEFAULT_CONTEXT
+from .backend import DTYPE, Array, BackendContext
+from .state import SynapticParams, SynapticState
 
 
-class SynapticChannels:
-    """Manages AMPA/NMDA/GABA-A/GABA-B conductance traces for a layer.
+# ======================================================================
+# Parameter factory — computes derived constants once, outside hot path
+# ======================================================================
 
-    Each channel maintains a conductance vector (one per postsynaptic neuron)
-    that decays exponentially and receives instantaneous increments on
-    presynaptic spikes.
 
-    Usage::
+def init_synaptic_params(
+    ctx: BackendContext,
+    *,
+    tau_ampa_rise: float = 0.4,
+    tau_ampa_decay: float = 2.0,
+    tau_nmda_rise: float = 10.0,
+    tau_nmda_decay: float = 100.0,
+    tau_gaba_a_rise: float = 0.25,
+    tau_gaba_a_decay: float = 5.0,
+    tau_gaba_b_rise: float = 30.0,
+    tau_gaba_b_decay: float = 100.0,
+    e_exc: float = 0.0,
+    e_inh: float = -75.0,
+    mg_concentration: float = 1.0,
+    ampa_nmda_ratio: float = 3.0,
+) -> SynapticParams:
+    """Precompute per-step multipliers and peak-normalisation factors."""
 
-        channels = SynapticChannels(n_post=64, config=SynapseConfig())
-        # Each timestep:
-        channels.receive_spikes(pre_spikes, w_ampa, w_nmda)
-        total_current = channels.compute_current(v_post)
+    def _norm(tau_d: float, tau_r: float) -> float:
+        # Peak-amplitude normalisation for the difference of exponentials.
+        # ``tau_d`` must strictly exceed ``tau_r`` (decay slower than rise).
+        assert tau_d > tau_r, (
+            f"Decay τ={tau_d} must exceed rise τ={tau_r} for dual-exp."
+        )
+        t_peak = (tau_r * tau_d / (tau_d - tau_r)) * float(jnp.log(tau_d / tau_r))
+        raw = float(jnp.exp(-t_peak / tau_d) - jnp.exp(-t_peak / tau_r))
+        return 1.0 / raw
+
+    return SynapticParams(
+        ampa_decay=ctx.decay(tau_ampa_decay),
+        ampa_rise_decay=ctx.decay(tau_ampa_rise),
+        nmda_decay=ctx.decay(tau_nmda_decay),
+        nmda_rise_decay=ctx.decay(tau_nmda_rise),
+        gaba_a_decay=ctx.decay(tau_gaba_a_decay),
+        gaba_a_rise_decay=ctx.decay(tau_gaba_a_rise),
+        gaba_b_decay=ctx.decay(tau_gaba_b_decay),
+        gaba_b_rise_decay=ctx.decay(tau_gaba_b_rise),
+        ampa_norm=jnp.asarray(_norm(tau_ampa_decay, tau_ampa_rise), DTYPE),
+        nmda_norm=jnp.asarray(_norm(tau_nmda_decay, tau_nmda_rise), DTYPE),
+        gaba_a_norm=jnp.asarray(_norm(tau_gaba_a_decay, tau_gaba_a_rise), DTYPE),
+        gaba_b_norm=jnp.asarray(_norm(tau_gaba_b_decay, tau_gaba_b_rise), DTYPE),
+        e_exc=jnp.asarray(e_exc, DTYPE),
+        e_inh=jnp.asarray(e_inh, DTYPE),
+        mg_concentration=jnp.asarray(mg_concentration, DTYPE),
+        ampa_nmda_ratio=jnp.asarray(ampa_nmda_ratio, DTYPE),
+    )
+
+
+# ======================================================================
+# Step primitives
+# ======================================================================
+
+
+def nmda_mg_block(v: Array, mg_concentration: Array) -> Array:
+    """Voltage-dependent Mg²⁺ block factor (Jahr & Stevens 1990).
+
+    B(V) = 1 / (1 + [Mg]/3.57 · exp(-0.062·V))
     """
+    return 1.0 / (1.0 + (mg_concentration / 3.57) * jnp.exp(-0.062 * v))
 
-    def __init__(
-        self,
-        n_post: int,
-        config: SynapseConfig | None = None,
-    ) -> None:
-        self.config = config or SynapseConfig()
-        self.n_post = n_post
 
-        # Decay-phase conductance traces per channel (n_post,)
-        self.g_ampa: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_nmda: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_gaba_a: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_gaba_b: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+def decay_channels(state: SynapticState, params: SynapticParams) -> SynapticState:
+    """Multiply every conductance trace by its per-step decay factor.
 
-        # Rise-phase traces (dual-exponential, Destexhe et al. 1998)
-        # Effective conductance = g_decay - g_rise after normalisation.
-        # Spikes increment both; rise decays faster → difference gives
-        # the characteristic rise-then-decay synaptic waveform.
-        self.g_ampa_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_nmda_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_gaba_a_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
-        self.g_gaba_b_rise: NDArray[np.float32] = np.zeros(n_post, dtype=np.float32)
+    Applied once per step *before* spike-driven increments so that the
+    instantaneous rise is visible on the same step.
+    """
+    return SynapticState(
+        g_ampa=state.g_ampa * params.ampa_decay,
+        g_ampa_rise=state.g_ampa_rise * params.ampa_rise_decay,
+        g_nmda=state.g_nmda * params.nmda_decay,
+        g_nmda_rise=state.g_nmda_rise * params.nmda_rise_decay,
+        g_gaba_a=state.g_gaba_a * params.gaba_a_decay,
+        g_gaba_a_rise=state.g_gaba_a_rise * params.gaba_a_rise_decay,
+        g_gaba_b=state.g_gaba_b * params.gaba_b_decay,
+        g_gaba_b_rise=state.g_gaba_b_rise * params.gaba_b_rise_decay,
+    )
 
-    def receive_excitatory(
-        self,
-        pre_spikes: NDArray[np.float32],
-        w: NDArray[np.float32],
-    ) -> None:
-        """Process presynaptic excitatory spikes through AMPA + NMDA channels.
 
-        AMPA/NMDA ratio from config (default 3:1, Myme et al. 2003).
-        Spike increments both decay and rise traces by w × N (normalisation
-        factor from Destexhe et al. 1998) so that peak conductance = w.
+def receive_excitatory(
+    state: SynapticState,
+    params: SynapticParams,
+    drive: Array,
+) -> SynapticState:
+    """Add excitatory drive (AMPA + NMDA).
 
-        Args:
-            pre_spikes: (n_pre,) spike vector.
-            w: (n_pre, n_post) weight matrix.
-        """
-        drive = pre_spikes.astype(np.float32) @ w  # (n_post,)
-        cfg = self.config
-        ratio = cfg.ampa_nmda_ratio
-        total = ratio + 1.0
-        ampa_drive = drive * (ratio / total)
-        nmda_drive = drive * (1.0 / total)
-        # Both decay and rise traces get the same norm-scaled increment
-        self.g_ampa += ampa_drive * cfg.ampa_norm
-        self.g_ampa_rise += ampa_drive * cfg.ampa_norm
-        self.g_nmda += nmda_drive * cfg.nmda_norm
-        self.g_nmda_rise += nmda_drive * cfg.nmda_norm
+    ``drive`` is the per-postsynaptic summed weighted spike contribution
+    (shape ``(n_post,)``).  Split between AMPA and NMDA by
+    ``ampa_nmda_ratio``; both decay and rise traces receive the same
+    norm-scaled increment so their difference peaks at ``drive``.
+    """
+    ratio = params.ampa_nmda_ratio
+    total = ratio + 1.0
+    ampa_inc = drive * (ratio / total) * params.ampa_norm
+    nmda_inc = drive * (1.0 / total) * params.nmda_norm
+    return eqx.tree_at(
+        lambda s: (s.g_ampa, s.g_ampa_rise, s.g_nmda, s.g_nmda_rise),
+        state,
+        (
+            state.g_ampa + ampa_inc,
+            state.g_ampa_rise + ampa_inc,
+            state.g_nmda + nmda_inc,
+            state.g_nmda_rise + nmda_inc,
+        ),
+    )
 
-    def receive_inhibitory(
-        self,
-        inh_spikes: NDArray[np.float32],
-        w_ie: NDArray[np.float32],
-        gaba_b_ratio: float = 0.25,
-    ) -> None:
-        """Process inhibitory spikes through GABA-A + GABA-B channels.
 
-        Args:
-            inh_spikes: (n_inh,) inhibitory spike vector.
-            w_ie: (n_inh, n_post) inhibitory weight matrix.
-            gaba_b_ratio: Fraction of inhibition via GABA-B (Isaacson 2011).
-        """
-        drive = inh_spikes.astype(np.float32) @ w_ie  # (n_post,)
-        cfg = self.config
-        ga_drive = drive * (1.0 - gaba_b_ratio)
-        gb_drive = drive * gaba_b_ratio
-        self.g_gaba_a += ga_drive * cfg.gaba_a_norm
-        self.g_gaba_a_rise += ga_drive * cfg.gaba_a_norm
-        self.g_gaba_b += gb_drive * cfg.gaba_b_norm
-        self.g_gaba_b_rise += gb_drive * cfg.gaba_b_norm
+def receive_inhibitory(
+    state: SynapticState,
+    params: SynapticParams,
+    drive: Array,
+    *,
+    gaba_b_ratio: float = 0.25,
+) -> SynapticState:
+    """Add inhibitory drive (GABA-A + GABA-B, Isaacson 2011 ratio)."""
+    ga = drive * (1.0 - gaba_b_ratio) * params.gaba_a_norm
+    gb = drive * gaba_b_ratio * params.gaba_b_norm
+    return eqx.tree_at(
+        lambda s: (s.g_gaba_a, s.g_gaba_a_rise, s.g_gaba_b, s.g_gaba_b_rise),
+        state,
+        (
+            state.g_gaba_a + ga,
+            state.g_gaba_a_rise + ga,
+            state.g_gaba_b + gb,
+            state.g_gaba_b_rise + gb,
+        ),
+    )
 
-    def decay(self) -> None:
-        """Apply exponential decay to all conductance channels.
 
-        Both decay-phase and rise-phase traces decay independently.
-        Effective conductance = g_decay - g_rise (computed in
-        compute_current).
-        """
-        cfg = self.config
-        self.g_ampa *= cfg.ampa_decay
-        self.g_nmda *= cfg.nmda_decay
-        self.g_gaba_a *= cfg.gaba_a_decay
-        self.g_gaba_b *= cfg.gaba_b_decay
-        self.g_ampa_rise *= cfg.ampa_rise_decay
-        self.g_nmda_rise *= cfg.nmda_rise_decay
-        self.g_gaba_a_rise *= cfg.gaba_a_rise_decay
-        self.g_gaba_b_rise *= cfg.gaba_b_rise_decay
+def effective_conductances(state: SynapticState) -> tuple[Array, Array, Array, Array]:
+    """Return ``(g_ampa, g_nmda, g_gaba_a, g_gaba_b)`` effective values.
 
-    def compute_current(
-        self,
-        v_post: NDArray[np.float32],
-    ) -> NDArray[np.float32]:
-        """Compute total synaptic current from all channels (Ohm's law).
+    Each is ``max(decay_trace - rise_trace, 0)`` — the characteristic
+    rise-then-decay waveform normalised so peak is driven by spike
+    weight.
+    """
+    g_ampa = jnp.maximum(state.g_ampa - state.g_ampa_rise, 0.0)
+    g_nmda = jnp.maximum(state.g_nmda - state.g_nmda_rise, 0.0)
+    g_gaba_a = jnp.maximum(state.g_gaba_a - state.g_gaba_a_rise, 0.0)
+    g_gaba_b = jnp.maximum(state.g_gaba_b - state.g_gaba_b_rise, 0.0)
+    return g_ampa, g_nmda, g_gaba_a, g_gaba_b
 
-        Dual-exponential kinetics (Destexhe et al. 1998):
-          g_eff = g_decay − g_rise  (difference gives rise-then-decay shape)
-        Conductance-based current with reversal potentials:
-          I_exc = (g_ampa_eff + g_nmda_eff × B(V)) × (E_exc − V)
-          I_inh = (g_gaba_a_eff + g_gaba_b_eff) × (E_inh − V)
 
-        Reference: Jahr & Stevens (1990), Destexhe et al. (1998)
+def compute_current(
+    state: SynapticState,
+    params: SynapticParams,
+    v_post: Array,
+) -> tuple[Array, Array]:
+    """Total synaptic current for the AdEx Euler step.
 
-        Args:
-            v_post: (n_post,) postsynaptic membrane potential (mV).
+    Returns ``(I_syn, g_total)`` — the total Ohm's-law current and its
+    total conductance (used by the exponential-Euler Jacobian
+    correction: dI/dV = -g_total).
 
-        Returns:
-            (n_post,) total synaptic current (positive = depolarizing).
-        """
-        cfg = self.config
+    Conductance-based current (Jahr & Stevens 1990, Destexhe 1998):
+        I_exc = (g_ampa + g_nmda · B(V)) · (E_exc − V)
+        I_inh = (g_gaba_a + g_gaba_b)  · (E_inh − V)
+    """
+    g_ampa, g_nmda, g_gaba_a, g_gaba_b = effective_conductances(state)
+    mg = nmda_mg_block(v_post, params.mg_concentration)
 
-        # Effective conductances: decay trace − rise trace (≥ 0 by construction)
-        g_ampa_eff = np.maximum(self.g_ampa - self.g_ampa_rise, 0.0)
-        g_nmda_eff = np.maximum(self.g_nmda - self.g_nmda_rise, 0.0)
-        g_gaba_a_eff = np.maximum(self.g_gaba_a - self.g_gaba_a_rise, 0.0)
-        g_gaba_b_eff = np.maximum(self.g_gaba_b - self.g_gaba_b_rise, 0.0)
+    g_exc = g_ampa + g_nmda * mg
+    g_inh = g_gaba_a + g_gaba_b
 
-        # NMDA voltage-dependent Mg²⁺ block (Jahr & Stevens 1990)
-        mg_block = SynapseConfig.nmda_mg_block(v_post)
+    i_exc = g_exc * (params.e_exc - v_post)
+    i_inh = g_inh * (params.e_inh - v_post)
 
-        # Excitatory: I = g × (E_exc − V) → positive at rest (depolarizing)
-        g_exc = g_ampa_eff + g_nmda_eff * mg_block
-        i_exc = g_exc * (cfg.e_exc - v_post)
+    return (i_exc + i_inh).astype(DTYPE), (g_exc + g_inh).astype(DTYPE)
 
-        # Inhibitory: I = g × (E_inh − V) → negative at rest (hyperpolarizing)
-        g_inh = g_gaba_a_eff + g_gaba_b_eff
-        i_inh = g_inh * (cfg.e_inh - v_post)
 
-        return i_exc + i_inh
+def synapse_step(
+    state: SynapticState,
+    params: SynapticParams,
+    exc_drive: Array,
+    inh_drive: Array,
+    v_post: Array,
+    *,
+    gaba_b_ratio: float = 0.25,
+) -> tuple[SynapticState, Array, Array]:
+    """Full synapse step: decay → receive → integrate current.
 
-    def reset(self) -> None:
-        """Reset all conductance traces to zero."""
-        self.g_ampa.fill(0.0)
-        self.g_nmda.fill(0.0)
-        self.g_gaba_a.fill(0.0)
-        self.g_gaba_b.fill(0.0)
-        self.g_ampa_rise.fill(0.0)
-        self.g_nmda_rise.fill(0.0)
-        self.g_gaba_a_rise.fill(0.0)
-        self.g_gaba_b_rise.fill(0.0)
+    ``exc_drive``/``inh_drive`` are pre-summed weighted spike drives
+    per postsynaptic neuron.  Returns the new state plus the current
+    and total conductance for the AdEx consumer.
+    """
+    decayed = decay_channels(state, params)
+    with_exc = receive_excitatory(decayed, params, exc_drive)
+    with_both = receive_inhibitory(with_exc, params, inh_drive, gaba_b_ratio=gaba_b_ratio)
+    i_syn, g_total = compute_current(with_both, params, v_post)
+    return with_both, i_syn, g_total

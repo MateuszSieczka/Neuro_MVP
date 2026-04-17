@@ -1,246 +1,173 @@
 """
-ThetaGammaOscillator -- nested oscillation pacemaker.
+Oscillator — pure functional theta/gamma pacemaker with PAC.
 
-Reference: Lisman & Jensen (2013) "The theta-gamma neural code"
+Replaces the legacy class-based ``ThetaGammaOscillator``.  All state
+lives in ``OscillatorState`` (theta_phase, gamma_phase,
+gamma_amplitude); parameters live in ``OscillatorParams``.
 
-Theta (4-8 Hz): episodic encoding phase, gates memory storage/retrieval.
-Gamma (30-100 Hz): local binding, paces k-WTA competition.
+Theta (4–8 Hz): episodic encoding phase; gates memory I/O.
+Gamma (30–100 Hz): local binding; paces k-WTA.
 
-Phase-Amplitude Coupling (PAC) -- Lisman & Jensen (2013):
-  Gamma oscillation phase-resets at each theta trough (theta = pi),
-  creating genuine cross-frequency coupling.  Gamma amplitude
-  is additionally modulated by theta phase:
-    gamma_amplitude = base + pac_depth * (1 - cos(theta_phase)) / 2
+Phase-Amplitude Coupling (Lisman & Jensen 2013):
+    Gamma phase-resets at each theta trough (θ = π).
+    Gamma amplitude envelope = 1 − PAC + PAC · (1 − cos θ)/2
+    ⇒ maximal gamma at θ=π (trough), minimal at θ=0 (peak).
 
-NE shifts theta frequency UP (arousal -> faster cycling).
-5-HT shifts theta frequency DOWN (patience -> longer cycles).
+Neuromodulation (scalar, per-step):
+    NE  ↑  →  theta freq ↑  (arousal, faster cycling)
+    5-HT↑  →  theta freq ↓  (patience, longer cycles)
 
-The oscillator drives:
-  - k-WTA evaluation timing (gamma trough)
-  - Episodic memory gating (theta phase)
-  - STDP window modulation (phase-dependent plasticity)
+SWS mode (``sws_mode=True``):
+    Theta frequency clamped to ``sws_freq_hz`` (~1 Hz, Steriade 1993);
+    gamma fully suppressed.  Up state = (θ < π), Down state = (θ ≥ π).
+
+All branches use ``jnp.where`` masking — no Python conditionals, so
+the step is jit-safe and SIMT-friendly.
 """
 
 from __future__ import annotations
 
-import numpy as np
+import equinox as eqx
+import jax.numpy as jnp
 
-from .config import OscillatorConfig
-from .simulation_context import SimulationContext, DEFAULT_CONTEXT
+from .backend import DTYPE, Array, BackendContext
+from .state import OscillatorState
 
 
-class ThetaGammaOscillator:
-    """Nested theta-gamma oscillator with phase-amplitude coupling.
+TWO_PI = 2.0 * jnp.pi
 
-    tick() advances both phases by dt and returns flags for gamma
-    and theta cycle completions. The gamma amplitude is modulated
-    by theta phase (PAC).
+
+# ======================================================================
+# Parameters
+# ======================================================================
+
+
+class OscillatorParams(eqx.Module):
+    """Theta/gamma oscillator constants.
+
+    All float32 scalars (traced leaves).  Allows runtime swap without
+    retracing via ``eqx.tree_at``.
     """
 
-    def __init__(
-        self,
-        config: OscillatorConfig | None = None,
-        ctx: SimulationContext | None = None,
-    ) -> None:
-        self.config = config or OscillatorConfig()
-        self.ctx = ctx or DEFAULT_CONTEXT
+    theta_freq_hz: Array       # base theta freq
+    theta_min_hz: Array
+    theta_max_hz: Array
+    gamma_freq_hz: Array
 
-        # ── Phase accumulators (0 → 2π) ───────────────────────────────
-        self.theta_phase: float = 0.0
-        self.gamma_phase: float = 0.0
+    pac_depth: Array           # 0..1, depth of theta-gamma PAC envelope
 
-        # ── Effective frequencies (modulated by NE / 5-HT) ───────────
-        self._theta_freq: float = self.config.theta_freq_hz
-        self._gamma_freq: float = self.config.gamma_freq_hz
+    ne_theta_shift: Array      # Hz added per unit NE
+    sero_theta_shift: Array    # Hz added per unit 5-HT (typically < 0)
 
-        # ── PAC amplitude (modulated by theta phase) ──────────────────
-        self.gamma_amplitude: float = 1.0
+    sws_freq_hz: Array         # slow-wave sleep theta-clamp freq
 
-        # ── SWS slow oscillation mode ─────────────────────────────────
-        # Unified: during SWS, theta freq → sws_freq_hz (~1 Hz),
-        # gamma suppressed.  Up/Down states derive from theta phase.
-        self._sws_mode: bool = False
-        self._in_up_state: bool = False
 
-    def tick(
-        self,
-        ne_level: float = 0.0,
-        sero_level: float = 0.0,
-    ) -> tuple[bool, bool]:
-        """Advance oscillator by one dt step.
+def init_oscillator_params(
+    *,
+    theta_freq_hz: float = 6.0,
+    theta_min_hz: float = 4.0,
+    theta_max_hz: float = 8.0,
+    gamma_freq_hz: float = 40.0,
+    pac_depth: float = 0.6,
+    ne_theta_shift: float = 2.0,
+    sero_theta_shift: float = -1.0,
+    sws_freq_hz: float = 1.0,
+) -> OscillatorParams:
+    assert theta_min_hz <= theta_freq_hz <= theta_max_hz
+    assert 0.0 <= pac_depth <= 1.0
+    f = lambda x: jnp.asarray(x, DTYPE)
+    return OscillatorParams(
+        theta_freq_hz=f(theta_freq_hz),
+        theta_min_hz=f(theta_min_hz),
+        theta_max_hz=f(theta_max_hz),
+        gamma_freq_hz=f(gamma_freq_hz),
+        pac_depth=f(pac_depth),
+        ne_theta_shift=f(ne_theta_shift),
+        sero_theta_shift=f(sero_theta_shift),
+        sws_freq_hz=f(sws_freq_hz),
+    )
 
-        Args:
-            ne_level:   Noradrenaline [0, 1] → speeds up theta.
-            sero_level: Serotonin [0, 1] → slows down theta.
 
-        Returns:
-            (gamma_reset, theta_reset): True if cycle completed.
-        """
-        cfg = self.config
-        dt_s = self.ctx.dt / 1000.0  # ms → s
+# ======================================================================
+# Step
+# ======================================================================
 
-        # ── Modulated theta frequency ─────────────────────────────────
-        if self._sws_mode:
-            # SWS: slow oscillation ~1 Hz (Steriade et al. 1993).
-            # NE/5-HT modulation ignored during sleep.
-            self._theta_freq = cfg.sws_freq_hz
-        else:
-            theta_f = (
-                cfg.theta_freq_hz
-                + cfg.ne_theta_shift * ne_level
-                + cfg.sero_theta_shift * sero_level
-            )
-            self._theta_freq = float(np.clip(theta_f, cfg.theta_min_hz, cfg.theta_max_hz))
 
-        # ── Phase advance ─────────────────────────────────────────────
-        TWO_PI = 2.0 * np.pi
-        d_theta = TWO_PI * self._theta_freq * dt_s
+class OscillatorOutput(eqx.Module):
+    """Per-step oscillator outputs used by downstream modules."""
 
-        # During SWS, gamma is suppressed (cortical silence between
-        # sharp-wave ripples; Steriade et al. 1993).
-        if self._sws_mode:
-            d_gamma = 0.0
-        else:
-            d_gamma = TWO_PI * self._gamma_freq * dt_s
+    gamma_reset: Array      # bool scalar — gamma cycle completed this step
+    theta_reset: Array      # bool scalar — theta cycle completed this step
+    in_up_state: Array      # bool scalar — SWS Up state (only meaningful if sws_mode)
+    encoding_phase: Array   # bool scalar — θ < π (Hasselmo 2005 encoding window)
 
-        old_theta = self.theta_phase
-        self.theta_phase += d_theta
-        self.gamma_phase += d_gamma
 
-        # ── PAC: gamma phase-reset at theta trough (Lisman & Jensen 2013)
-        # True PAC = gamma bursts restart at each theta trough (θ=π).
-        # This locks gamma oscillation onset to the theta cycle,
-        # producing the nested "neural code" observed in hippocampus.
-        theta_crossed_trough = (old_theta < np.pi) and (self.theta_phase >= np.pi)
-        if theta_crossed_trough:
-            self.gamma_phase = 0.0
+def oscillator_step(
+    state: OscillatorState,
+    params: OscillatorParams,
+    ctx: BackendContext,
+    *,
+    ne_level: Array | float = 0.0,
+    sero_level: Array | float = 0.0,
+    sws_mode: Array | bool = False,
+) -> tuple[OscillatorState, OscillatorOutput]:
+    """Advance theta + gamma phases by one ``ctx.dt``.
 
-        # Gamma amplitude envelope modulated by theta phase
-        # (maximal gamma power at theta trough, minimal at peak)
-        # Lisman & Jensen (2013): gamma peaks at theta trough because
-        # pyramidal depolarisation is maximal, driving interneuron activity.
-        # cos(theta)=-1 at trough, so (1-cos)/2 = 1 at trough.
-        pac = cfg.pac_depth * (1.0 - np.cos(self.theta_phase)) / 2.0
-        self.gamma_amplitude = 1.0 - cfg.pac_depth + pac
+    Applies PAC (gamma reset at theta trough + cosine envelope) and
+    optional SWS clamp.  Returns new state and cycle-completion flags.
+    """
+    dt_s = ctx.dt / 1000.0  # ms → s
+    ne = jnp.asarray(ne_level, DTYPE)
+    sero = jnp.asarray(sero_level, DTYPE)
+    sws = jnp.asarray(sws_mode, dtype=jnp.bool_)
 
-        # ── Cycle completion flags ────────────────────────────────────
-        gamma_reset = theta_crossed_trough  # phase-reset counts as cycle
-        theta_reset = False
+    # ── Effective theta frequency (branchless) ─────────────────────────
+    theta_f_awake = jnp.clip(
+        params.theta_freq_hz
+        + params.ne_theta_shift * ne
+        + params.sero_theta_shift * sero,
+        params.theta_min_hz, params.theta_max_hz,
+    )
+    theta_f = jnp.where(sws, params.sws_freq_hz, theta_f_awake)
+    # Gamma suppressed during SWS (Steriade 1993)
+    gamma_f = jnp.where(sws, jnp.asarray(0.0, DTYPE), params.gamma_freq_hz)
 
-        if self.gamma_phase >= TWO_PI:
-            self.gamma_phase -= TWO_PI
-            gamma_reset = True
+    # ── Phase advance ──────────────────────────────────────────────────
+    d_theta = TWO_PI * theta_f * dt_s
+    d_gamma = TWO_PI * gamma_f * dt_s
 
-        if self.theta_phase >= TWO_PI:
-            self.theta_phase -= TWO_PI
-            theta_reset = True
+    old_theta = state.theta_phase
+    theta_next = old_theta + d_theta
+    gamma_next = state.gamma_phase + d_gamma
 
-        # SWS Up/Down state derives from unified theta phase:
-        # Up = 0→π (first half), Down = π→2π (second half).
-        if self._sws_mode:
-            self._in_up_state = self.theta_phase < np.pi
-            self.gamma_amplitude = 0.0  # gamma suppressed
+    # ── PAC: gamma phase-resets when theta crosses π (trough) ─────────
+    crossed_trough = (old_theta < jnp.pi) & (theta_next >= jnp.pi)
+    gamma_next = jnp.where(crossed_trough, jnp.asarray(0.0, DTYPE), gamma_next)
 
-        return gamma_reset, theta_reset
+    # ── Wrap phases to [0, 2π) ─────────────────────────────────────────
+    gamma_wrapped_flag = gamma_next >= TWO_PI
+    gamma_next = jnp.where(gamma_wrapped_flag, gamma_next - TWO_PI, gamma_next)
 
-    @property
-    def theta_encoding_phase(self) -> bool:
-        """True during theta peak (encoding window: 0 → π).
+    theta_wrapped = theta_next >= TWO_PI
+    theta_next = jnp.where(theta_wrapped, theta_next - TWO_PI, theta_next)
 
-        Hasselmo (2005): encoding occurs at theta peak where ACh
-        is high and external (sensory) input dominates over internal
-        (CA3 autoassociative) recall.  cos(θ) > 0 in this window.
-        """
-        return self.theta_phase < np.pi
+    # ── Gamma amplitude envelope (PAC) ─────────────────────────────────
+    # (1 − cos θ)/2 ∈ [0,1]; peaks at θ=π (trough)
+    pac = params.pac_depth * (1.0 - jnp.cos(theta_next)) * 0.5
+    gamma_amp_awake = 1.0 - params.pac_depth + pac
+    gamma_amp = jnp.where(sws, jnp.asarray(0.0, DTYPE), gamma_amp_awake)
 
-    @property
-    def theta_retrieval_phase(self) -> bool:
-        """True during theta trough (retrieval window: π → 2π).
+    new_state = OscillatorState(
+        theta_phase=theta_next.astype(DTYPE),
+        gamma_phase=gamma_next.astype(DTYPE),
+        gamma_amplitude=gamma_amp.astype(DTYPE),
+    )
 
-        Hasselmo (2005): retrieval occurs at theta trough where ACh
-        is low and internal CA3 recall dominates over external input.
-        cos(θ) < 0 in this window.
-        """
-        return self.theta_phase >= np.pi
-
-    @property
-    def effective_theta_hz(self) -> float:
-        return self._theta_freq
-
-    @property
-    def effective_gamma_hz(self) -> float:
-        return self._gamma_freq
-
-    def reset(self) -> None:
-        self.theta_phase = 0.0
-        self.gamma_phase = 0.0
-        self.gamma_amplitude = 1.0
-        self._theta_freq = self.config.theta_freq_hz
-        self._gamma_freq = self.config.gamma_freq_hz
-        self._sws_mode = False
-        self._in_up_state = False
-
-    # ------------------------------------------------------------------
-    # SWS slow oscillation mode (unified with tick)
-    # ------------------------------------------------------------------
-
-    def enter_sws(self) -> None:
-        """Switch to Slow-Wave Sleep oscillation.
-
-        In SWS, tick() uses sws_freq_hz (~1 Hz) for theta and
-        suppresses gamma.  Up/Down states derive from theta phase:
-          Up  = θ < π (first half of slow oscillation)
-          Down = θ ≥ π (second half)
-        """
-        self._sws_mode = True
-        self.theta_phase = 0.0  # start fresh slow oscillation
-        self.gamma_phase = 0.0
-        self._in_up_state = False
-
-    def exit_sws(self) -> None:
-        """Return to normal theta-gamma oscillation."""
-        self._sws_mode = False
-        self._in_up_state = False
-
-    def tick_sws(self) -> tuple[bool, bool]:
-        """Advance slow oscillation by one dt step.
-
-        Thin wrapper around tick() for backward compatibility with
-        replay_buffer.  Returns Up/Down state transitions instead
-        of gamma/theta resets.
-
-        Returns:
-            (up_onset, down_onset): True at Up/Down state transitions.
-        """
-        was_up = self._in_up_state
-        self.tick(ne_level=0.0, sero_level=0.0)
-        is_up = self._in_up_state
-        up_onset = is_up and not was_up
-        down_onset = not is_up and was_up
-        return up_onset, down_onset
-
-    @property
-    def sws_mode(self) -> bool:
-        return self._sws_mode
-
-    @property
-    def in_up_state(self) -> bool:
-        return self._in_up_state
-
-    # ------------------------------------------------------------------
-    # Seizure brake
-    # ------------------------------------------------------------------
-
-    _SEIZURE_THRESHOLD_MULT: float = 3.0
-
-    def check_seizure(
-        self,
-        mean_rate: float,
-        baseline_rate: float = 0.05,
-    ) -> bool:
-        """Check if mean firing rate exceeds seizure threshold.
-
-        If rate > 3× baseline → signals forced Down state for 200ms.
-        """
-        threshold = self._SEIZURE_THRESHOLD_MULT * max(baseline_rate, 0.01)
-        return mean_rate > threshold
+    gamma_reset = crossed_trough | gamma_wrapped_flag
+    output = OscillatorOutput(
+        gamma_reset=gamma_reset,
+        theta_reset=theta_wrapped,
+        in_up_state=sws & (theta_next < jnp.pi),
+        encoding_phase=theta_next < jnp.pi,
+    )
+    return new_state, output

@@ -1,522 +1,234 @@
 """
-AdExLayer — Adaptive Exponential Integrate-and-Fire neuron population.
+Neuron — pure functional AdEx integrate-and-fire step.
 
-Reference: Brette & Gerstner (2005) "Adaptive Exponential Integrate-and-Fire
-Model as an Effective Description of Neuronal Activity"
+Replaces the legacy class-based ``AdExLayer`` with stateless functions
+operating on ``NeuronState`` / ``NeuronParams`` pytrees.
 
-Changes from legacy LIFLayer:
-  1. AdEx membrane dynamics: exponential spike initiation + adaptation current w.
-  2. Exponential Euler integration (A-stable) instead of linear exact decay.
-  3. Spike detection at v_spike_cutoff (above V_T) instead of v_thresh.
-  4. w_adapt state: spike-triggered + subthreshold adaptation.
-  5. Different neuron types from SAME equations (RS, FS, IB, LS via params).
-  6. Multiplicative STDP kernel (Bi & Poo 2001) with proper causal asymmetry.
-  7. Calcium-based eligibility traces (Graupner & Brunel 2012).
-  8. Synaptic scaling (Turrigiano 2008) replaces hard weight clips.
-  9. SynapticChannels integration for AMPA/NMDA temporal dynamics.
-  10. NE/ACh timescale modulation with explicit compression factors.
+Membrane (Brette & Gerstner 2005):
+    C_m dV/dt = -g_L(V - E_L) + g_L·Δ_T·exp((V-V_T)/Δ_T) + I_syn - w
+    τ_w dw/dt = a·(V - E_L) - w
+Spike:  V ≥ V_cutoff  ⇒  V ← V_reset,  w ← w + b
+
+Integration uses exponential Euler (Rotter & Diesmann 1999) — A-stable,
+handles the AdEx exp term + NMDA stiffness without substepping.
+
+Neuromorphic note: setting ``a=0, b=0, delta_t→0`` degenerates the kernel
+to pure LIF — no code branch needed.  Akida / TrueNorth export clamps
+params at conversion time; DYNAPs / Loihi 2 / SpiNNaker 2 run the full
+AdEx natively.
+
+STDP + eligibility traces live in a separate module (Phase 1.5 will add
+``core/plasticity.py``) because they operate on *pairs* of populations
+(pre + post) and the connection fabric.  This step is population-local.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import NamedTuple, Optional
 
-import numpy as np
-from numpy.typing import NDArray
+import equinox as eqx
+import jax.numpy as jnp
 
-from .config import (
-    NeuronConfig,
-    STDPConfig,
-    HomeostaticConfig,
-    SynapseConfig,
-    init_weights,
-)
-from .synapse import SynapticChannels
-
-if TYPE_CHECKING:
-    from .astrocyte import AstrocyteField
+from .backend import DTYPE, Array, BackendContext
+from .state import NeuronState, NeuronParams
 
 
-class HomeostaticState:
-    """Shared homeostatic threshold adaptation state.
+# ======================================================================
+# Optional astrocyte modulation — lightweight pytree
+# ======================================================================
 
-    Used by LIFLayer, CompetitiveLIFLayer, and PyramidalLayer to manage
-    v_thresh_adaptive, avg_rate, and dark matter neurons with identical logic.
-    Eliminates ~60 lines of duplicated homeostatic code.
+
+class AstroMod(NamedTuple):
+    """Per-neuron astrocyte modulation factors (Krok 1.3).
+
+    ``threshold_shift`` is added to V_T (mV); ``leak_gain`` multiplies
+    g_L.  Both have shape ``(n,)`` matching the population.  Pass
+    ``None`` when astrocyte coupling is disabled.
     """
 
-    def __init__(
-        self,
-        num_neurons: int,
-        v_thresh: float,
-        config: HomeostaticConfig,
-    ) -> None:
-        self.config = config
-        self.v_thresh_adaptive: NDArray[np.float32] = np.full(
-            num_neurons, v_thresh, dtype=np.float32,
-        )
-        self.avg_rate: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
-        self.is_dark_matter: NDArray[np.bool_] = np.zeros(
-            num_neurons, dtype=bool,
-        )
-        n_dark = int(num_neurons * config.dark_matter_ratio)
-        if n_dark > 0:
-            dark_idx = np.random.choice(num_neurons, n_dark, replace=False)
-            self.is_dark_matter[dark_idx] = True
-            self.v_thresh_adaptive[dark_idx] += config.dark_matter_thresh_offset
-
-    def update(self, spikes: NDArray[np.bool_], window_steps: int = 1) -> None:
-        """BCM-derived threshold adaptation toward target_rate.
-
-        Args:
-            spikes: per-neuron spike counts or binary spikes for the window.
-            window_steps: number of steps in evaluation window (1 for per-step).
-        """
-        cfg = self.config
-        spikes_f = spikes.astype(np.float32)
-        spikes_per_step = spikes_f / max(window_steps, 1)
-
-        if window_steps > 1:
-            decay = cfg.ctx.decay(cfg.homeostatic_tau * window_steps)
-        else:
-            decay = cfg.homeo_decay
-
-        self.avg_rate = self.avg_rate * decay + spikes_per_step * (1.0 - decay)
-        rate_error = self.avg_rate - cfg.target_rate
-        self.v_thresh_adaptive += cfg.thresh_adapt_lr * window_steps * rate_error
-        np.clip(
-            self.v_thresh_adaptive, cfg.thresh_min, cfg.thresh_max,
-            out=self.v_thresh_adaptive,
-        )
-
-    def effective_threshold(self, ne_level: float) -> NDArray[np.float32]:
-        """Return threshold with NE-driven drop."""
-        ne_drop = ne_level * self.config.ne_thresh_drop
-        return self.v_thresh_adaptive - ne_drop
-
-    def reset(self, v_thresh: float) -> None:
-        """Reset to initial state (preserves dark matter offsets)."""
-        self.v_thresh_adaptive.fill(v_thresh)
-        self.v_thresh_adaptive[self.is_dark_matter] += (
-            self.config.dark_matter_thresh_offset
-        )
-        self.avg_rate.fill(0.0)
+    threshold_shift: Array
+    leak_gain: Array
 
 
-class AdExLayer:
-    """Vectorised Adaptive Exponential Integrate-and-Fire population.
+# ======================================================================
+# Parameter factory — builds NeuronParams from raw constants
+# ======================================================================
 
-    The layer composes independent config dataclasses:
-      - ``NeuronConfig``      — AdEx membrane dynamics (tau_m, delta_t, tau_w, a, b, ...)
-      - ``STDPConfig``        — STDP kernel parameters (Bi & Poo 2001)
-      - ``HomeostaticConfig`` — optional BCM-derived threshold adaptation
-      - ``SynapseConfig``     — optional AMPA/NMDA channel dynamics
 
-    Membrane equation (Brette & Gerstner 2005):
-      C_m dV/dt = -g_L(V - E_L) + g_L Δ_T exp((V - V_T)/Δ_T) + I_syn - w
-      τ_w dw/dt = a(V - E_L) - w
+def init_neuron_params(
+    ctx: BackendContext,
+    *,
+    v_rest: float = -70.0,
+    v_thresh: float = -55.0,
+    v_reset: float = -75.0,
+    v_spike_cutoff: float = -30.0,
+    delta_t: float = 2.0,
+    C_m: float = 281.0,
+    g_L: float = 30.0,
+    tau_w: float = 144.0,
+    a: float = 4.0,
+    b: float = 80.5,
+    refrac_period_ms: float = 2.0,
+) -> NeuronParams:
+    """Build a ``NeuronParams`` pytree.
 
-    Integration via Exponential Euler (A-stable, handles AdEx + NMDA stiffness).
-
-    Weight update is three-factor (Izhikevich 2007):
-      Δw = lr × modulator × eligibility × error_signal
+    Defaults: Regular-Spiking pyramidal (Brette & Gerstner 2005 Tab. 1).
+    Other neuron types change ``(a, b, tau_w)``:
+        Fast-Spiking  (FS):  a=0,  b=0,   tau_w irrelevant
+        Intr. Bursting(IB):  a=4,  b=150, tau_w=30
+        Late Spiking  (LS):  a=80, b=40,  tau_w=720
+    Pure LIF:  a=0, b=0, delta_t→0.01 (near-zero for numeric safety).
     """
-
-    def __init__(
-        self,
-        num_inputs: int,
-        num_neurons: int = 1,
-        neuron_cfg: NeuronConfig | None = None,
-        stdp_cfg: STDPConfig | None = None,
-        homeo_cfg: HomeostaticConfig | None = None,
-        synapse_cfg: SynapseConfig | None = None,
-        excitatory: bool = True,
-    ) -> None:
-        self.neuron_cfg = neuron_cfg or NeuronConfig()
-        self.stdp_cfg = stdp_cfg or STDPConfig()
-        self.homeo_cfg = homeo_cfg  # None = no homeostatic adaptation
-        self.synapse_cfg = synapse_cfg  # None = instantaneous PSP model
-
-        self.num_inputs = num_inputs
-        self.num_neurons = num_neurons
-
-        # Backward-compat alias used by downstream layers
-        self.config = self.neuron_cfg
-
-        # ── Membrane state ────────────────────────────────────────────
-        self.v: NDArray[np.float32] = np.full(
-            num_neurons, self.neuron_cfg.v_rest, dtype=np.float32,
-        )
-        self.has_spiked: NDArray[np.bool_] = np.zeros(num_neurons, dtype=bool)
-        self.refrac_count: NDArray[np.int32] = np.zeros(num_neurons, dtype=np.int32)
-
-        # ── AdEx adaptation current (Brette & Gerstner 2005) ─────────
-        self.w_adapt: NDArray[np.float32] = np.zeros(
-            num_neurons, dtype=np.float32,
-        )
-
-        # ── Synaptic weights (nS conductance) ─────────────────────────
-        self.w: NDArray[np.float32] = init_weights(
-            num_inputs, num_neurons,
-            psp_target=self.neuron_cfg.psp_target,
-            excitatory=excitatory,
-            g_L=self.neuron_cfg.g_L,
-            driving_force=self.neuron_cfg.driving_force_exc,
-        )
-
-        # ── STDP traces (Bi & Poo 2001) ──────────────────────────────
-        # Pre-synaptic trace: incremented on pre spike, decays with τ_plus
-        self.x_pre: NDArray[np.float32] = np.zeros(num_inputs, dtype=np.float32)
-        # Post-synaptic trace: incremented on post spike, decays with τ_minus
-        self.x_post: NDArray[np.float32] = np.zeros(num_neurons, dtype=np.float32)
-
-        # ── Spike timing for causal STDP window (±20ms, Bi & Poo 2001) ─
-        # Time since last spike (in timesteps). Large init = no recent spike.
-        self.t_since_pre_spike: NDArray[np.int32] = np.full(
-            num_inputs, 1000, dtype=np.int32,
-        )
-        self.t_since_post_spike: NDArray[np.int32] = np.full(
-            num_neurons, 1000, dtype=np.int32,
-        )
-        self._stdp_window: int = 20  # ±20 timesteps (±20ms at dt=1ms)
-
-        # ── Eligibility trace (three-factor, Graupner & Brunel 2012) ─
-        self.e: NDArray[np.float32] = np.zeros(
-            (num_inputs, num_neurons), dtype=np.float32,
-        )
-
-        # ── Synaptic channels (optional) ──────────────────────────────
-        self.channels: SynapticChannels | None = None
-        if self.synapse_cfg is not None:
-            self.channels = SynapticChannels(
-                n_post=num_neurons, config=self.synapse_cfg,
-            )
-
-        # ── Homeostatic state ─────────────────────────────────────────
-        self._ne_level: float = 0.0
-        self._homeo_state: HomeostaticState | None = None
-        if self.homeo_cfg is not None:
-            self._homeo_state = HomeostaticState(
-                num_neurons, self.neuron_cfg.v_thresh, self.homeo_cfg,
-            )
-            # Backward-compat aliases
-            self.v_thresh_adaptive = self._homeo_state.v_thresh_adaptive
-            self.avg_rate = self._homeo_state.avg_rate
-            self._is_dark_matter = self._homeo_state.is_dark_matter
-
-        # ── Effective decay factors (modulated by NE / ACh) ──────────
-        self._mem_decay: float = self.neuron_cfg.mem_decay
-        self._mem_gain: float = self.neuron_cfg.mem_gain
-        self._pre_decay: float = self.stdp_cfg.pre_decay
-        self._post_decay: float = self.stdp_cfg.post_decay
-        self._elig_decay: float = self.stdp_cfg.elig_decay
-
-        # ── Synaptic scaling bookkeeping (Turrigiano 2008) ────────────
-        self._scaling_counter: int = 0
-        self._scaling_interval: int = self.neuron_cfg.scaling_interval
-
-        # ── Astrocyte ATP modulation (Krok 1.3, optional) ────────────
-        self._astrocyte: AstrocyteField | None = None
-        self._zone_idx: NDArray[np.int32] | None = None
-
-    # ------------------------------------------------------------------
-    # Astrocyte coupling
-    # ------------------------------------------------------------------
-
-    def set_astrocyte(
-        self,
-        astrocyte: AstrocyteField,
-        zone_idx: NDArray[np.int32] | None = None,
-    ) -> None:
-        """Attach an AstrocyteField for ATP-based V_T / g_L modulation.
-
-        Args:
-            astrocyte: AstrocyteField instance providing per-zone ATP state.
-            zone_idx: (num_neurons,) mapping neuron i → zone. If None,
-                      neurons are distributed evenly across zones.
-        """
-        self._astrocyte = astrocyte
-        if zone_idx is not None:
-            self._zone_idx = zone_idx.astype(np.int32)
-        else:
-            self._zone_idx = np.linspace(
-                0, astrocyte.n_zones - 1, self.num_neurons,
-            ).astype(np.int32)
-
-    # ------------------------------------------------------------------
-    # Core dynamics
-    # ------------------------------------------------------------------
-
-    def forward(self, pre_spikes: NDArray[np.float32]) -> NDArray[np.bool_]:
-        """One AdEx integration step: current → exp euler → spike → adapt → traces.
-
-        Membrane (Brette & Gerstner 2005):
-          C_m dV/dt = -g_L(V-E_L) + g_L Δ_T exp((V-V_T)/Δ_T) + I_syn - w
-        Integrated via Exponential Euler (A-stable).
-
-        Args:
-            pre_spikes: (num_inputs,) presynaptic spike vector (0/1 or rate).
-
-        Returns:
-            (num_neurons,) boolean spike array.
-        """
-        pre_f32 = pre_spikes.astype(np.float32)
-        ncfg = self.neuron_cfg
-        ctx = ncfg.ctx
-
-        # 1. STDP trace decay
-        self.x_pre *= self._pre_decay
-        self.x_post *= self._post_decay
-
-        # Event-based pre trace: increment only on discrete spikes (Bi & Poo 2001)
-        pre_binary = (pre_f32 > 0.5).astype(np.float32)
-        self.x_pre += pre_binary
-
-        # Update spike timing counters
-        self.t_since_pre_spike += 1
-        self.t_since_pre_spike[pre_binary > 0.5] = 0
-        self.t_since_post_spike += 1
-
-        # 2. Refractory management
-        in_refrac = self.refrac_count > 0
-        self.refrac_count[in_refrac] -= 1
-
-        # 3. Compute synaptic drive
-        if self.channels is not None:
-            # Conductance-based (AMPA + NMDA temporal dynamics)
-            self.channels.receive_excitatory(pre_f32, self.w)
-            self.channels.decay()
-            current = self.channels.compute_current(self.v)
-        else:
-            # Instantaneous conductance-based model: I = g × (E_exc − V)
-            g_exc = pre_f32 @ self.w  # total excitatory conductance (nS)
-            current = g_exc * (ncfg.e_exc - self.v)  # pA
-
-        # 4. AdEx membrane integration via Exponential Euler
-        # F(V) = (1/C_m) * [-g_L*(V-E_L) + g_L*Δ_T*exp((V-V_T)/Δ_T) + I - w]
-        # J(V) = ∂F/∂V = (1/C_m) * [-g_L + g_L*exp((V-V_T)/Δ_T)]
-        # ATP modulation (Krok 1.3): effective V_T and g_L per neuron
-        if self._astrocyte is not None:
-            z = self._zone_idx
-            eff_v_thresh = ncfg.v_thresh + self._astrocyte.threshold_shift[z]
-            eff_g_L = ncfg.g_L * self._astrocyte.leak_gain[z]
-        else:
-            eff_v_thresh = ncfg.v_thresh
-            eff_g_L = ncfg.g_L
-
-        exp_term = np.exp(
-            np.clip((self.v - eff_v_thresh) / ncfg.delta_t, -20.0, 10.0),
-        )
-        inv_Cm = 1.0 / ncfg.C_m
-        F_v = inv_Cm * (
-            -eff_g_L * (self.v - ncfg.v_rest)
-            + eff_g_L * ncfg.delta_t * exp_term
-            + current - self.w_adapt
-        )
-        J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term)
-
-        integrated_v = ctx.exp_euler_step(self.v, F_v, J_v)
-        np.clip(integrated_v, None, 50.0, out=integrated_v)  # cap phi1 runaway
-        self.v = np.where(in_refrac, ncfg.v_reset, integrated_v)
-
-        # 5. Spike detection (v >= v_spike_cutoff, combined with adaptive thresh)
-        thresh = self._effective_threshold()
-        spike_thresh = np.minimum(
-            np.float32(ncfg.v_spike_cutoff), thresh,
-        ) if isinstance(thresh, np.ndarray) else np.float32(ncfg.v_spike_cutoff)
-        self.has_spiked = (self.v >= spike_thresh) & ~in_refrac
-
-        # 6. Reset spiked neurons + spike-triggered adaptation
-        self.v[self.has_spiked] = ncfg.v_reset
-        self.w_adapt[self.has_spiked] += ncfg.b
-        self.refrac_count[self.has_spiked] = ncfg.refrac_period
-        # Event-based post trace: increment by 1.0 on spike event
-        self.x_post[self.has_spiked] += 1.0
-        self.t_since_post_spike[self.has_spiked] = 0
-
-        # 7. Subthreshold adaptation: w = w*decay + a*(V - E_L)*gain
-        self.w_adapt = (
-            self.w_adapt * ncfg.w_decay
-            + ncfg.a * (self.v - ncfg.v_rest) * ncfg.w_gain
-        )
-
-        # 8. Eligibility trace — causal STDP window (±20ms, Bi & Poo 2001)
-        self.e *= self._elig_decay
-
-        if np.any(self.has_spiked):
-            post_idx = np.where(self.has_spiked)[0]
-            ltp_mask = (self.t_since_pre_spike <= self._stdp_window).astype(np.float32)
-            self.e[:, post_idx] += (
-                self.stdp_cfg.a_plus
-                * (self.x_pre * ltp_mask)[:, np.newaxis]
-            )
-
-        pre_spiked = pre_binary > 0.5
-        if np.any(pre_spiked):
-            ltd_mask = (self.t_since_post_spike <= self._stdp_window).astype(np.float32)
-            self.e[pre_spiked, :] -= (
-                self.stdp_cfg.a_minus
-                * (self.x_post * ltd_mask)[np.newaxis, :]
-            )
-
-        # 9. Homeostatic threshold adaptation (if configured)
-        if self.homeo_cfg is not None:
-            self._update_homeostatic()
-
-        # 10. Periodic synaptic scaling (Turrigiano 2008)
-        self._scaling_counter += 1
-        if self._scaling_counter >= self._scaling_interval:
-            self._synaptic_scaling()
-            self._scaling_counter = 0
-
-        return self.has_spiked
-
-    # ------------------------------------------------------------------
-    # Threshold helpers
-    # ------------------------------------------------------------------
-
-    def _effective_threshold(self) -> NDArray[np.float32] | float:
-        """Return adaptive threshold (with NE drop) or static threshold."""
-        if self._homeo_state is not None:
-            return self._homeo_state.effective_threshold(self._ne_level)
-        if hasattr(self, 'v_thresh_adaptive'):
-            # Subclass may have created this directly (e.g. CompetitiveLIFLayer)
-            ne_drop = self._ne_level * getattr(
-                self.homeo_cfg, 'ne_thresh_drop', 0.0,
-            ) if self.homeo_cfg else 0.0
-            return self.v_thresh_adaptive - ne_drop
-        return np.float32(self.neuron_cfg.v_thresh)
-
-    # ------------------------------------------------------------------
-    # Homeostatic plasticity (BCM-derived)
-    # ------------------------------------------------------------------
-
-    def _update_homeostatic(self) -> None:
-        """BCM-derived threshold adaptation toward target_rate."""
-        assert self._homeo_state is not None
-        self._homeo_state.update(self.has_spiked)
-
-    # ------------------------------------------------------------------
-    # Synaptic scaling (Turrigiano 2008)
-    # ------------------------------------------------------------------
-
-    def _synaptic_scaling(self) -> None:
-        """Multiplicative synaptic scaling to maintain column-wise weight norms.
-
-        Every ``_scaling_interval`` steps, rescale:
-            w_col *= target_norm / actual_norm
-        where target_norm = initial column-wise L2 norm (approximated
-        from init std × sqrt(fan_in)), in nS conductance units.
-        """
-        col_norms = np.linalg.norm(self.w, axis=0)
-        ncfg = self.neuron_cfg
-        target = np.sqrt(float(self.num_inputs)) * (
-            ncfg.psp_target * ncfg.g_L
-            / (ncfg.driving_force_exc * np.sqrt(max(1.0, self.num_inputs * 0.05)))
-        )
-        scale = np.where(col_norms > 1e-8, target / col_norms, 1.0)
-        # Soft scaling — move 10% toward target per event
-        scale = 1.0 + 0.1 * (scale - 1.0)
-        self.w *= scale.astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # Neuromodulatory interfaces
-    # ------------------------------------------------------------------
-
-    def set_ne_level(self, ne: float) -> None:
-        """Set noradrenaline level for dark-matter recruitment."""
-        self._ne_level = float(np.clip(ne, 0.0, 1.0))
-
-    def set_plasticity_timescales(self, ne: float, ach: float = 0.5) -> None:
-        """Modulate trace/membrane time constants via NE and ACh.
-
-        NE → compresses eligibility/STDP traces (explore new associations).
-        ACh → compresses membrane τ (prioritise bottom-up input).
-        """
-        ne = float(np.clip(ne, 0.0, 1.0))
-        ach = float(np.clip(ach, 0.0, 1.0))
-
-        ctx = self.neuron_cfg.ctx
-
-        # NE compression on trace time constants
-        ne_factor = 1.0 + ne * self.neuron_cfg.ne_trace_compression
-        eff_tau_e = self.stdp_cfg.tau_eligibility / ne_factor
-        eff_tau_pre = self.stdp_cfg.tau_plus / ne_factor
-        eff_tau_post = self.stdp_cfg.tau_minus / ne_factor
-
-        # ACh compression on membrane τ
-        ach_factor = 1.0 + ach * self.neuron_cfg.ach_membrane_compression
-        eff_tau_m = self.neuron_cfg.tau_m / ach_factor
-
-        self._elig_decay = ctx.decay(eff_tau_e)
-        self._pre_decay = ctx.decay(eff_tau_pre)
-        self._post_decay = ctx.decay(eff_tau_post)
-        self._mem_decay = ctx.decay(eff_tau_m)
-        self._mem_gain = ctx.complement(eff_tau_m)
-
-    # ------------------------------------------------------------------
-    # Weight update — three-factor STDP (Izhikevich 2007)
-    # ------------------------------------------------------------------
-
-    def update_weights(
-        self,
-        m_t: float,
-        pred_error: NDArray[np.float32],
-    ) -> None:
-        """Three-factor STDP: Δw = lr × m_t × e × error_signal.
-
-        Broadcasting logic:
-          - If pred_error matches num_inputs → input-space error (PC).
-          - If pred_error matches num_neurons → output-space error (BG).
-        """
-        if np.isclose(m_t, 0.0):
-            return
-
-        # Determine broadcast shape
-        if pred_error.shape[0] == self.num_inputs:
-            error_signal = pred_error[:, np.newaxis]
-        elif pred_error.shape[0] == self.num_neurons:
-            error_signal = pred_error[np.newaxis, :]
-        else:
-            raise ValueError(
-                f"pred_error shape {pred_error.shape} incompatible with "
-                f"inputs ({self.num_inputs}) or neurons ({self.num_neurons})."
-            )
-
-        dw = self.stdp_cfg.a_plus * m_t * self.e * error_signal
-        self.w += dw
-
-    # ------------------------------------------------------------------
-    # State management
-    # ------------------------------------------------------------------
-
-    def reset_state(self) -> None:
-        """Reset transient state between episodes. Weights preserved."""
-        self.v.fill(self.neuron_cfg.v_rest)
-        self.w_adapt.fill(0.0)
-        self.e.fill(0.0)
-        self.x_pre.fill(0.0)
-        self.x_post.fill(0.0)
-        self.refrac_count.fill(0)
-        self.has_spiked.fill(False)
-
-        if self.channels is not None:
-            self.channels.reset()
-
-        if self._homeo_state is not None:
-            self._homeo_state.reset(self.neuron_cfg.v_thresh)
-        self._ne_level = 0.0
-
-        # Reset effective decay factors to base values
-        self._mem_decay = self.neuron_cfg.mem_decay
-        self._mem_gain = self.neuron_cfg.mem_gain
-        self._pre_decay = self.stdp_cfg.pre_decay
-        self._post_decay = self.stdp_cfg.post_decay
-        self._elig_decay = self.stdp_cfg.elig_decay
-        self._scaling_counter = 0
-
-
-# Backward-compat alias — downstream code imports LIFLayer
-LIFLayer = AdExLayer
+    return NeuronParams(
+        v_rest=jnp.asarray(v_rest, DTYPE),
+        v_thresh=jnp.asarray(v_thresh, DTYPE),
+        v_reset=jnp.asarray(v_reset, DTYPE),
+        v_spike_cutoff=jnp.asarray(v_spike_cutoff, DTYPE),
+        delta_t=jnp.asarray(delta_t, DTYPE),
+        C_m=jnp.asarray(C_m, DTYPE),
+        g_L=jnp.asarray(g_L, DTYPE),
+        tau_w=jnp.asarray(tau_w, DTYPE),
+        a=jnp.asarray(a, DTYPE),
+        b=jnp.asarray(b, DTYPE),
+        refrac_period=jnp.asarray(int(ctx.ms_to_steps(refrac_period_ms)), jnp.int32),
+        w_decay=ctx.decay(tau_w),
+        w_gain=ctx.complement(tau_w),
+    )
+
+
+# ======================================================================
+# Core step
+# ======================================================================
+
+
+def _adex_drift(
+    v: Array,
+    w: Array,
+    i_syn: Array,
+    g_syn: Array,
+    params: NeuronParams,
+    eff_v_thresh: Array,
+    eff_g_L: Array,
+) -> tuple[Array, Array]:
+    """Return ``(F_V, J_V)`` for the exp-Euler integrator.
+
+    F_V(V) = (1/C_m) · [-g_L(V-E_L) + g_L·Δ_T·exp((V-V_T)/Δ_T) + I_syn - w]
+    J_V(V) = ∂F/∂V = (1/C_m) · [-g_L + g_L·exp((V-V_T)/Δ_T) - g_syn]
+
+    ``g_syn`` is the total synaptic conductance from ``synapse_step``
+    (conductance-based synapses contribute ``-g_syn`` to the Jacobian
+    because I_syn = g·(E-V)).
+    """
+    exp_arg = jnp.clip((v - eff_v_thresh) / params.delta_t, -20.0, 10.0)
+    exp_term = jnp.exp(exp_arg)
+    inv_Cm = 1.0 / params.C_m
+
+    F_v = inv_Cm * (
+        -eff_g_L * (v - params.v_rest)
+        + eff_g_L * params.delta_t * exp_term
+        + i_syn
+        - w
+    )
+    J_v = inv_Cm * (-eff_g_L + eff_g_L * exp_term - g_syn)
+    return F_v, J_v
+
+
+def neuron_step(
+    state: NeuronState,
+    params: NeuronParams,
+    ctx: BackendContext,
+    i_syn: Array,
+    g_syn: Array,
+    *,
+    astro: Optional[AstroMod] = None,
+    v_thresh_adaptive: Optional[Array] = None,
+    ne_level: Array | float = 0.0,
+    ne_thresh_drop: float = 3.0,
+) -> tuple[NeuronState, Array]:
+    """One AdEx integration step.
+
+    Args:
+        state:  current ``NeuronState``.
+        params: static (per-run) ``NeuronParams``.
+        ctx:    backend context (exp_euler_step, dt).
+        i_syn:  ``(n,)`` total synaptic current from ``synapse_step``.
+        g_syn:  ``(n,)`` total synaptic conductance (Jacobian term).
+        astro:  optional per-zone V_T shift + g_L gain (Krok 1.3).
+        v_thresh_adaptive: optional homeostatic threshold ``(n,)``;
+                overrides ``params.v_thresh`` when provided.
+        ne_level: scalar NE neuromodulator level (reduces threshold).
+        ne_thresh_drop: mV reduction in threshold per unit NE.
+
+    Returns:
+        ``(new_state, spikes)`` where ``spikes`` is a float32 ``(n,)``
+        array of 0/1 values (post-reset, post-refractory).
+    """
+    # 1. Effective threshold + leak (homeostatic + astrocyte + NE)
+    base_thresh = v_thresh_adaptive if v_thresh_adaptive is not None else params.v_thresh
+    if astro is not None:
+        eff_v_thresh = base_thresh + astro.threshold_shift
+        eff_g_L = params.g_L * astro.leak_gain
+    else:
+        eff_v_thresh = base_thresh
+        eff_g_L = params.g_L
+    eff_v_thresh = eff_v_thresh - jnp.asarray(ne_level, DTYPE) * ne_thresh_drop
+
+    # 2. Refractory countdown (clamped ≥ 0)
+    new_refrac = jnp.maximum(state.refrac - 1, 0)
+    in_refrac = new_refrac > 0
+
+    # 3. Drift + exp-Euler on V (using effective V_T / g_L)
+    F_v, J_v = _adex_drift(
+        state.v, state.w_adapt, i_syn, g_syn, params, eff_v_thresh, eff_g_L,
+    )
+    v_integrated = ctx.exp_euler_step(state.v, F_v, J_v)
+    v_integrated = jnp.minimum(v_integrated, jnp.asarray(50.0, DTYPE))
+    v_held = jnp.where(in_refrac, params.v_reset, v_integrated)
+
+    # 4. Spike detection — at or above cutoff, not in refractory
+    spike_threshold = jnp.minimum(params.v_spike_cutoff, eff_v_thresh)
+    spiked = (v_held >= spike_threshold) & ~in_refrac
+    spikes_f = spiked.astype(DTYPE)
+
+    # 5. Reset V, trigger adaptation jump, arm refractory, bump post trace
+    v_post = jnp.where(spiked, params.v_reset, v_held)
+    w_after_spike = state.w_adapt + spikes_f * params.b
+    refrac_after = jnp.where(spiked, params.refrac_period, new_refrac).astype(jnp.int32)
+
+    # 6. Subthreshold adaptation: w = w·decay + a·(V−E_L)·gain
+    w_new = (
+        w_after_spike * params.w_decay
+        + params.a * (v_post - params.v_rest) * params.w_gain
+    )
+
+    # 7. Post-synaptic STDP trace: decay + event-based increment
+    #    (pre-trace lives in the *upstream* layer's state)
+    x_post_new = state.x_post + spikes_f
+    # x_pre left untouched here — managed by STDP module with pre layer.
+
+    new_state = eqx.tree_at(
+        lambda s: (s.v, s.w_adapt, s.refrac, s.x_post, s.spikes),
+        state,
+        (v_post, w_new, refrac_after, x_post_new, spikes_f),
+    )
+    return new_state, spikes_f
+
+
+# ======================================================================
+# Convenience: STDP pre-trace update (independent of neuron_step)
+# ======================================================================
+
+
+def decay_pre_trace(
+    state: NeuronState,
+    decay: Array | float,
+    incoming_spikes: Array,
+) -> NeuronState:
+    """Decay ``x_pre`` and increment on incoming spikes.
+
+    Used when ``x_pre`` tracks the post-synaptic neuron's *incoming*
+    spike rate (e.g. for per-target heterosynaptic rules).  Shape of
+    ``incoming_spikes`` must match ``state.x_pre``.
+    """
+    new_xpre = state.x_pre * decay + incoming_spikes
+    return eqx.tree_at(lambda s: s.x_pre, state, new_xpre)

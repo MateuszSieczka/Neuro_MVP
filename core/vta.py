@@ -1,19 +1,33 @@
 """VTA dopaminergic circuit — pure JAX.
 
 Eshel et al. (2015); Schultz (1997, 1998); Tobler et al. (2005);
-Grace (1991); Schweighofer et al. (2008); Watabe-Uchida et al. (2017).
+Grace (1991); Schweighofer et al. (2008); Watabe-Uchida et al. (2017);
+Bayer & Glimcher (2005); Frémaux & Gerstner (2016).
 
 Circuit:
 - **VP**    (inhibitory) carries ``V̂(s)`` captured at decision time.
 - **PPTg**  (excitatory) carries ``γ_eff · V̂(s')`` — the PPTg synaptic
   τ implements temporal discount; 5-HT widens τ (Schweighofer 2008).
-- **Reward** (excitatory) carries ``reward_gain · r``.
+- **Reward** (excitatory) carries ``reward_gain · (r − b)`` where ``b`` is
+  the long-term reward baseline (slow EMA, see below).
 - **D2 autoreceptor** normalises RPE by a slow RMS trace (Tobler 2005).
 
 The E/I balance ``RPE_raw = I_reward + I_ppTg − I_vp`` is algebraically
-identical to classic TD ``r + γ V(s') − V(s)`` and is divided by the D2
-adaptive gain to produce the broadcast RPE. A homeostatic weight-norm
-bound prevents V estimates from diverging.
+identical to classic baseline-subtracted TD ``(r − b) + γ V(s') − V(s)``
+and is divided by the D2 adaptive gain to produce the broadcast RPE.
+A homeostatic weight-norm bound prevents V estimates from diverging.
+
+**Reward baseline (b)** — a slow EMA of the raw extrinsic reward kept
+outside the critic. Bayer & Glimcher (2005) report that VTA dopamine
+neurons encode RPE *relative to* an expected-reward signal that
+adapts on a much slower timescale than per-state V̂; orbitofrontal /
+amygdala circuits maintain that expectation. Frémaux & Gerstner
+(2016) prove R-STDP requires reward-baseline subtraction for
+stationary-task stability — without it the per-state critic alone has
+to absorb the absolute reward level, which couples value-error and
+policy-error and produces tonic-DA collapse on stationary tasks. The
+baseline is ``b_{t+1} = decay·b_t + (1−decay)·r_t``; centering uses
+the pre-update ``b_t`` so the system is causal.
 
 Legacy notes:
 - ``is_terminal`` is represented as a float mask (0/1) so the step is
@@ -45,6 +59,7 @@ class VTAParams(eqx.Module):
     reward_gain: Array
     value_lr: Array
     auto_decay: Array          # per-step EMA decay for RMS
+    baseline_decay: Array      # per-step EMA decay for reward baseline
     min_gain: Array
     readout_decay: Array
     dt: Array                  # ms per simulation step (for γ_eff)
@@ -59,6 +74,13 @@ def init_vta_params(
     reward_gain: float = 1.0,
     value_lr: float = 0.1,
     tau_autoreceptor: float = 10_000.0,
+    # tau_reward_baseline: long-run E[r] tracker. Must be (a) slower
+    # than the critic so V̂ carries state-specific structure, and (b)
+    # slower than auto_rms so the D2 normaliser still tracks the
+    # short-term variance of *centered* RPE. 30 s is the OFC/amygdala
+    # appetitive-baseline timescale (Bayer & Glimcher 2005;
+    # Padoa-Schioppa & Cai 2011).
+    tau_reward_baseline: float = 30_000.0,
     min_gain: float = 0.01,
     readout_decay: float = 2e-5,
     dtype=DTYPE,
@@ -69,6 +91,7 @@ def init_vta_params(
         reward_gain=f(reward_gain),
         value_lr=f(value_lr),
         auto_decay=f(ctx.decay(tau_autoreceptor)),
+        baseline_decay=f(ctx.decay(tau_reward_baseline)),
         min_gain=f(min_gain),
         readout_decay=f(readout_decay),
         dt=f(ctx.dt),
@@ -83,6 +106,7 @@ class VTAState(eqx.Module):
     stored_v: Array            # scalar
     e_value: Array             # (hidden_size,)
     auto_rms: Array            # scalar, warm-start at 1.0
+    reward_baseline: Array     # scalar, slow EMA of raw reward
     last_rpe: Array            # scalar diagnostic
     last_v_s_prime: Array      # scalar diagnostic
     last_gamma_eff: Array      # scalar diagnostic
@@ -101,6 +125,7 @@ def init_vta_state(
         stored_v=z,
         e_value=jnp.zeros(h, dtype=dtype),
         auto_rms=jnp.asarray(1.0, dtype),
+        reward_baseline=z,
         last_rpe=z,
         last_v_s_prime=z,
         last_gamma_eff=jnp.asarray(0.99, dtype),
@@ -162,7 +187,15 @@ def vta_compute_rpe(
     v_s_prime = jnp.dot(act_next, state.w_value)
     I_vp = state.stored_v
     I_ppTg = (1.0 - term) * gamma_eff * v_s_prime
-    I_reward = params.reward_gain * r
+    # Baseline-subtracted reward signal (Bayer & Glimcher 2005;
+    # Frémaux & Gerstner 2016). The pre-update baseline is used so
+    # the centering is causal; the baseline is then advanced.
+    r_centered = r - state.reward_baseline
+    I_reward = params.reward_gain * r_centered
+    reward_baseline = (
+        params.baseline_decay * state.reward_baseline
+        + (1.0 - params.baseline_decay) * r
+    )
 
     rpe_raw = I_reward + I_ppTg - I_vp
 
@@ -176,9 +209,12 @@ def vta_compute_rpe(
     rpe = rpe_raw / auto_gain
 
     new_state = eqx.tree_at(
-        lambda s: (s.auto_rms, s.last_rpe, s.last_v_s_prime, s.last_gamma_eff),
+        lambda s: (
+            s.auto_rms, s.reward_baseline,
+            s.last_rpe, s.last_v_s_prime, s.last_gamma_eff,
+        ),
         state,
-        (auto_rms, rpe, v_s_prime, gamma_eff),
+        (auto_rms, reward_baseline, rpe, v_s_prime, gamma_eff),
     )
     return VTAOutput(
         state=new_state,
@@ -219,8 +255,10 @@ def vta_update(
 def vta_reset_transient(state: VTAState, *, dtype=DTYPE) -> VTAState:
     """Clear the ``stored_v`` / ``e_value`` snapshots between episodes.
 
-    Preserves ``w_value`` and ``auto_rms`` (both are persistent across
-    episodes in the legacy code).
+    Preserves ``w_value``, ``auto_rms`` and ``reward_baseline`` (all
+    three are persistent across episodes \u2014 the baseline tracks the
+    long-run reward expectation of the body in the world, which is
+    *not* episode-bound).
     """
     h = state.w_value.shape[0]
     z = jnp.asarray(0.0, dtype)

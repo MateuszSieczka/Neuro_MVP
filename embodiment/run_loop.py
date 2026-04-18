@@ -24,9 +24,10 @@ from .body_interface import BodyInterface, SensorySample
 class EpisodeResult(NamedTuple):
     """Per-step history of one episode."""
 
-    actions: Array            # (T,) int32
-    rewards: Array            # (T,) float32 \u2014 extrinsic
-    total_rewards: Array      # (T,) float32 \u2014 incl. intrinsic drives
+    body_actions: Array       # (T,) int32
+    saccade_actions: Array    # (T,) int32
+    rewards: Array            # (T,) float32 — extrinsic
+    total_rewards: Array      # (T,) float32 — incl. intrinsic drives
     rpes: Array               # (T,) float32
     curiosities: Array        # (T,) float32
     dones: Array              # (T,) float32
@@ -48,7 +49,7 @@ def run_episode(
 ) -> EpisodeResult:
     """Run one episode; return trajectories and the final brain state.
 
-    The episode stops early on the body's ``done`` flag. No JIT here \u2014
+    The episode stops early on the body's ``done`` flag. No JIT here —
     ``action_brain_step`` is heavy enough that per-cycle Python overhead
     is negligible, and bodies are ordinary Python objects; this keeps
     the loop trivially debuggable.
@@ -65,7 +66,8 @@ def run_episode(
             info={},
         )
 
-    actions = []
+    body_actions = []
+    saccade_actions = []
     rewards = []
     total_rewards = []
     rpes = []
@@ -82,11 +84,11 @@ def run_episode(
             sample.sensory, prev_reward, prev_done, k_sel,
         )
         brain_state = out.state
-        action = out.action
 
-        body, sample = body.act(k_act, action)
+        body, sample = body.act(k_act, out.body_action, out.saccade_action)
 
-        actions.append(action)
+        body_actions.append(out.body_action)
+        saccade_actions.append(out.saccade_action)
         rewards.append(sample.reward)
         total_rewards.append(out.total_reward)
         rpes.append(out.rpe)
@@ -99,9 +101,10 @@ def run_episode(
         if bool(sample.done):
             break
 
-    T = len(actions)
+    T = len(body_actions)
     return EpisodeResult(
-        actions=jnp.asarray(actions, jnp.int32),
+        body_actions=jnp.asarray(body_actions, jnp.int32),
+        saccade_actions=jnp.asarray(saccade_actions, jnp.int32),
         rewards=jnp.asarray(rewards, DTYPE),
         total_rewards=jnp.asarray(total_rewards, DTYPE),
         rpes=jnp.asarray(rpes, DTYPE),

@@ -9,10 +9,11 @@ integration testing).
 from .body_interface import BodyInterface, SensorySample
 from .bandit import GaussianBanditBody
 from .gridworld import GridWorldBody
+from .visual_grid import VisualGridBody
 from .run_loop import run_episode, EpisodeResult
 
 __all__ = [
     "BodyInterface", "SensorySample",
-    "GaussianBanditBody", "GridWorldBody",
+    "GaussianBanditBody", "GridWorldBody", "VisualGridBody",
     "run_episode", "EpisodeResult",
 ]

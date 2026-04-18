@@ -504,12 +504,53 @@ from .world_model import (
 
 
 # ---------------------------------------------------------------------
+# Parallel cortico-BG-thalamo-cortical loops
+# ---------------------------------------------------------------------
+#
+# Alexander, DeLong & Strick (1986) demonstrated that the basal ganglia
+# implement at least five anatomically segregated parallel loops —
+# motor, oculomotor, dorsolateral prefrontal, lateral orbitofrontal,
+# anterior cingulate — each selecting actions in its own domain and
+# sharing only the dopaminergic broadcast from SNc/VTA and the cortical
+# glutamatergic drive. Credit assignment across domains is delegated to
+# the world model (shared sensory outcome → shared DA signal).
+#
+# In Phase 4 we instantiate **two** such loops:
+#
+#   * ``actor_body``    — skeletomotor loop (putamen analogue), selects
+#     one of ``n_body_actions`` discrete motor commands.
+#   * ``actor_saccade`` — oculomotor loop (caudate / FEF-SC analogue),
+#     selects one of ``n_saccade_actions`` discrete fovea shifts.
+#
+# Both populations receive the SAME striatal drive (cortex L2/3 belief
+# ⊕ raw sensory) and the SAME phasic DA from VTA, but they maintain
+# independent MSN voltages, independent lateral inhibition and
+# independent evidence accumulators. This is the only architecture
+# that scales linearly with the number of action domains — a
+# prerequisite for Phase 5 (babbling / speech motor) and beyond.
+#
+# References
+# ----------
+# Alexander, DeLong & Strick (1986) — parallel segregated circuits.
+# Hikosaka et al. (2000)           — saccade selection via BG.
+# Middleton & Strick (2000)        — distinct cortical territories.
+# Tan (1993); Claus & Boutilier (1998) — independent learners with a
+#                                         shared global reward.
+
+
+#: Discrete saccade action space emitted by the oculomotor loop.
+#: Index 0 = recentre fovea, 1..8 = eight cardinal / diagonal shifts.
+#: The brain emits only the index; the body interprets it.
+SACCADE_ACTION_DIM: int = 9
+
+
+# ---------------------------------------------------------------------
 # Params
 # ---------------------------------------------------------------------
 
 
 class ActionBrainParams(eqx.Module):
-    """All MinimalBrain params + action/value/world machinery."""
+    """All MinimalBrain params + two parallel BG loops + VTA + WM."""
 
     # Region modules (body-agnostic)
     thalamus_relay: RelayParams
@@ -519,7 +560,8 @@ class ActionBrainParams(eqx.Module):
     oscillator: OscillatorParams
     neuromodulator: NeuromodulatorParams
     critic: CriticParams
-    actor: ActorParams
+    actor_body: ActorParams
+    actor_saccade: ActorParams
     vta: VTAParams
     world_model: WorldModelParams
 
@@ -540,7 +582,8 @@ class ActionBrainParams(eqx.Module):
     beta_homeostasis: Array     # Keramati & Gutkin 2014
 
     # Static
-    n_actions: int = eqx.field(static=True)
+    n_body_actions: int = eqx.field(static=True)
+    n_saccade_actions: int = eqx.field(static=True)
     sensory_size: int = eqx.field(static=True)
     substeps: int = eqx.field(static=True)
     delay_ct_steps: int = eqx.field(static=True)
@@ -548,7 +591,7 @@ class ActionBrainParams(eqx.Module):
 
 
 class ActionBrainState(eqx.Module):
-    """All MinimalBrain state + BG/VTA/WM state + decision bookkeeping."""
+    """All MinimalBrain state + dual-loop BG + VTA/WM + decision bookkeeping."""
 
     thalamus_relay: RelayState
     thalamus_trn: TRNState
@@ -557,31 +600,38 @@ class ActionBrainState(eqx.Module):
     oscillator: OscillatorState
     neuromodulator: NeuromodulatorState
     critic: CriticState
-    actor: ActorState
+    actor_body: ActorState
+    actor_saccade: ActorState
     vta: VTAState
     world_model: WorldModelState
 
     delay_ct: DelayBuffer
     delay_mossy: DelayBuffer
 
-    # Last committed action (one-hot) kept so wm_update can observe
-    # (s_t, a_t, s_{t+1}) at the next cycle. Scalar int for logging.
-    last_action: Array          # (n_actions,) one-hot
-    last_action_id: Array       # scalar int32
-    last_sensory: Array         # (sensory_size,)
-    last_rpe: Array             # scalar — diagnostic only
-    last_total_reward: Array    # scalar — diagnostic only
+    # Last committed motor commands from each parallel loop. The world
+    # model consumes the concatenation as its action space so it can
+    # model sensory outcomes that depend on both where the body moved
+    # and where the eye looked.
+    last_body_action: Array          # (n_body_actions,) one-hot
+    last_body_action_id: Array       # scalar int32
+    last_saccade_action: Array       # (n_saccade_actions,) one-hot
+    last_saccade_action_id: Array    # scalar int32
+
+    last_sensory: Array              # (sensory_size,)
+    last_rpe: Array                  # scalar — diagnostic only
+    last_total_reward: Array         # scalar — diagnostic only
 
 
 class ActionBrainOutput(NamedTuple):
     state: ActionBrainState
-    action: Array               # scalar int32 — the newly committed action
-    rpe: Array                  # scalar — RPE for the previous transition
-    total_reward: Array         # scalar — extrinsic + intrinsic
-    curiosity: Array            # scalar — world-model curiosity ∈ [0, 1]
-    cortex_belief: Array        # (n_l23_state,)
-    cortex_l5_rate: Array       # (n_l5,)
-    cerebellum_nuclei: Array    # (n_dn,)
+    body_action: Array           # scalar int32 — skeletomotor command
+    saccade_action: Array        # scalar int32 — oculomotor command
+    rpe: Array                   # scalar — RPE for the previous transition
+    total_reward: Array          # scalar — extrinsic + intrinsic
+    curiosity: Array             # scalar — world-model curiosity ∈ [0, 1]
+    cortex_belief: Array         # (n_l23_state,)
+    cortex_l5_rate: Array        # (n_l5,)
+    cerebellum_nuclei: Array     # (n_dn,)
     relay_spikes: Array
     theta_phase: Array
     neuromod: NeuromodulatorState
@@ -591,7 +641,8 @@ def init_action_brain_params(
     ctx: BackendContext,
     *,
     sensory_size: int,
-    n_actions: int,
+    n_body_actions: int,
+    n_saccade_actions: int = SACCADE_ACTION_DIM,
     # thalamus
     n_tc: int = 64,
     n_ct: int = 32,
@@ -629,10 +680,18 @@ def init_action_brain_params(
 ) -> ActionBrainParams:
     """Build an ActionBrain params pytree.
 
-    The sensory and action sizes come from the body (``body.sensory_size``,
-    ``body.n_actions``). Region sizes and substep count are policy
-    choices, not task-specific. 20 substeps ≈ 20 ms is the canonical
-    cortical decision interval (Schall 2002; Gold & Shadlen 2007).
+    Two BG actors are instantiated over the same striatal drive (cortex
+    L2/3 belief ⊕ raw sensory): a body-action actor of ``motor_dim =
+    n_body_actions`` and a saccade actor of ``motor_dim =
+    n_saccade_actions``. The world model's action space is the
+    concatenation ``n_body_actions + n_saccade_actions`` so it can
+    account for sensory outcomes that depend on both.
+
+    20 substeps ≈ 20 ms is the canonical cortical decision interval
+    (Schall 2002; Gold & Shadlen 2007); both parallel loops share this
+    window (Rayner 1998 reports 200-300 ms inter-saccade intervals,
+    i.e. ≥10 decision cycles per saccade — evidence accumulation is
+    naturally slower for low-salience inputs).
     """
     tr_p = init_relay_params(
         ctx, n_afferent=sensory_size, n_tc=n_tc, n_ct=n_ct,
@@ -649,18 +708,24 @@ def init_action_brain_params(
     osc_p = init_oscillator_params()
     nm_p = init_neuromodulator_params(ctx)
 
+    state_size = cortex_n_l23_state + sensory_size
     critic_p = init_critic_params(
-        ctx, state_size=cortex_n_l23_state + sensory_size,
-        hidden_size=critic_hidden,
+        ctx, state_size=state_size, hidden_size=critic_hidden,
     )
-    actor_p = init_actor_params(
-        ctx, state_size=cortex_n_l23_state + sensory_size,
-        motor_dim=n_actions,
+    actor_body_p = init_actor_params(
+        ctx, state_size=state_size,
+        motor_dim=n_body_actions,
+        n_per_action=actor_n_per_action,
+    )
+    actor_saccade_p = init_actor_params(
+        ctx, state_size=state_size,
+        motor_dim=n_saccade_actions,
         n_per_action=actor_n_per_action,
     )
     vta_p = init_vta_params(ctx, hidden_size=critic_hidden)
     wm_p = init_world_model_params(
-        ctx, state_size=sensory_size, action_size=n_actions,
+        ctx, state_size=sensory_size,
+        action_size=n_body_actions + n_saccade_actions,
         hidden_size=wm_hidden, n_error=wm_n_error,
         n_neurons_per_dim=wm_n_neurons_per_dim,
     )
@@ -673,9 +738,6 @@ def init_action_brain_params(
     w_l5_mossy = jnp.abs(
         jax.random.normal(k2, (cortex_n_l5, mossy_size), dtype=DTYPE)
     ) * jnp.asarray(w_l5_mossy_mean, DTYPE)
-    # Inferior olive: signed projection. One IO neuron per sensory
-    # dimension converges onto ~n_purkinje/sensory_size PCs; we model
-    # as a dense Gaussian map (Marr 1969 abstract connectivity).
     w_io_pc = jax.random.normal(
         k3, (sensory_size, cerebellum_n_purkinje), dtype=DTYPE,
     ) * jnp.asarray(w_io_pc_sigma, DTYPE)
@@ -688,14 +750,18 @@ def init_action_brain_params(
         thalamus_relay=tr_p, thalamus_trn=trn_p,
         cortex=cx_p, cerebellum=cb_p,
         oscillator=osc_p, neuromodulator=nm_p,
-        critic=critic_p, actor=actor_p, vta=vta_p, world_model=wm_p,
+        critic=critic_p,
+        actor_body=actor_body_p,
+        actor_saccade=actor_saccade_p,
+        vta=vta_p, world_model=wm_p,
         w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy, w_io_pc=w_io_pc,
         phase_offset_thalamus=f(phase_offsets_rad[0]),
         phase_offset_cortex=f(phase_offsets_rad[1]),
         phase_offset_cerebellum=f(phase_offsets_rad[2]),
         beta_curiosity=f(beta_curiosity),
         beta_homeostasis=f(beta_homeostasis),
-        n_actions=int(n_actions),
+        n_body_actions=int(n_body_actions),
+        n_saccade_actions=int(n_saccade_actions),
         sensory_size=int(sensory_size),
         substeps=int(substeps),
         delay_ct_steps=d_ct, delay_mossy_steps=d_mossy,
@@ -705,7 +771,7 @@ def init_action_brain_params(
 def init_action_brain_state(
     key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
 ) -> ActionBrainState:
-    keys = split_key(key, 8)
+    keys = split_key(key, 9)
     tr_s = init_relay_state(keys[0], params.thalamus_relay)
     trn_s = init_trn_state(keys[1], params.thalamus_trn)
     cx_s = init_cortical_area_state(keys[2], params.cortex)
@@ -713,9 +779,10 @@ def init_action_brain_state(
     osc_s = init_oscillator_state()
     nm_s = init_neuromodulator_state(params.neuromodulator)
     critic_s = init_critic_state(keys[4], params.critic)
-    actor_s = init_actor_state(keys[5], params.actor)
-    vta_s = init_vta_state(keys[6], params.vta)
-    wm_s = init_world_model_state(keys[7], params.world_model)
+    actor_body_s = init_actor_state(keys[5], params.actor_body)
+    actor_saccade_s = init_actor_state(keys[6], params.actor_saccade)
+    vta_s = init_vta_state(keys[7], params.vta)
+    wm_s = init_world_model_state(keys[8], params.world_model)
 
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
@@ -723,13 +790,18 @@ def init_action_brain_state(
         thalamus_relay=tr_s, thalamus_trn=trn_s,
         cortex=cx_s, cerebellum=cb_s,
         oscillator=osc_s, neuromodulator=nm_s,
-        critic=critic_s, actor=actor_s, vta=vta_s, world_model=wm_s,
+        critic=critic_s,
+        actor_body=actor_body_s,
+        actor_saccade=actor_saccade_s,
+        vta=vta_s, world_model=wm_s,
         delay_ct=init_delay_buffer(n_ct, params.delay_ct_steps, dtype=dtype),
         delay_mossy=init_delay_buffer(
             mossy_size, params.delay_mossy_steps, dtype=dtype,
         ),
-        last_action=jnp.zeros(params.n_actions, dtype),
-        last_action_id=jnp.asarray(0, jnp.int32),
+        last_body_action=jnp.zeros(params.n_body_actions, dtype),
+        last_body_action_id=jnp.asarray(0, jnp.int32),
+        last_saccade_action=jnp.zeros(params.n_saccade_actions, dtype),
+        last_saccade_action_id=jnp.asarray(0, jnp.int32),
         last_sensory=jnp.zeros(params.sensory_size, dtype),
         last_rpe=jnp.asarray(0.0, dtype),
         last_total_reward=jnp.asarray(0.0, dtype),
@@ -798,19 +870,35 @@ def _perceive_substep(
     critic_out = critic_step(
         state.critic, params.critic, ctx, striatal_drive,
     )
-    actor_out = actor_step(
-        state.actor, params.actor, ctx, striatal_drive,
-        inputs=ActorInputs(
-            da=mb_out.neuromod.dopamine,
-            tonic_da=mb_out.neuromod.tonic_da,
-            epistemic_drive=novelty,
-        ),
+
+    # Parallel cortico-BG-thalamo-cortical loops (Alexander 1986):
+    # both actors receive the same striatal drive and the same phasic
+    # DA broadcast, but maintain independent MSN populations, lateral
+    # inhibition and evidence accumulators.
+    actor_inputs = ActorInputs(
+        da=mb_out.neuromod.dopamine,
+        tonic_da=mb_out.neuromod.tonic_da,
+        epistemic_drive=novelty,
+    )
+    body_out = actor_step(
+        state.actor_body, params.actor_body, ctx, striatal_drive,
+        inputs=actor_inputs,
+    )
+    saccade_out = actor_step(
+        state.actor_saccade, params.actor_saccade, ctx, striatal_drive,
+        inputs=actor_inputs,
     )
 
-    # World-model forward prediction (no weight updates — happens at learn)
+    # World-model forward prediction consumes the JOINT last motor
+    # command — body and saccade both shape what the brain will see
+    # next (the body by moving the agent, the saccade by moving the
+    # fovea).
+    joint_last_action = jnp.concatenate(
+        [state.last_body_action, state.last_saccade_action], axis=0,
+    )
     wm_out = wm_predict(
         state.world_model, params.world_model, ctx,
-        sensory, state.last_action,
+        sensory, joint_last_action,
         ach=mb_out.neuromod.acetylcholine,
     )
 
@@ -822,13 +910,16 @@ def _perceive_substep(
         oscillator=mb_out.state.oscillator,
         neuromodulator=mb_out.state.neuromodulator,
         critic=critic_out.state,
-        actor=actor_out.state,
+        actor_body=body_out.state,
+        actor_saccade=saccade_out.state,
         vta=state.vta,
         world_model=wm_out.state,
         delay_ct=mb_out.state.delay_ct,
         delay_mossy=mb_out.state.delay_mossy,
-        last_action=state.last_action,
-        last_action_id=state.last_action_id,
+        last_body_action=state.last_body_action,
+        last_body_action_id=state.last_body_action_id,
+        last_saccade_action=state.last_saccade_action,
+        last_saccade_action_id=state.last_saccade_action_id,
         last_sensory=state.last_sensory,
         last_rpe=state.last_rpe,
         last_total_reward=state.last_total_reward,
@@ -852,20 +943,25 @@ def action_brain_step(
     """Run one full decision cycle on sensory ``s_{t+1}``.
 
     Inputs:
-      * ``sensory``      : ``s_{t+1}`` just received from body.act(a_t).
+      * ``sensory``      : ``s_{t+1}`` just received from
+        ``body.act(body_action_t, saccade_action_t)``.
       * ``prev_reward``  : ``r_t`` emitted during that transition.
       * ``prev_done``    : terminal flag for the transition.
-      * ``key``          : PRNG for action sampling (tie-break).
+      * ``key``          : PRNG for action sampling (independently
+        split between the body-actor and saccade-actor tie-breaks).
 
     Output:
-      * ``action``       : the newly committed ``a_{t+1}``.
+      * ``body_action``    : the newly committed skeletomotor command.
+      * ``saccade_action`` : the newly committed oculomotor command.
       * Diagnostics including the RPE that corrected the previous
         transition, the aggregated intrinsic+extrinsic total reward,
         curiosity, and selected cortical readouts.
 
     Side effect: the world model is *updated* with the realised
-    transition (s_t, a_t, s_{t+1}), and the cerebellum receives the
-    resulting sensory-prediction error as its climbing signal.
+    transition ``(s_t, (a_body_t ⊕ a_saccade_t), s_{t+1})``, and the
+    cerebellum receives the resulting sensory-prediction error as its
+    climbing signal. Both actor populations receive the same scalar
+    RPE and update independently against their own eligibility traces.
 
     All operations are pure; JIT via ``jax.lax.scan`` for the substep
     loop inside perception.
@@ -874,12 +970,16 @@ def action_brain_step(
     done = jnp.asarray(prev_done, DTYPE)
 
     # --- 1. Perceive s_{t+1} first so critic.activation = V(s_{t+1}).
-    # Clear BG evidence at the start of a new decision window so
-    # spike counts accumulate cleanly over this window only.
+    # Clear BG evidence on BOTH parallel loops at the start of a new
+    # decision window so spike counts accumulate cleanly over this
+    # window only.
     state = eqx.tree_at(
-        lambda s: s.actor,
+        lambda s: (s.actor_body, s.actor_saccade),
         state,
-        actor_reset_evidence(state.actor),
+        (
+            actor_reset_evidence(state.actor_body),
+            actor_reset_evidence(state.actor_saccade),
+        ),
     )
 
     # During perception the phasic-DA / ACh drives carry the *previous*
@@ -905,11 +1005,15 @@ def action_brain_step(
     relay_spikes = relay_hist[-1]
 
     # --- 2. Close the loop on the PREVIOUS transition --------------
-    # 2a. World-model learning on (s_t, a_t, s_{t+1}) \u2014 sensory PE
-    #     serves as the cerebellar climbing signal.
+    # 2a. World-model learning on (s_t, a_t, s_{t+1}) — sensory PE
+    #     serves as the cerebellar climbing signal. Action is the
+    #     joint body+saccade one-hot committed on the previous cycle.
+    joint_last_action = jnp.concatenate(
+        [state.last_body_action, state.last_saccade_action], axis=0,
+    )
     wm_out = wm_update(
         state.world_model, params.world_model, ctx,
-        state.last_sensory, state.last_action, sensory,
+        state.last_sensory, joint_last_action, sensory,
         m_t=1.0,
         ach=state.neuromodulator.acetylcholine,
     )
@@ -941,20 +1045,38 @@ def action_brain_step(
     )
     rpe = vta_out.rpe
 
-    # 2d. Weight updates driven by this RPE.
+    # 2d. Weight updates driven by this RPE. The same scalar RPE drives
+    #     both parallel loops; credit is assigned per-domain through
+    #     the INDEPENDENT eligibility traces each actor maintains.
     vta_state = vta_update(vta_out.state, params.vta, rpe)
     critic_state = critic_update(state.critic, params.critic, rpe)
-    actor_state = actor_update(
-        state.actor, params.actor, rpe, state.last_action_id,
+    actor_body_state = actor_update(
+        state.actor_body, params.actor_body, rpe,
+        state.last_body_action_id,
+    )
+    actor_saccade_state = actor_update(
+        state.actor_saccade, params.actor_saccade, rpe,
+        state.last_saccade_action_id,
     )
 
     # --- 3. Store V(s_{t+1}) in VTA for next cycle's TD target. -----
     vta_state = vta_store_prediction(vta_state, critic_state.activation)
 
-    # --- 4. Select a_{t+1} from the BG evidence accumulated in scan.
-    action_id = actor_select_action(actor_state, params.actor, key)
-    action_oh = (
-        jnp.arange(params.n_actions) == action_id
+    # --- 4. Select a_{t+1} from each loop's evidence accumulated in
+    #     the scan. Independent PRNG keys so tie-breaking in one loop
+    #     does not correlate with the other.
+    k_body, k_saccade = split_key(key, 2)
+    body_action_id = actor_select_action(
+        actor_body_state, params.actor_body, k_body,
+    )
+    saccade_action_id = actor_select_action(
+        actor_saccade_state, params.actor_saccade, k_saccade,
+    )
+    body_action_oh = (
+        jnp.arange(params.n_body_actions) == body_action_id
+    ).astype(DTYPE)
+    saccade_action_oh = (
+        jnp.arange(params.n_saccade_actions) == saccade_action_id
     ).astype(DTYPE)
 
     cerebellum_nuclei = cb_state.dn_rate
@@ -967,12 +1089,15 @@ def action_brain_step(
         oscillator=state.oscillator,
         neuromodulator=state.neuromodulator,
         critic=critic_state,
-        actor=actor_state,
+        actor_body=actor_body_state,
+        actor_saccade=actor_saccade_state,
         vta=vta_state,
         world_model=wm_out.state,
         delay_ct=state.delay_ct, delay_mossy=state.delay_mossy,
-        last_action=action_oh,
-        last_action_id=action_id,
+        last_body_action=body_action_oh,
+        last_body_action_id=body_action_id,
+        last_saccade_action=saccade_action_oh,
+        last_saccade_action_id=saccade_action_id,
         last_sensory=sensory.astype(DTYPE),
         last_rpe=rpe,
         last_total_reward=r_total,
@@ -980,7 +1105,8 @@ def action_brain_step(
 
     return ActionBrainOutput(
         state=new_state,
-        action=action_id,
+        body_action=body_action_id,
+        saccade_action=saccade_action_id,
         rpe=rpe,
         total_reward=r_total,
         curiosity=curiosity,

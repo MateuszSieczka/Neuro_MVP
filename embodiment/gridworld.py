@@ -107,9 +107,13 @@ class GridWorldBody(eqx.Module, BodyInterface):
         return new_body, sample
 
     def act(
-        self, key: PRNGKey, action: Array,
+        self,
+        key: PRNGKey,
+        body_action: Array,
+        saccade_action: Array,
     ) -> tuple["GridWorldBody", SensorySample]:
-        a = jnp.clip(jnp.asarray(action, jnp.int32), 0, 3)
+        del saccade_action   # plain GridWorld has no visual sensor
+        a = jnp.clip(jnp.asarray(body_action, jnp.int32), 0, 3)
         d = _DIRS[a]
         new_pos = jnp.clip(self.pos + d, 0, self.size - 1)
         on_goal = jnp.all(new_pos == self.goal)

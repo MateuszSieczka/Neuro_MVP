@@ -171,4 +171,5 @@ from .brain_graph import (
     ActionBrainParams, ActionBrainState, ActionBrainOutput,
     init_action_brain_params, init_action_brain_state,
     action_brain_step,
+    SACCADE_ACTION_DIM,
 )

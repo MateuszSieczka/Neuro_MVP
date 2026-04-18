@@ -62,11 +62,25 @@ class SensorySample(NamedTuple):
 
 
 class BodyInterface(ABC):
-    """ABC for any embodiment (bandit, gridworld, MuJoCo, Unity, ROS)."""
+    """ABC for any embodiment (bandit, gridworld, MuJoCo, Unity, ROS).
+
+    The brain emits **two** discrete motor commands on every decision
+    cycle, one per parallel cortico-BG-thalamo-cortical loop (Alexander,
+    DeLong & Strick 1986):
+
+      * ``body_action``    — skeletomotor command in ``[0, n_actions)``.
+      * ``saccade_action`` — oculomotor command in
+        ``[0, core.SACCADE_ACTION_DIM)``.
+
+    Every body must accept both; bodies with no visual sensor simply
+    ignore the saccade argument (bandit, plain gridworld). The
+    ``VisualGridBody`` and other visually-sensed bodies interpret the
+    saccade index as a relative shift of the retinal fixation point.
+    """
 
     #: Static — brain needs this to size the thalamic afferent channel.
     sensory_size: int
-    #: Static — number of discrete body actions. BG actor ``motor_dim``.
+    #: Static — number of discrete body actions. BG body-actor ``motor_dim``.
     n_actions: int
 
     @abstractmethod
@@ -79,16 +93,22 @@ class BodyInterface(ABC):
 
     @abstractmethod
     def act(
-        self, key: PRNGKey, action: Array,
+        self,
+        key: PRNGKey,
+        body_action: Array,
+        saccade_action: Array,
     ) -> tuple["BodyInterface", SensorySample]:
-        """Advance the world by one body step under ``action``.
+        """Advance the world by one decision cycle.
 
         Parameters
         ----------
         key:
             PRNG key for any stochastic world dynamics.
-        action:
+        body_action:
             Integer scalar in ``[0, n_actions)`` (``jnp.int32``).
+        saccade_action:
+            Integer scalar in ``[0, SACCADE_ACTION_DIM)``. Bodies
+            without a visual sensor should ignore this argument.
 
         Returns
         -------

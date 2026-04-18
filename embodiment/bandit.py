@@ -90,9 +90,13 @@ class GaussianBanditBody(eqx.Module, BodyInterface):
         return self, sample
 
     def act(
-        self, key: PRNGKey, action: Array,
+        self,
+        key: PRNGKey,
+        body_action: Array,
+        saccade_action: Array,
     ) -> tuple["GaussianBanditBody", SensorySample]:
-        a = jnp.asarray(action, jnp.int32)
+        del saccade_action   # bandits have no visual sensor
+        a = jnp.asarray(body_action, jnp.int32)
         mu = self.arm_means[a]
         noise = jax.random.normal(key, (), dtype=DTYPE) * self.noise_sigma
         r = mu + noise

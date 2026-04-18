@@ -78,6 +78,12 @@ class NeuromodulatorParams(eqx.Module):
     sero_reward_ec50: Array
     sero_reward_hill_n: Array
 
+    # Boredom drive (Yu & Dayan 2005 NE = unexpected uncertainty, here
+    # from the opposite side — world became *more* predictable than
+    # long-term average, hence orienting bonus).
+    pe_long_decay: Array
+    boredom_weight: Array
+
 
 def init_neuromodulator_params(
     ctx: BackendContext,
@@ -99,6 +105,8 @@ def init_neuromodulator_params(
     history_window_steps: float = 100.0,
     sero_reward_ec50: float = 0.4,
     sero_reward_hill_n: float = 1.0,
+    tau_pe_long: float = 10_000.0,
+    boredom_weight: float = 0.05,
     dtype=DTYPE,
 ) -> NeuromodulatorParams:
     """All τ in ms, converted via ``ctx.decay``. ``history_window_steps`` is
@@ -126,6 +134,8 @@ def init_neuromodulator_params(
         td_ema_decay=f(ema),
         sero_reward_ec50=f(sero_reward_ec50),
         sero_reward_hill_n=f(sero_reward_hill_n),
+        pe_long_decay=f(ctx.decay(tau_pe_long)),
+        boredom_weight=f(boredom_weight),
     )
 
 
@@ -142,6 +152,7 @@ class NeuromodulatorState(eqx.Module):
     error_ema: Array
     td_abs_ema: Array
     acc_pe_trace: Array
+    pe_long: Array             # slow-EMA PE (τ ≈ 10 s) — boredom baseline
 
 
 def init_neuromodulator_state(
@@ -159,6 +170,7 @@ def init_neuromodulator_state(
         error_ema=z,
         td_abs_ema=z,
         acc_pe_trace=z,
+        pe_long=z,
     )
 
 
@@ -210,14 +222,28 @@ def neuromodulator_step(
     dopamine = _ema(state.dopamine, rpe_signal, params.da_decay)
 
     # --- ACh (novelty) ------------------------------------------------
+    # Tonic (basal-forebrain) + phasic (novelty) — Sarter 2009.
     if novelty is None:
         nov_val = error_mag
     else:
         nov_val = jnp.clip(jnp.asarray(novelty, DTYPE), 0.0, 1.0)
-    ach = _ema(state.acetylcholine, nov_val, params.ach_decay)
+    ach_target = jnp.clip(params.baseline_ach + nov_val, 0.0, 1.0)
+    ach = _ema(state.acetylcholine, ach_target, params.ach_decay)
 
-    # --- NE (global surprise) ----------------------------------------
-    ne = _ema(state.noradrenaline, error_mag, params.ne_decay)
+    # --- NE (global surprise + boredom bonus) -----------------------
+    # Tonic (LC baseline) + phasic (surprise) — Aston-Jones & Cohen 2005.
+    # Additive boredom term: Yu & Dayan 2005 \u2014 NE ~ unexpected
+    # uncertainty.  When the world becomes *more* predictable than its
+    # long-term average (error_mag << pe_long), a ReLU(pe_long \u2212 pe_now)
+    # signal pushes NE upward, raising exploration gain.  Scaling
+    # `boredom_weight` (default 0.05) follows the plan.
+    pe_long = _ema(state.pe_long, error_mag, params.pe_long_decay)
+    boredom = jnp.clip(pe_long - error_mag, 0.0, 1.0)
+    ne_target = jnp.clip(
+        params.baseline_ne + error_mag + params.boredom_weight * boredom,
+        0.0, 1.0,
+    )
+    ne = _ema(state.noradrenaline, ne_target, params.ne_decay)
 
     # --- 5-HT (stability) --------------------------------------------
     error_ema = _ema(state.error_ema, error_mag, params.error_ema_decay)
@@ -258,6 +284,7 @@ def neuromodulator_step(
         error_ema=error_ema,
         td_abs_ema=td_abs_ema,
         acc_pe_trace=clamp(acc),
+        pe_long=pe_long,
     )
 
 

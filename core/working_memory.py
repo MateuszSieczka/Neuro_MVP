@@ -404,10 +404,26 @@ def wm_update_lateral(state: WMState, params: WMParams) -> WMState:
 
 
 def wm_reset_transient(state: WMState, params: WMParams) -> WMState:
-    """Clear dynamic state (V, traces, content); keep learned weights."""
+    """Clear dynamic state (V, traces, content); keep learned weights.
+
+    JIT-safe: builds NeuronStates from tracer-valued ``v_rest`` rather
+    than calling ``init_neuron_state`` (which casts to ``float``).
+    """
     n, n_in, n_gate = params.n, params.n_in, params.n_gate
     cp = params.content
     gp = params.gate
+
+    def _fresh(size, v_rest_arr):
+        zeros = jnp.zeros(size, DTYPE)
+        return NeuronState(
+            v=jnp.full(size, v_rest_arr, dtype=DTYPE),
+            w_adapt=zeros,
+            refrac=jnp.zeros(size, dtype=jnp.int32),
+            x_pre=zeros,
+            x_post=zeros,
+            spikes=zeros,
+        )
+
     return eqx.tree_at(
         lambda s: (
             s.content, s.gate, s.gate_rate, s.gate_signal,
@@ -415,8 +431,8 @@ def wm_reset_transient(state: WMState, params: WMParams) -> WMState:
         ),
         state,
         (
-            init_neuron_state(n, v_rest=float(cp.v_rest)),
-            init_neuron_state(n_gate, v_rest=float(gp.v_thresh - 2.0)),
+            _fresh(n, cp.v_rest),
+            _fresh(n_gate, gp.v_thresh - jnp.asarray(2.0, DTYPE)),
             jnp.zeros(n_gate, DTYPE),
             jnp.asarray(0.0, DTYPE),
             jnp.zeros((n_in, n), DTYPE),

@@ -1,739 +1,508 @@
-# Plan: SNN Brain for Embodied AGI
+# Plan: Phase 0 (resurrection + closure) → 5 → 6 → 7 → 8 → 9
 
 ## TL;DR
 
-Transform the current RL-centric SNN (Neuro_MVP_6) into a scalable, biologically-grounded artificial brain for embodied AGI. Migrate from NumPy to JAX for GPU+JIT (1M+ neurons). Replace the flat agent architecture with a hierarchical brain composed of differentiated regions (cortex, thalamus, BG, hippocampus, cerebellum). Add sensory pipelines (vision, auditory, touch), motor systems (movement + speech via phonemes), and cross-modal concept binding. Every component justified by papers — zero magic values, zero ML hacks.
+Audyt codebase'u (kwiecień 2026) pokazał, że za czystym frontem JAX/Equinox kryje się **głęboki dług integracyjny**: pięć w pełni zaimplementowanych modułów (`working_memory`, `attention`, `episodic_memory`, `sequence_memory`, `replay_buffer`) jest niewywoływanych poza testami; astrocyta nie jest podpinana do neuronów; oscillator emituje fazy których nikt nie konsumuje; receptor pharmacology działa tylko w BG; free-energy VFE/EFE jest exportowane ale nigdy nie liczone; cała hierarchia ventralna (V2/V4) i auditory (A1) istnieje wyłącznie w testach. Phase 3 nie ma żadnego testu funkcjonalnego.
+
+Ten plan rezygnuje z dodawania nowych dużych modułów dopóki istniejące nie są zintegrowane. **Phase 0** wskrzesza orphans i domyka Phase 3+4 (z testami). Każda dalsza faza dodaje **jedną** nową zdolność kognitywną zbudowaną na zintegrowanych już komponentach. Wszystko biofizyczne (AdEx, STDP, conductance-based); zero ML-owych skrótów (no backprop, no softmax policy, no learned RNN).
+
+Cel końcowy: embodied agent w MuJoCo MJX który (a) widzi i słyszy ze scale-invariant retiną/cochleą, (b) pamięta epizody i konsoliduje je we śnie, (c) tworzy multimodalne koncepty w ATL/konwergencji, (d) gaworzy → uczy się słów → mówi w odpowiedzi → wewnętrznie przemyśla, (e) planuje przez active inference (EFE), (f) utrzymuje cele w PFC.
+
+Każda faza ma trzy progi wejścia do następnej: zielone testy unit, zielone testy funkcjonalne, dwa diagnostyki biofizyczne (firing rates + neuromod balance).
 
 ---
 
-## PHASE 0: CLEANUP & FOUNDATION
+## Phase 0 — Resurrection + closure of Phase 3/4
 
-### 0.1 Remove dead code
+### Cel
 
-- `core/pyramidal_neuron.py` — **DELETE entirely**. PyramidalLayer is never instantiated. Useful BAC-firing logic (Larkum 1999, Payeur 2021) will be re-integrated into the unified cortical neuron in Phase 1.
-- `core/columnar.py` — **DELETE entirely**. Never activated (state_size < 16 for all tasks). Replace with `core/cortex.py` in Phase 2.
-- `core/predictive_coding.py` — **DELETE**. Merge the Rao & Ballard relaxation loop into `core/error_neuron.py` (which is the superior implementation — dual-population, conductance-based, used by WorldModel).
-- `core/competitive_layer.py` — **DELETE as standalone file**. Merge k-WTA inhibition into `core/cortex.py` (cortical column builder).
-- Dead code within files:
-  - `neuron.py`: Remove `_mem_decay`/`_mem_gain` (lines 194-195 — set but never read in forward()), `LIFLayer = AdExLayer` alias (line 507)
-  - `config.py`: Remove `i_thresh` field (wrong formula, never used), `SynapseType` enum (never imported), fix `mg_concentration` bug (hardcoded in `nmda_mg_block()` instead of using field)
-  - `synapse.py`: Remove unused `NeuronConfig` import
-  - `simulation_context.py`: Remove unused `lru_cache` import
-  - `basal_ganglia.py`: Remove `_STDP_LTD_LTP_RATIO` (declared, never used), `_msn_decay()` function (never called), `_t_since_pre/post` timing arrays (updated but never queried), `_homeo_counter` (incremented, never read)
-  - `working_memory.py`: Remove `prediction_error` placeholder (initialized to ones, never updated)
-  - `replay_buffer.py`: Remove `Experience.curiosity` (stored, never read), fix double-copy in `store()` (replace + **post_init** both copy)
-  - `sequence_memory.py`: Remove `_step_count` (incremented, never read)
-  - `network.py`: Fix `_concat_offsets` key direction bug (source,target vs target,source inconsistency)
-  - `world_model.py`: Cap `error_history` to ring buffer (memory leak), remove `set_ne_level()` no-op
-  - `astrocyte.py config`: Remove `atp_seizure_hill_n` and `atp_seizure_duration` (placeholders, never implemented)
+Doprowadzić `ActionBrain` do stanu w którym **każdy** moduł `core/` jest albo wywoływany w produkcyjnej pętli, albo świadomie usunięty. Domknąć Phase 3 testowo. Zintegrować wizję end-to-end. Zwolnić "orphaned" warstwy bez wprowadzania nowej funkcjonalności. To jest faza długu technicznego przed dalszą rozbudową.
 
-### 0.2 Fix known bugs
+### Dlaczego najpierw
 
-- **`a_plus` double application** in `neuron.py`: Applied both in eligibility trace (L353/L360) AND in `update_weights()` (L475). Fix: remove from `update_weights()`, keep only in eligibility computation.
-- **Jacobian missing ∂I_syn/∂V** in `neuron.py` L313-318: For conductance-based synapses, J(V) should include `-g_exc/C_m`. Fix: pass `g_exc_total` from `SynapticChannels.compute_current()` and add to Jacobian.
-- **`mg_concentration` field ignored**: `SynapseConfig.nmda_mg_block()` hardcodes `1.0/3.57` instead of `self.mg_concentration/3.57`. Fix: use the config field.
-- **World model τ_Ca inconsistency**: `world_model.py` L95 overrides `tau_ca=500` (10× faster than biological default 5000). Either justify or use default.
+Każda kolejna faza będzie referowała moduły, które dziś są martwe. Phase 5 zakłada `episodic_memory` i `replay_buffer` (oba orphaned). Phase 6 zakłada cross-modal attention (orphaned). Phase 7 zakłada inner-speech jako PFC `sequence_memory` replay (oba orphaned). Bez Phase 0 każda następna faza buduje na uniwersum z dziurami.
 
-### 0.3 Resolve unit inconsistencies
+### Zakres
 
-- **Curiosity signal** in `world_model.py`: Mixes decoder_error (state units), encoder_error (spikes²/step), precision (dimensionless). Fix: normalize each component to [0,1] before combining. Reference: Barto et al. (2013) "Intrinsic motivation and reinforcement learning" — curiosity should be dimensionless information gain.
-- **Mental rehearsal epistemic**: Same mix of spikes + variance + precision. Fix: express all components as information-theoretic quantities (nats or bits). PE → KL divergence, ambiguity → conditional entropy, precision → inverse Fisher information.
-- **Attention gains**: Applied multiplicatively to currents without explicit units. Fix: make gains dimensionless [0.1, 2.0] and document clearly.
+#### 0.1 Diagnostyka kortykalna (gate fazy)
+
+- Test `test_phase0_cortex_alive.py`: `MinimalBrain` na `uniform_dense(0.3)` przez 200 dt → wymagamy `cortex.l5_rate.mean()` ∈ [1, 10] Hz, `l23_state` mean ∈ [2, 12] Hz (Barth & Poulet 2012). Jeśli fail → rekalibracja `psp_target` w `cortex.init_cortical_area_params` przez podniesienie `g_syn_unitary` z 0.43 nS do wartości w której L4 osiąga rheobase przy oczekiwanym afferencie. Kalibracja jest biofizyczna (Feldmeyer 2002 dopuszcza 0.4-1.0 nS), nie taskowa.
+- Identyczny test dla `ActionBrain` na `GaussianBanditBody` po 200 cykli decyzyjnych.
+
+#### 0.2 Receptor pharmacology w cortex/thalamus/WM
+
+- Obecnie `CorticalInputs.receptor_gain` defaultuje do 1.0; cortex ignoruje DA/ACh/NE poza efektem przez neuromodulator bus. Naprawa: w `cortex.cortical_area_step` policzyć `LayerModulation = compute_layer_modulation(receptor_params, da, ach, ne, ht)` — funkcja istnieje w `core/receptor.py`. Multiplikatywnie modulować `excitability` L4/L2-3, gain L5 (per `LayerModulation` fields).
+- Ten sam pattern dla `thalamus_step` (ACh-gated burst, McCormick 1992 — istnieje pole, nie używane w pełni) i `wm_step` (DA·ACh gating gate już jest, ale brak per-receptor Hill).
+- Dodać jeden zestaw `ReceptorParams` per region do `MinimalBrainParams`/`ActionBrainParams`.
+
+#### 0.3 Astrocyte → neurony (active path)
+
+- `core/neuron.py` ma `set_astrocyte()`/`_astrocyte` ale w wersji JAX to martwe pole. Refactor: dodać `astrocyte_state: AstrocyteState | None` do `CorticalAreaParams` (static-shaped bool flag), w `cortex_step` wywołać `astrocyte_step` z `aggregate_to_zones(spike_rates)` i propagować `threshold_shift`/`leak_gain`/`metabolic_lr` do AdEx step (już są policzone w `astrocyte.py`, tylko nie wpinane).
+- Wymóg: cortex dostaje JEDNO pole astrocyty (16 zon), shared między L4/L23/L5. WM dostaje swoje. BG swoje. To zmiana Params shape — nie jest to refactor jednego modułu, lecz cross-cutting wiring.
+- Po podpięciu: ATP będzie się wyczerpywać przy long sustained activity (zalewy). Gate snu w Phase 5 zacznie być sterowalny.
+
+#### 0.4 Oscillator phase gating
+
+- Faza theta jest emitowana ale nikt jej nie czyta. Wpiąć w cortex_step jako modulator excitability: `cortex_excitability_phase = 1 + 0.1·cos(theta_phase + phase_offset)` (Lakatos et al. 2008 — neuronal oscillations modulate excitability ~10-15%). Niewielki współczynnik, biologicznie udokumentowany.
+- W BG dodatkowo: gamma amplitude → striatal MSN burst gating (Berke 2009, ~30 Hz w aktywnym stanie).
+- W WM: theta-gamma coupling już zakładany w plan_finished — uczynić explicit przez `wm_step(theta_phase, gamma_amp)`.
+- To NIE jest dodawanie funkcjonalności, to konsumpcja sygnału który już istnieje. Brak tego dziś jest bug-like.
+
+#### 0.5 Working memory w ActionBrain (PFC slot)
+
+- WM jest fully tested ale orphaned. Wpięcie: nowy moduł `core/pfc.py` jako thin wrapper łączący jeden `WMState` (32-64 content neurons) z cortexem L2/3 jako goal slot.
+- Wiring: `pfc_step` dostaje cortex L2/3 belief jako ff_input + DA + ACh; output `wm_content_rate` projektowany do BG actor jako dodatkowy striatal_drive (Frank & Badre 2012 hierarchical RL — PFC bias na BG).
+- Brak goal-encoding logiki; PFC po prostu utrzymuje attractor. Goal-setting (zmiana attractora przez sygnał kontekstowy) wchodzi w Phase 9.
+- Reset PFC tylko na `done=True`. Persystencja przez wiele cykli decyzyjnych jest istotą WM.
+
+#### 0.6 Attention module integration
+
+- `attention.py` (Reynolds & Heeger divisive norm + IOR) jest gotowe. Wpiąć jako modulator wejściowych afferentów thalamicznych: `relay.afferent` mnożone przez `attention_output.gain` przed `thalamic_step`.
+- Top-down: `attention_step` dostaje `cortex_l5` jako saliency input (cortex steruje na co thalamus puszcza dalej — corticothalamic feedback, Sherman & Guillery 2002).
+- IOR uczy się on-line: po fixacji rejonu ACh trace → zmniejszony top-down gain przez `attention_learn`.
+- Ten moduł będzie później głównym substratem Phase 7.6 (auditory attention window).
+
+#### 0.7 Sensory stack w ActionBrain (vision end-to-end)
+
+- Nowy moduł `sensory/sensory_stack.py`: pure-functional `SensoryStackParams` = (RetinaConfig, V1Params, V2Params, V4Params, attention_params), `sensory_stack_state`, `sensory_stack_step(state, params, ctx, image, fixation_xy)` → `(new_state, afferent_to_thalamus, v1_pe, v4_belief)`.
+- Wewnątrz: retina → lgn_normalize → V1 cortex_step (z Gabor init) → V2 cortex_step → V4 cortex_step. Zwraca `v4_belief` jako "wektor sensoryczny do thalamus_relay" (znacznie krótszy niż surowy LGN ~960 → ~96; biologicznie odpowiada że LGN nie projektuje do całego cortex tylko do V1, V1 do V2 itd.).
+- `VisualGridBody._observe` zwraca `image` + `fixation_xy`; `ActionBrain` instancjonuje `SensoryStackState` i wywołuje `sensory_stack_step` przed thalamus_relay.
+- Backward-compat flag: `bypass_sensory_stack: bool` static; gdy True ActionBrain bierze `sensory` jak dotąd. Zachowane dla bandit/gridworld testów.
+
+#### 0.8 Saccade info-gain + per-loop credit
+
+- Trzymać `prev_v1_pe` w `ActionBrainState` (skalar = mean V1 L2/3 error).
+- Po `sensory_stack_step` policzyć `info_gain = relu(prev_v1_pe - current_v1_pe)` i dodać do `r_total` z `β_saccade = 0.05` (Itti & Baldi 2009 Bayesian surprise).
+- Per-loop credit przez **eligibility mask** (nie osobny RPE). Każdy `actor_update` dostaje `eligibility_mask: Array (motor_dim,)` = one-hot ostatniej akcji × `signed_credit_for_this_loop`. Body actor: extrinsic + curiosity + homeostasis. Saccade actor: extrinsic + saccade info-gain. Curiosity i homeostasis mogą iść do obu.
+- Decyzja: maska, nie osobny RPE — prostsze, mniej nowego state, biologicznie OK (odpowiada lokalnej D1/D2 plastyczności w specific striatal territory).
+
+#### 0.9 Boredom (PE drift) drive
+
+- W neuromodulator dodać EMA: `pe_long = 0.99·pe_long + 0.01·curiosity`. Sygnał `boredom = relu(pe_long - curiosity)` (PE spadło poniżej długoterminowego średniego → środowisko zbyt przewidywalne).
+- `boredom` mapuje na **NE bonus** (lokalnie podnosi LR i temperaturę eksploracji actor-critic — Yu & Dayan 2005). Nie podnosi extrinsic reward.
+- Mały drive (waga 0.05). Reference-paper, nie tuned.
+
+#### 0.10 Cerebellum efference copy
+
+- Dziś `cerebellum.mossy` dostaje tylko cortex L5 przez `w_l5_mossy`. Plan_finished wymagał efference. Naprawa: w `_perceive_substep` konkatenować `state.last_body_action` + `state.last_saccade_action` (one-hot) jako dodatkowe mossy afferenty (osobna macierz `w_efference_mossy`).
+- Cerebellum będzie się uczyć "gdy ja kazałem akcję A i fovea X, sensory zmieni się tak" — czyli forward model z efference copy (Wolpert 1998), nie tylko z cortex L5.
+
+#### 0.11 Brakujące testy Phase 3+4
+
+- `test_phase3_bandit.py` — 3-armed Gaussian, 800 cykli, p(best) ≥ 0.55. Conservative bo BG dwustopniowy actor jest młody.
+- `test_phase3_gridworld.py` — 5×5, 3000 cykli, mean episode length ≥ 20% poniżej random baseline (seed average n=5).
+- `test_phase3_curiosity.py` — GridWorld z `goal_reward=0`, 2000 cykli, `curiosity.mean()>0`, body actor entropia akcji > 0.5·log(n_actions).
+- `test_phase3_olive_proxy.py` — world_model PE (mean L2 norm) spada ≥30% w 1500 cykli na GridWorld. Test = cerebellum dostaje sensowny sygnał uczenia.
+- `test_phase4_v1_emergence_full.py` — 10k kroków VisualGridBody na losowych teksturach, mierzymy orientation-tuning index (Ringach 2002) na L2/3 V1 ≥ 0.3 dla ≥40% neuronów. To jest **długi** test, ale konieczny by uznać V1 STDP za działające.
+- `test_phase4_saccade_selection.py` — VisualGridBody 5×5, po 3000 cykli histogram fixation correlates z mapą V1 PE (Spearman ρ > 0.2).
+- `test_phase4_end_to_end.py` — VisualGridBody 3×3 + SensoryStack + ActionBrain 2000 cykli, success rate ≥ 0.4 (≥3× random).
+- `test_phase0_pfc_persistence.py` — WM utrzymuje attractor po usunięciu drive ≥ 200 dt (memory span > working window).
+- `test_phase0_attention_ior.py` — attention_step + attention_learn → po fixacji rejonu jego gain spada o ≥30% (IOR działa).
+- `test_phase0_astrocyte_atp.py` — sustained 50 Hz spiking layer → ATP spada do <0.3 atp_max po 5000 dt; threshold_shift > 2 mV.
+
+### Co NIE wchodzi
+
+- MuJoCo, M1 ciągłe, hippocampus refactor, ATL, sleep cycles, language. Wszystkie te są w późniejszych fazach.
+- Strukturalna plastyczność (jest w `sparse.py` ale nieużywana — odkładamy do Phase 9+).
+- Free energy VFE/EFE callsites (Phase 9 active inference).
+
+### Krytyczne pliki
+
+- `core/cortex.py` — wpiąć `compute_layer_modulation` (+ `astrocyte_step` jeśli `astrocyte_params is not None`), wpiąć `theta_phase` modulację excitability.
+- `core/thalamus.py` — wpiąć ACh receptor gain (już jest częściowo, dokończyć).
+- `core/working_memory.py` — wpiąć theta-gamma argumenty do `wm_step`.
+- `core/pfc.py` — **NOWY** — thin wrapper WM jako goal slot.
+- `core/attention.py` — bez zmian; wpinane od strony brain_graph.
+- `core/brain_graph.py` — `ActionBrainParams/State` rozszerzone o: `pfc`, `attention`, `astrocyte_cortex`, `astrocyte_wm`, `sensory_stack`, `prev_v1_pe`, `pe_long`, `w_efference_mossy`. `_perceive_substep` rozbudowany o sensory_stack + attention + pfc. `action_brain_step` rozbudowany o saccade info-gain + boredom + per-loop eligibility mask.
+- `core/basal_ganglia.actor_update` — przyjmować `eligibility_mask` jako mnożnik credit per-action.
+- `sensory/sensory_stack.py` — **NOWY** — pure-functional retina→V1→V2→V4 stack.
+- `embodiment/visual_grid.py` — `_observe` zwraca `(image, fixation_xy)` zamiast surowego afferentu (gdy `bypass_sensory_stack=False`).
+- `tests/test_phase0_*.py` (3), `tests/test_phase3_*.py` (4), `tests/test_phase4_*.py` (3 nowe).
+
+### Decyzje (Phase 0)
+
+1. **Astrocyta podpięta przez Params, nie przez `set_astrocyte`** — JAX wymaga statycznego pytree. Mutacyjne `set_astrocyte` jest nie-JAX-owe i było zostawione martwe; refactor przez Params jest jedyną poprawną drogą.
+2. **PFC jako thin wrapper, nie jako pełna `CorticalArea`** — pełny PFC z 3 warstwami i error neurons jest za duży. Jeden WM slot to prawdziwie minimalny PFC. Cele i hierarchia (Phase 9) dodadzą warstwy.
+3. **Eligibility mask, nie per-loop RPE** — rozwiązanie z maską jest prostsze, mniej nowego state, biologicznie OK (lokalna plastyczność striatal territory).
+4. **Sensory stack zwraca V4 belief, nie konkat[V4, raw LGN]** — biologicznie thalamus dostaje feedback z cortex hierarchii (pulvinar), nie z LGN bezpośrednio. Symbol "raw LGN do brain" już jest niefizjologiczny. Konkat byłby ML-skrótem.
+5. **Boredom sterowany NE (gain), nie reward** — Yu & Dayan 2005: NE = unexpected uncertainty. Boredom to zaskoczenie spadkiem PE (środowisko za nudne), a NE moduluje LR/exploration.
+6. **Receptor multiplikatywnie** — Silver 2010, MOD-1 z `neuro_mvp6_fixes.md`. Dodatywne łamałoby niezależność G-białkowych kaskad.
+
+### Weryfikacja Phase 0
+
+1. Wszystkie 4 istniejące testy Phase 4 zielone.
+2. Wszystkie nowe testy zielone (3 phase0, 4 phase3, 3 phase4).
+3. Diagnostyka biofizyczna (`test_phase0_cortex_alive.py` extension): cortex 1-12 Hz, thalamus 5-15 Hz, BG MSN 1-5 Hz, VTA 3-8 Hz, WM content 5-30 Hz w persistent state.
+4. Dopamine bus: phasic spike przy unexpected reward ≥3× tonic (Schultz 1997).
+5. ATP balance: pod normalnym taskiem (GridWorld 1000 cycles) ATP nie spada poniżej 0.5; pod sustained drive (`uniform_dense(0.8)`) spada do 0.2-0.3 (przygotowuje gate snu w Phase 5).
+6. Manual: `MinimalBrain` JIT-uje się i robi 5000 dt < 10s wall-time po warmup.
 
 ---
 
-## PHASE 1: JAX MIGRATION & CORE ENGINE
+## Phase 5 — Hippocampal episodic loop + sleep consolidation
 
-### 1.1 JAX backend layer
+### Cel
 
-Create `core/backend.py`:
+Dodać **pamięć epizodyczną w pętli** (zapis on-line + recall on-line) i **konsolidację offline** (sen). Nic więcej. M1 ciągłe i MuJoCo trafiają do Phase 6 — łączenie ich z hippocampusem łamałoby zasadę "jedna nowa zdolność per faza".
 
-- Abstract array operations behind thin wrapper
-- `import jax.numpy as jnp` as primary, `numpy` as fallback
-- Use `equinox` library for class-based JAX modules (jit-compatible)
-- All neuron/synapse state becomes a JAX Pytree
-- Forward pass: pure function `new_state, spikes = step(state, input, params)` — jit-compilable
-- Use `jax.lax.scan` for temporal simulation (auto-unroll substeps)
-- Use `jax.vmap` for batch processing across independent brain regions
+### Dlaczego teraz
 
-### 1.2 Sparse connectivity engine
+Phase 0 dał Working Memory (krótkie horyzonty) i astrocytę z ATP (substrat snu). Episodic memory uzupełnia hierarchię pamięci o długie horyzonty zdarzeń. Bez tego concept emergence w Phase 7 nie miałaby na czym budować (koncepty = stabilne attraktory powtarzane w replay nocnym).
 
-Create `core/sparse.py`:
+### Zakres
 
-- **CSR sparse matrix** representation for synaptic weights (via `jax.experimental.sparse`)
-- Connection probability masks: `p_connect(distance) = p_local × exp(-d²/2σ²)` (Hellwig 2000 — distance-dependent cortical connectivity)
-- Block-sparse for local connectivity within cortical columns
-- Random long-range sparse connections (Markov et al. 2014 — cortical interarea connectivity)
-- Sparse matmul: `I_syn = sparse_w @ pre_spikes` — O(nnz) instead of O(N²)
-- **Structural plasticity**: Functions for synaptogenesis (add connections where correlated activity has no synapse) and pruning (remove synapses below weight threshold). Reference: Butz & van Ooyen (2013) "A simple rule for dendritic spine and axonal bouton formation"
-- Target: ~5-15% connectivity density (Braitenberg & Schüz 1998 — cortical statistics)
+#### 5.1 Hippocampus jako region
 
-### 1.3 Unified neuron model
+- Nowy moduł `core/hippocampus.py` łączący istniejące `episodic_memory` (DG/CA3 słowniki) + `sequence_memory` (CA3 transition learning) w jeden `HippocampusParams/State`.
+- `hippocampus_step(state, params, ctx, ec_in, theta_phase, ne_level)` → `(new_state, ca1_recall, novelty)`.
+  - DG sparse coding (już mamy w `episodic_memory.dg_encode`).
+  - CA3 pattern completion z sekwencji (rozszerzyć `sequence_memory.seqmem_step` o auto-associative recall — istnieje `predicted_next`, dorobić `pattern_complete_from_partial`).
+  - CA1 mismatch: porównanie CA3 recall z aktualnym EC input → mismatch signal do PFC (nowość, Lisman 1999).
+- Theta phase gating: encoding na ascending theta (Hasselmo 2002), recall na descending. Implementacja: `encoding_gate = sigmoid(cos(theta_phase) + 0.5)`, `recall_gate = 1 - encoding_gate`.
 
-Refactor `core/neuron.py` to support two modes in a single jit-compiled function:
+#### 5.2 EC (entorhinal cortex) jako mikro-most
 
-**Mode A — LIF+SFA** (default, 90% of neurons):
+- HC nie pobiera danych z dowolnego cortex bezpośrednio. Standard: cortex (V4/IT, A1, S1, M1) → EC → HC. Nowa cienka `EntorhinalParams` (jedna `CorticalArea`-lite): konkat głównych cortex outputów → projekcja → DG.
+- W Phase 5 sensory ogranicza się do `v4_belief + sensory_raw + last_motor`. Place cells/grid cells (Moser 2008) — odkładamy do Phase 6 razem z MuJoCo (place cells potrzebują ciągłej topologii ruchu).
+
+#### 5.3 Wpięcie HC w ActionBrain
+
+- W `_perceive_substep`: po sensory_stack obliczyć `ec_in`, wywołać `hippocampus_step`. CA1 recall projektowany do PFC (jako dodatkowy ff input do WM); novelty mismatch do `neuromodulator.acetylcholine` (ACh wzrasta przy nowości — Hasselmo 2006, McGaughy 2008).
+- Storage w CA3: jeśli `novelty > episodic.ne_threshold` zapisz parę `(ec_in, last_motor_joint)` przez `try_store`. To jest gate na NE (już w `episodic_memory`).
+
+#### 5.4 Replay buffer orchestration
+
+- Plan dotychczasowy zostawił `replay_buffer.py` z komentarzem "orchestration is brain-graph layer's job". Dodać `core/sleep.py` z `sws_replay_step` i `rem_replay_step` używającymi istniejącego `replay_buffer.replay_sample`.
+- SWS: reverse replay (chronologically backward). Każdy sampled `Experience` → critic_update + actor_update z czasem skompresowanym (n_substeps=5 zamiast 20). Konsoliduje procedural credit (Wilson & McNaughton 1994).
+- REM: forward replay z augmentacją przez world_model rollouts. World model generuje N alternatywnych następników z noise; sequence_memory uczy się tych "snów" (Diekelmann & Born 2010).
+- ACh tonic: niskie podczas SWS (umożliwia replay), wysokie podczas REM (Hasselmo 2006). Dodać `sleep_phase ∈ {WAKE, SWS, REM}` do `NeuromodulatorState` jako enum.
+
+#### 5.5 Sleep gate przez astrocytę i oscillator
+
+- Astrocyte ATP < `atp_sleep_threshold = 0.3` → switch oscillator do `slow_wave_mode` (1 Hz, już istnieje w `oscillator.py` jako `sws` flag) → uruchomienie `sws_replay_step` w pętli `brain_graph` poza standardowym `action_brain_step`.
+- Brak twardego `done`-triggera. Sen jest endogeniczny i autoregulowany (Achermann & Borbély 2003 process S+C).
+- Wyjście ze snu: ATP > 0.8 → switch do WAKE. Mała histereza by uniknąć szybkich oscylacji.
+- API: `brain_graph.sleep_cycle(state, params, key, n_swr=200, n_rem=100)` → wywoływane przez run_loop kiedy `state.neuromod.sleep_phase != WAKE`.
+
+#### 5.6 Testy Phase 5
+
+- `test_phase5_dg_separation.py` — dwa podobne stany (cosine 0.9) → dwie różne sparse keys (cosine ≤0.3). Pattern separation działa.
+- `test_phase5_ca3_completion.py` — CA3 zaprezentowane z 50% klucza → recall ≥70% sim z pełnym wzorcem.
+- `test_phase5_ca1_novelty.py` — sekwencja A,B,C wyuczona; podanie A,X (X≠B) → ACh wzrost ≥2× baseline.
+- `test_phase5_sws_consolidation.py` — train na bandyce 200 epizodów + 5 SWS cycles → policy regret na trzymanym test-secie ≤80% baseline (sen pomógł).
+- `test_phase5_rem_planning.py` — train world_model na N stanach + REM rollouts → MSE na trzymanych unseen stanach ≤80% bez REM.
+- `test_phase5_atp_sleep_gate.py` — sustained activity → ATP ↓ → automatyczne wejście w SWS → ATP regenerates → wyjście do WAKE.
+- `test_phase5_theta_phase_encoding.py` — sekwencja inputów na różnych fazach theta → DG zapisuje tylko te na encoding phase.
+
+### Co NIE wchodzi (Phase 5)
+
+- M1 ciągłe, MuJoCo, place/grid cells, ATL, mowa.
+
+### Decyzje (Phase 5)
+
+1. **HC = cienki kompozyt istniejących modułów** — `episodic_memory` i `sequence_memory` są dobrze przetestowane; nie chcemy ich przepisywać. Hippocampus to fasada.
+2. **Sen endogeniczny przez ATP** — nie scheduled. To jest jedna z głównych biofizycznych decyzji projektowych z plan_finished. Wreszcie egzekwowalna po Phase 0.3.
+3. **EC jako thin wrapper, nie 6-warstwowy cortex** — analogicznie do PFC. Funkcjonalnie potrzebujemy tylko zbiegu modalności do DG.
+4. **Brak dreaming z modulacją afektywną** — Phase 7+ (afekt-tagged koncepty są dopiero w Phase 7).
+
+### Weryfikacja Phase 5
+
+1. 7 nowych testów zielone.
+2. Phase 0 wszystkie testy nadal zielone (regresja).
+3. Diagnostyka: w epizodzie nowej sceny CA1 mismatch >0.2 w pierwszych 5 cyklach, spada poniżej 0.05 po 50.
+4. Sleep cycle redukuje skumulowane PE world_model o ≥20% (consolidation).
+
+---
+
+## Phase 6 — Continuous body, M1, MuJoCo
+
+### Cel
+
+Wyjść z dyskretnego GridWorlda do **ciągłego ciała w fizyce**. M1 generuje ciągły torque/velocity command z dyskretnej preparatory activity z BG. Cerebellum dostaje proprioception jako mossy + efference jako climbing. Place cells emergują z ruchu w przestrzeni.
+
+### Dlaczego teraz
+
+Phase 5 dał konsolidację, więc continuous learning na długich trajektoriach (reaching, locomotion) ma gdzie się utrwalać. Phase 7 (multimodal concept emergence) potrzebuje motor jako trzeciego modalu (nie da się "chwycić" konceptu kuli bez motorycznego skojarzenia).
+
+### Zakres
+
+#### 6.1 M1 jako CorticalArea + continuous head
+
+- Nowy `core/m1.py`. M1 = `CorticalArea` (cortex.py) z dodatkowym `motor_readout: Array (n_l5, motor_dim)` mapującym L5 firing rate na continuous joint command.
+- BG body actor → M1 preparatory L4 input (jako `td_prediction` w `CorticalInputs`). M1 wykonuje "policy distillation": dyskretna akcja → ciągła trajektoria torque (Wolpert 2001 forward model + inverse).
+- `m1_step` zwraca `joint_command: Array (motor_dim,)` jako średnią ważoną L5 firing × motor_readout.
+- Uczenie: STDP cortex + Hebbian na motor_readout modulowany RPE z VTA (procedural learning, Doya 2000).
+
+#### 6.2 MuJoCo MJX body
+
+- `embodiment/mjx_arm_body.py`: 7-DOF reacher z `mujoco-mjx` (pure JAX, JIT-able). Sensory: proprioception (joint angles + velocities, 14 dim) + opcjonalnie wizja przez camera RGB → SensoryStack.
+- 4 actions BG body actor mapują na "ruch wybranej grupy mięśni" (skrótowo: shoulder_x, shoulder_y, elbow, wrist), M1 ciągle interpoluje.
+- Reward extrinsic = -dist(end_effector, target).
+
+#### 6.3 Cerebellum continuous efference
+
+- Phase 0.10 dał efference one-hot do mossy. Tu: pełen `joint_command` (continuous) + proprioception → cerebellum_step. Climbing fiber = `joint_command_actual - joint_command_predicted` (Wolpert 1998 predictor).
+- Forward model cerebellum uczy się przewidywać proprioception_t+1 z (proprio_t, joint_command_t).
+
+#### 6.4 Place cells / grid cells
+
+- W EC (Phase 5.2) dodać podpopulację `n_grid_cells = 64` z fixed 2D Gaussian RFs na pozycji ciała w (x,y) (Hafting 2005 z stałymi odstępami sieci heksagonalnej). Hippocampus DG dostaje ich aktywność jako dodatkowy ec_in.
+- Pozycja ciała = body kinematics z MuJoCo (czysta funkcja stanu fizyki, nie uczona).
+- Place cells emergują w CA3 jako kombinacje grid cells × kontekst sensoryczny — przez normalne CA3 learning, nie hardcoded.
+
+#### 6.5 Testy Phase 6
+
+- `test_phase6_mjx_jit.py` — MJX body + ActionBrain + sensory_stack JIT-uje się i robi 1000 cykli < 30s.
+- `test_phase6_reach_learning.py` — 7-DOF reach do statycznego targetu, success rate ≥0.5 po 20k cycles, baseline random ≤0.05.
+- `test_phase6_m1_smoothness.py` — M1 generuje smooth torques: jerk metric (3rd derivative L2 norm) < 5× human-typical (Flash & Hogan 1985 minimum-jerk).
+- `test_phase6_cerebellum_forward.py` — predicted proprioception MSE spada ≥40% po 5k cycles na reaching.
+- `test_phase6_grid_to_place.py` — agent porusza się losowo w gridzie 5×5, po 10k cycles ≥30% CA3 neuronów ma place-field selectivity (firing > 3× baseline tylko w jednej komórce).
+
+### Co NIE wchodzi (Phase 6)
+
+- ATL, multimodal concepts, mowa, gaworzenie. Cała Phase 7.
+- Lokomocja (chodzenie) — wymaga modulacji rdzeniowej (CPG) — Phase 9+.
+- Manipulacja narzędzi — Phase 9+.
+
+### Decyzje (Phase 6)
+
+1. **MJX, nie PyBullet/Unity** — pure JAX, JIT-uje się z resztą brainem. Plan_finished błędnie sugerował MuJoCo "klasyczny" — MJX jest jego JAX-port, designed właśnie do tego.
+2. **M1 z preparatory + continuous head** — Churchland 2012 preparatory subspace. BG nie jest direct motor; M1 jest tłumaczem.
+3. **Place cells emergują, grid cells fixed** — grid cells są bardziej "wbudowane" anatomicznie (path integration, Burak & Fiete 2009); place cells są zdecydowanie uczone.
+
+### Weryfikacja Phase 6
+
+1. 5 nowych testów zielone.
+2. Phase 0/5 testy zielone (regresja).
+3. Diagnostyka: M1 firing rate 5-30 Hz w aktywnym ruchu (Georgopoulos 1986); cerebellum Purkinje 30-100 Hz (Häusser & Clark 1997).
+4. End-to-end: ATP cycles (ATP ↓ podczas reaching → sen → ATP ↑) muszą być wykrywalne na 10k+ cycles.
+
+---
+
+## Phase 7 — Multimodal convergence & concept emergence
+
+### Cel
+
+Powiązać modalności (wizja V4 + audio A1 + motor M1 + episodic CA1 + value VTA) w **jednej regionie konwergencji** (ATL/AG hub). Dla embodied AGI to substrat **konceptów**: stabilne attraktory uruchamiane przez dowolny modal danego doświadczenia.
+
+### Dlaczego teraz
+
+Phase 6 dał motor i fizykę. Phase 5 dał epizody. Bez ATL agent ma odseparowane representacje per-modal i żaden mechanizm nie wiąże ich w "tę samą rzecz". To jest _crucial step_ do AGI.
+
+### Zakres
+
+#### 7.1 Auditory pipeline w ActionBrain
+
+- A1 dotąd standalone. Wpięcie analogiczne do SensoryStack vision: nowy `sensory/auditory_stack.py` (cochlea → MGN normalize → A1 cortex → opcjonalnie A2/STG jako kolejna `CorticalArea`).
+- ActionBrain dostaje drugi sensory port: `audio_waveform` przekazywane przez auditory_stack do drugiego thalamic relay (MGN), drugiego cortex (A1), output → ATL.
+- Brak nowych BG actors w tej fazie (auditory attention window — Phase 8 razem z mową).
+
+#### 7.2 ATL convergence zone
+
+- Nowy `core/atl.py` jako `CorticalArea` (~512 neurons) z afferentami konkatenowanymi: `[v4_belief, a1_belief, m1_l5, ca1_recall, vta_value_tag]`.
+- Slow STDP: niskie `learning_rate` (1/10 cortexu standardowego), długi integration window. Cel: stabilne attraktory.
+- Lateral inhibition silne (k-WTA, k=5%): konkurencja → kategorie.
+- Synaptic scaling (Turrigiano 2008): per-neuron rate homeostasis (już w `plasticity.py` jako homeostatic_scaling — wpiąć tutaj jeśli orphaned, jak attention).
+- Reference: Patterson, Nestor, Rogers (2007) hub-and-spoke; Binder & Desai (2011).
+
+#### 7.3 Cross-modal novelty drive
+
+- Curiosity dotąd była per-cortex PE. Tu nowy sygnał: `cross_modal_pe = ||predicted_audio_from_atl - actual_audio||` (i analogicznie dla innych par). Predykcje generuje ATL przez generative weights do każdego modalu (PC top-down feedback do V4, A1).
+- Wysokie cross_modal_pe → silne ACh + curiosity bonus do reward. Generuje zachowanie "patrz i słuchaj" + powtarzane investigation.
+
+#### 7.4 Value tagging
+
+- VTA RPE → krótka okno (200 dt) eligibility w ATL: neurony aktywne tuż przed dużym RPE dostają wzmocnienie wagowych projekcji do `affective_field` w ATL (subset 64 neuronów reprezentujących valence).
+- Reference: Pessoa (2008) emocje jako value-tagged concepts, LeDoux (2000) afektywne tagging.
+
+#### 7.5 Multimodal task environment
+
+- `embodiment/multimodal_grid.py`: VisualGridBody + per-cell tone. Konsystentne pary (color, freq) w 80% komórek, niekonsystentne 20% jako noise.
+- Nowy `embodiment/object_world.py` z MJX (Phase 6+): kilka obiektów z teksturami i nazwami-tonami, agent może podejść, dotknąć, popchnąć.
+
+#### 7.6 Testy Phase 7
+
+- `test_phase7_atl_selectivity.py` — po 15k cycles na multimodal_grid ≥30% ATL neuronów ma d' > 1.5 dla par (V+A) konsystentnych vs niekonsystentnych.
+- `test_phase7_cross_modal_recall.py` — ATL aktywuje się przy podaniu tylko V; predicted_audio z ATL ≥ 0.6 cosine z faktycznym tone tej kategorii.
+- `test_phase7_concept_stability.py` — 3 epizody odstępu 24h-symulowane (tj. 3 sleep cycles między) → koncept reaktywuje się z całym modal-agnostic profile (CA1 recall + ATL recall + V4 PE drop).
+- `test_phase7_value_tagging.py` — koncepty skojarzone z reward mają baseline rate ≥1.5× neutralnych.
+- `test_phase7_audio_in_loop.py` — pure tone 1kHz w loop, ActionBrain JIT-uje, A1 firing rate 2-15 Hz.
+
+### Co NIE wchodzi (Phase 7)
+
+- Mowa (gaworzenie/produkcja/rozumienie). Phase 8.
+- Inner speech. Phase 8.
+- Compositional concepts. Phase 9.
+
+### Decyzje (Phase 7)
+
+1. **Jeden ATL zamiast hub-and-spoke z multiple convergence sites** — biologicznie uproszczenie (Patterson 2007 sam mówi że ATL jest dominującym hubem).
+2. **Slow STDP + synaptic scaling** — koncepty muszą być stabilne na timescale wielu epizodów. Standard cortex STDP jest za szybki.
+3. **Generative top-down z ATL do każdego modalu** — Rao & Ballard 1999. To umożliwia cross_modal_pe i imagination ("widzę kulę → przewiduję dźwięk").
+4. **Value tag jako subset ATL, nie osobny region** — amygdala jako pełny region jest Phase 9+. Tu: lekkie afektywne tagging w ATL.
+
+### Weryfikacja Phase 7
+
+1. 5 testów zielone. Regresja Phase 0/5/6.
+2. Diagnostyka: ATL stable attractor — dwa wejścia o cosine 0.8 → ATL output cosine ≥0.95.
+
+---
+
+## Phase 8 — Speech, babbling, comprehension, inner thought
+
+### Cel
+
+**Mowa.** Najtrudniejsza faza. Wymaga: (a) speech motor M1 + vocal tract, (b) feedback przez własne ucho (ear-mouth loop), (c) Wernicke (comprehension), (d) inner speech jako PFC sequence replay z motor suppression.
+
+### Dlaczego teraz
+
+Phase 7 dał koncepty. Język to sekwencjonowanie konceptów do artykulacji. Bez konceptów językowych nie ma podstawy znaczeniowej (czysto syntaktyczny SNN to chińskie pokoje).
+
+### Zakres
+
+#### 8.1 Speech motor M1 (laryngeal)
+
+- Drugi M1 head: `m1_speech` z motor_dim ≈ 30 (artikulatory: jaw, lip rounding, tongue front/back/height, larynx pitch, voicing). Może być kolejnym M1 lub osobnym head z tej samej `CorticalArea`.
+- Decyzja: **osobny moduł** `core/m1_speech.py` z osobnymi STDP, bo timescale i target (kontynualny waveform) są inne niż reaching.
+
+#### 8.2 Vocal tract synthesizer
+
+- `embodiment/vocal_tract.py`: deterministyczny Klatt 1980 cascade-parallel formant synthesizer (lub Pink Trombone-style). Input: 30 DOF z `m1_speech`. Output: waveform 16 kHz.
+- Waveform → `auditory_stack` (Phase 7) → A1 → ATL. **Self-feedback loop zamknięta.**
+
+#### 8.3 Babbling
+
+- Pre-training 30k cycles bez task: M1_speech random init, agent słyszy siebie. STDP w M1_speech ↔ A1 powiązanie ulega (article→sound mapping).
+- Curiosity drive: info-gain w A1 po artykulacji → preferencja dla wokalizacji o maksymalnej różnorodności (analog saccade info-gain z Phase 0).
+- Reference: Guenther DIVA model (2016), Oller 1980 canonical babbling, Kuhl 2004 perceptual magnet.
+
+#### 8.4 Wernicke (comprehension)
+
+- Nowy `core/wernicke.py` jako `CorticalArea` po A1 (w auditory hierarchii). Sequence_memory wpięte tu (Phase 0 zostawił seq-mem orphaned w hippocampus; tu drugie callsite — to OK, sequence_memory to general primitive).
+- Słyszę "kula" → A1 sekwencja → Wernicke uczy się "to słowo to klasterujące pattern" → projekcja do ATL → odpala koncept "kula".
+- Wernicke → ATL projekcja jest plastyczna (Hebbian), uczy się collocation słowo-koncept.
+
+#### 8.5 Productive speech (concept → articulation)
+
+- Reverse path: ATL koncept → PFC sequence_memory (Phase 0 PFC jako goal slot, tutaj rozszerzamy o sequence_memory wewnątrz PFC) → projekcja do M1_speech → vocal_tract.
+- Tutor environment `embodiment/tutor_env.py`: opiekun pokazuje obiekt + wymawia słowo; agent próbuje powtórzyć; reward = cosine podobieństwo waveform-cochleogram (DTW), Kuhl 2004 social gating.
+
+#### 8.6 Auditory attention (3rd BG loop)
+
+- Trzeci aktor BG: `actor_audio_attention` (motor_dim = 8: 4 kierunki frequency × 2 czasowe). Wybiera okno spektrogramu do uwagi (analog saccade dla wzroku).
+- Skaluje per-loop credit z Phase 0 do trójki: body / saccade / audio_attend.
+
+#### 8.7 Inner speech / thought
+
+- W PFC dodać `motor_suppress: bool` field. Kiedy `True`: sequence_memory replay aktywuje M1_speech ALE `vocal_tract.act` nie jest wywoływane (efference bez motor output).
+- Cerebellum forward model przewiduje "co bym usłyszał" → predicted cochleogram → A1 → ATL — jakbym mówił, ale cicho.
+- Thought chain: ATL koncept A → PFC seq → koncept B → seq → koncept C... iteracyjnie, każda iteracja = jeden cykl decyzyjny z PFC autoreplay.
+- Reference: Vygotsky 1934, Hurlburt & Heavey 2006, Alderson-Day & Fernyhough 2015.
+
+#### 8.8 Testy Phase 8
+
+- `test_phase8_babbling_diversity.py` — po 30k cycles ≥10 klastrów spectralnych w produkowanych wokalizacjach (k-means na cochleogram).
+- `test_phase8_word_learning.py` — po 5k tutor interactions, agent reproducuje target z DTW similarity ≥0.6.
+- `test_phase8_comprehension.py` — słysząc "kula" → fixacja na obiekcie kula w 5-obiektowym MJX environments ≥70% w 8 sekund.
+- `test_phase8_inner_speech.py` — PFC autoreplay z motor_suppress generuje sekwencję ATL aktywacji bez nonzero vocal_tract output.
+- `test_phase8_thought_chain.py` — startując od konceptu A, sekwencja długości ≥4 z co najmniej 2 unique concept transitions niezdegenerowana w pętli A→A→A.
+- `test_phase8_aud_attention.py` — w polu z dwoma równoczesnymi tonami (450, 1100 Hz) agent po 2k cycles preferuje fixację na jednym (entropia rozkładu fixacji < 0.5 max).
+
+### Co NIE wchodzi (Phase 8)
+
+- Gramatyka wielowyrazowa, składnia rekurencyjna — Phase 9.
+- ToM, intencje innych, wnioskowanie społeczne — Phase 9+.
+- Czytanie/pisanie — out of scope.
+
+### Decyzje (Phase 8)
+
+1. **Klatt synthesizer, nie WaveNet** — biofizyka niż ML. Klatt jest deterministyczny i ma dokładnie te DOF jakie potrzebujemy.
+2. **PFC z sequence_memory wewnątrz** — sequence_memory to "goal sequencer" w PFC. Hippocampus uczy zdarzeniowych sekwencji; PFC uczy sekwencji intencjonalnych.
+3. **Inner speech = motor_suppress + cerebellum re-afference** — to jest _the_ biologiczna teoria wewnętrznej mowy (Tian & Poeppel 2010 "mental imagery of speech").
+4. **Audio attention jako trzeci aktor BG** — kontynuacja parallel-loops architektury (Alexander 1986). Skaluje się.
+
+### Weryfikacja Phase 8
+
+1. 6 testów zielone.
+2. Regresja wszystkich poprzednich faz.
+3. Diagnostyka: M1_speech firing 10-50 Hz w aktywnej artykulacji; baseline 1-3 Hz.
+4. ACh poziom: wysoki podczas comprehension, średni podczas tutor reward, niski podczas inner speech (Hasselmo 2006).
+
+---
+
+## Phase 9 — Hierarchical control, active inference, ToM (open-ended)
+
+### Cel (szkic)
+
+Po Phase 8 agent ma podstawowy embodied AGI substrat: ciało, percepcja, pamięć, sen, koncepty, mowa, myśl. Phase 9+ to:
+
+- **Goal stack w PFC** (hierarchiczne RL, Botvinick 2014).
+- **Aktywne wnioskowanie z EFE** — wreszcie call-site dla `expected_free_energy()` z `core/free_energy.py`.
+- **Strukturalna plastyczność** — call-site dla `synaptogenesis()/prune_below()` z `core/sparse.py`.
+- **Theory of Mind** — drugi agent w środowisku, koncepty na temat jego stanów.
+- **Compositional language** — sequence_memory hierarchiczny (jeden poziom słów, drugi fraz).
+- **Tool use** — extension manipulation w MJX.
+
+Każdy z tych elementów to osobna faza ~rozmiaru Phase 5-7. Teraz są tylko placeholderem; konkretny plan Phase 9.x napiszemy po Phase 8.
+
+---
+
+## Dependency graph
 
 ```
-V_{t+1} = V_t × decay + (I_syn - w_adapt) × gain
-w_{t+1} = w_t × w_decay + b × spike_t
-spike = V > V_thresh
+Phase 0 (resurrection + closure: PFC, attention, astrocyte, oscillator, sensory_stack, V1 emergence, saccade info-gain, Phase 3 testy)
+   ↓ blokuje
+Phase 5 (HC + EC + replay orchestration + sleep-by-ATP)
+   ↓ blokuje
+Phase 6 (M1 continuous + MJX + cerebellum efference + place/grid)
+   ↓ blokuje
+Phase 7 (auditory in loop + ATL + cross-modal novelty + value tagging)
+   ↓ blokuje
+Phase 8 (M1_speech + vocal_tract + babbling + Wernicke + inner speech + 3rd BG loop)
+   ↓
+Phase 9+ (goal stack, EFE, structural plasticity, ToM, grammar, tools)
 ```
 
-- decay = exp(-dt/τ_m), gain = (1 - decay) / g_L
-- Reference: Gerstner & Kistler (2002), Brette & Gerstner (2005) limiting case
-- ~3× faster than AdEx (no exp computation per neuron per step)
-- SFA captures working memory dynamics (Benda & Herz 2003)
-
-**Mode B — AdEx** (for PFC attractor / thalamic burst):
-
-- Keep current implementation, port to JAX
-- Use only where burst detection or precise adaptation dynamics are critical
-- Reference: Brette & Gerstner (2005)
-
-**Common features:**
-
-- Refractory period (absolute + relative via adaptation)
-- Spike traces for STDP (exponential decay)
-- Conductance-based synaptic input via SynapticChannels
-- Per-neuron configurable: `mode = 'lif' | 'adex'` flag
-- All state as flat JAX arrays (no Python objects per neuron)
-
-### 1.4 Event-driven optimization (for 1M+ scale)
-
-At 1M+ neurons, even O(N) per timestep is expensive for non-spiking neurons. Implement **hybrid clock-driven / event-driven**:
-
-- **Clock-driven** for active populations (recently received input or near threshold)
-- **Inactive populations**: Skip integration, maintain at resting potential
-- **Activation queue**: When a presynaptic population spikes, mark postsynaptic population as "active" for τ_m timesteps
-- Reference: Brette et al. (2007) "Simulation of networks of spiking neurons" — the standard approach for large-scale SNN
-- JAX implementation: use masks + conditional computation via `jax.lax.cond`
+Phase 0 jest wąskim gardłem — bez wskrzeszenia orphans nie ma jak wywołać `episodic_memory` w Phase 5, `attention` w Phase 7, `sequence_memory` w Phase 8.
 
 ---
 
-## PHASE 2: BRAIN REGIONS ARCHITECTURE
+## Cross-cutting decyzje (architektura)
 
-### 2.1 CorticalArea module
-
-Create `core/cortex.py` — generic cortical area factory:
-
-Each cortical area has 3 functional layers (simplified from 6 biological):
-
-- **L2/3** (superficial): Predictive coding — generates predictions, computes PE. Uses ErrorNeuronLayer dual-population model (state + error neurons). Reference: Rao & Ballard (1999), Bastos et al. (2012) "Canonical microcircuits for predictive coding"
-- **L4** (granular): Input layer — receives feedforward thalamocortical input. k-WTA competitive inhibition for sparse coding. Reference: Douglas & Martin (2004) "Neuronal circuits of the neocortex"
-- **L5/6** (deep): Output layer — sends feedback/efferent projections. Generates top-down predictions. Adaptive threshold for attention gating.
-
-**Connectivity pattern** (Bastos et al. 2012 canonical microcircuit):
-
-- Feedforward: L4 → L2/3 → L5/6
-- Feedback: L5/6 → L2/3 (top-down prediction)
-- Lateral: Within-layer recurrent (attractor dynamics)
-- Inhibitory: Each layer has a local InhibitoryPool (FS interneurons)
-
-**Parameters per area** (configurable):
-
-- `n_neurons_per_layer`: list[int] — e.g., [256, 512, 256] for L2/3, L4, L5/6
-- `connectivity_density`: float — default 0.1 (10%)
-- `neuron_mode`: 'lif' (default) or 'adex' (for PFC)
-- `has_predictive_coding`: bool — whether L2/3 does PC
-- `receptive_field_size`: Optional[int] — for sensory areas with topographic maps
-
-**Interarea connections** (Markov et al. 2014 — SLN hierarchy):
-
-- Feedforward: L2/3 of lower area → L4 of higher area
-- Feedback: L5/6 of higher area → L2/3 of lower area (targets error neurons)
-- Each connection has: weight, delay (axonal conduction), connection probability
-
-### 2.2 Thalamus module
-
-Create `core/thalamus.py`:
-
-- **Thalamic relay neurons**: AdEx in burst mode (IB type: a=2, b=60, τ_w=20)
-  - Two states: burst (low DA) and tonic (high DA) — Sherman & Guillery (2002)
-  - Burst mode gates novel/salient inputs → cortex
-  - Tonic mode passes ongoing sensory stream → cortex
-- **Reticular nucleus (TRN)**: Inhibitory shell around thalamus
-  - Receives collaterals from both cortex→thalamus and thalamus→cortex
-  - Provides lateral inhibition between thalamic nuclei
-  - Implements attentional selection (Crick 1984 "Function of the thalamic reticular complex")
-- **Nuclei** (configurable):
-  - LGN (vision) → V1
-  - MGN (audition) → A1
-  - VPL/VPM (somatosensory) → S1
-  - Pulvinar (association/attention) → higher cortical areas
-  - MD (mediodorsal) → PFC
-- Reference: Sherman & Guillery (2006) "Exploring the Thalamus and Its Role in Cortical Function"
-
-### 2.3 Cerebellum module
-
-Create `core/cerebellum.py`:
-
-- **Granule cell layer**: Massive expansion (N_granule ≈ 4 × N_mossy) with sparse random projections — like DG in hippocampus. Reference: Marr (1969) "A theory of cerebellar cortex"
-- **Purkinje cells**: Main output — learn via climbing fiber error signals. LTD at parallel fiber→Purkinje synapses when climbing fiber is active. Reference: Albus (1971), Ito (2006) "Cerebellar circuitry as a neuronal machine"
-- **Deep cerebellar nuclei**: Output pathway, inhibited by Purkinje cells
-- **Function**: Forward model — learns to predict sensory consequences of actions:
-  - Input: efference copy from motor cortex + current sensory state
-  - Output: predicted next sensory state
-  - Error: actual vs predicted sensory state (from climbing fibers / inferior olive)
-  - Reference: Wolpert et al. (1998) "Internal models in the cerebellum"
-- This replaces the current `world_model.py` for motor predictions (world_model stays for higher-level cognitive predictions)
-
-### 2.4 BrainGraph orchestrator
-
-Refactor `core/network.py` → `core/brain_graph.py`:
-
-- Replace flat layer graph with **hierarchical region graph**
-- Each region is a `CorticalArea`, `ThalamusNucleus`, `CerebellumCircuit`, `BasalGangliaCircuit`, or `HippocampalFormation`
-- **Inter-region connections**: Sparse, delayed (axonal conduction time 1-10 ms per brain region distance)
-  - Reference: Swadlow (2000) — axonal conduction velocities 1-10 m/s
-  - With brain-scale distances of 1-10 cm: delays of 1-10 ms
-- **Global oscillator bus**: Each region subscribes to theta/gamma phase
-  - But can have local oscillator phase offsets (traveling waves)
-  - Reference: Muller et al. (2018) "Cortical travelling waves"
-- **Neuromodulator distribution**: Global + regional modulation (keep current architecture but expand to per-region NE/ACh)
-- **Step function**: Topological order respecting delays, jit-compiled
+1. **Wszystko biofizyczne, zero ML hacków**. Konkretnie zakazane: backprop, softmax-policy, learned RNN gates, Adam, learned positional embeddings, normalizing flows, attention z dot-product key-query (jest nasza biologiczna divisive-normalization attention!).
+2. **Każdy moduł albo w produkcji albo usunięty**. Po Phase 0 nie tolerujemy orphans. Audyt bowiem pokazał, że orphans rosną szybciej niż integracja.
+3. **Astrocyta wszędzie tam gdzie są spike-bursty neurons** — cortex, BG, WM, M1, A1, ATL. To koszt JIT + Params shape, ale daje konsystentny ATP/precision system.
+4. **Receptor pharmacology w każdej regionie** — nie tylko BG. Cortex, thalamus, WM, ATL muszą mieć `compute_layer_modulation` calls.
+5. **Sequence_memory jest re-używalny** — w hippocampus (CA3) i w PFC (intencje). Dwa callsite, ten sam moduł.
+6. **Attention jest re-używalna** — wpięta w thalamus (przed cortex), później w ATL (gating sensory dla konceptów), później w Wernicke (selektor dźwięku).
+7. **Per-loop BG actors skaluje się** — refactor `ActionBrain` na `actors: List[ActorParams]` z masking-based credit już w Phase 0. Dodawanie pętli (saccade, audio attend, etc.) jest wtedy trywialne.
+8. **Brak external pretrained models w głównej ścieżce** — DINOv2/CLIP/Whisper itd. dopuszczalne tylko jako opcjonalny `bootstrap_adapter` za flagą domyślnie False, jak ustalono w plan_finished. Phase 0-9 nie używają żadnego.
 
 ---
 
-## PHASE 3: SENSORY SYSTEMS
+## Open questions (do rozstrzygnięcia w trakcie)
 
-### 3.1 Vision pipeline
-
-Create `sensory/vision.py`:
-
-**Architecture** (Hybrid Gabor V1 + spiking higher):
-
-1. **Retina** (fixed, not learned):
-   - Input: RGB image (64×64 or 128×128 from Unity camera)
-   - Center-surround: Difference of Gaussians (ON-center/OFF-center ganglion cells)
-   - Temporal change detection: Frame differencing → event-like spikes
-   - Reference: Rodieck (1998) "The First Steps in Seeing"
-   - Implementation: Standard convolution on GPU (JAX conv2d)
-
-2. **LGN** (thalamic relay):
-   - Burst/tonic mode for novel vs familiar visual input
-   - Attentional gating via TRN feedback
-
-3. **V1** (fixed Gabor filters, not learned):
-   - 8 orientations × 4 spatial frequencies × ON/OFF = 64 feature maps
-   - Gabor filter bank: `g(x,y) = exp(-(x'²+γ²y'²)/2σ²) × cos(2πx'/λ + φ)`
-   - Reference: Hubel & Wiesel (1962), Olshausen & Field (1996)
-   - Implementation: Depthwise convolution on GPU (fast, parallel)
-   - Output: Sparse spike patterns (threshold + WTA competition within orientation columns)
-
-4. **V2** (learned via STDP — CorticalArea):
-   - Combines V1 features into texture/contour elements
-   - Reference: Freeman et al. (2013) — V2 texture selectivity
-   - n_neurons: ~2000 (configurable)
-
-5. **V4/IT** (learned — CorticalArea):
-   - Object-level representations
-   - Invariant to position/size via progressive pooling
-   - Reference: DiCarlo et al. (2012) "How does the brain solve visual object recognition?"
-   - n_neurons: ~1000 (configurable)
-   - Outputs: Object-level sparse codes that feed into concept binding
-
-**Optional semantic shortcut** (removable):
-
-- DINOv2 or CLIP features → population encoding → inject into V4/IT as additional input
-- For bootstrapping early training when visual cortex hasn't learned enough
-- Reference: Conceptually similar to "innate knowledge" / evolutionary priors
-- Can be gradually faded out as SNN visual hierarchy matures
-
-### 3.2 Auditory pipeline
-
-Create `sensory/auditory.py`:
-
-1. **Cochlea** (fixed, not learned):
-   - Mel filterbank (64 frequency bands) applied to audio waveform
-   - Half-wave rectification (inner hair cell model)
-   - Reference: Lyon (2017) "Human and Machine Hearing"
-   - Output: 64-channel spectrogram at ~1ms resolution
-
-2. **MGN** (thalamic relay):
-   - Tonotopic organization preserved
-   - Burst mode for novel sounds
-
-3. **A1** (primary auditory cortex — CorticalArea):
-   - Tonotopic map (frequency → spatial position)
-   - Temporal pattern detection (onset, offset, frequency modulation)
-   - Reference: Kaas & Hackett (2000)
-   - n_neurons: ~1000
-
-4. **Belt/Parabelt** (secondary auditory — CorticalArea):
-   - Phoneme-level representations
-   - Temporal sequence learning (sequence_memory integration)
-   - Reference: Rauschecker & Scott (2009) "Maps and streams in the auditory cortex"
-   - n_neurons: ~500
-
-5. **STS** (superior temporal sulcus — CorticalArea):
-   - Audio-visual integration
-   - Voice/face binding
-   - Reference: Beauchamp et al. (2004)
-
-### 3.3 Somatosensory pipeline
-
-Create `sensory/somatosensory.py`:
-
-1. **Mechanoreceptors** (fixed encoding):
-   - Pressure/force → population coded spikes
-   - Proprioception: joint angles + velocities → population coded
-   - Reference: Johansson & Flanagan (2009)
-
-2. **S1** (primary somatosensory — CorticalArea):
-   - Somatotopic map (body part → spatial position)
-   - Texture, pressure, proprioception integration
-
-3. **S2** (secondary — CorticalArea):
-   - Higher-order tactile processing
-   - Object recognition by touch
-
-### 3.4 Interoception
-
-Create `sensory/interoception.py`:
-
-- Internal state variables: energy level (from astrocyte ATP), "pain" (prediction error magnitude), arousal (NE level)
-- Population coded → insular cortex area
-- Reference: Craig (2009) "How do you feel — now?"
-- Drives homeostatic behavior (seek food when energy low, rest when fatigued)
+1. **PFC: jeden WM slot czy multiple (Cowan 4±1)?** — Phase 0 startuje z jednym (minimum żywotne); rozważyć multiple w Phase 5 jako prerequisite dla goal stack w Phase 9.
+2. **Astrocyta zone count per region** — domyślnie 16 (`astrocyte.AstrocyteParams.n_zones`); może wymagać per-region override (cortex większe, BG mniejsze).
+3. **Sleep cycle długość** — 200 SWS + 100 REM to estymata; kalibrować empirycznie po Phase 5.
+4. **Vocal tract: Klatt vs Pink Trombone** — Klatt deterministyczny, Pink Trombone bardziej intuicyjny dla ssania. Decyzja: Klatt (tradycja phonetic synthesis).
+5. **MJX vs MuJoCo Python bindings** — MJX (pure JAX), confirmed.
+6. **Czy dodawać amygdala jako region** — Phase 7 robi value tagging w ATL subset; pełna amygdala (LeDoux) Phase 9+.
+7. **Czy zostawić bandit/gridworld po Phase 6** — TAK, jako fast smoke-tests dla kolejnych refaktorów. Tylko visual_grid migruje do MJX object_world.
 
 ---
 
-## PHASE 4: MOTOR SYSTEMS + LANGUAGE
-
-### 4.1 Motor cortex
-
-Create `motor/motor_cortex.py`:
-
-1. **Premotor cortex** (CorticalArea):
-   - Action plan level: high-level goals → sequences of motor primitives
-   - Receives from PFC (goals), BG (selected action)
-   - Outputs to M1
-   - Reference: Rizzolatti & Luppino (2001) "The cortical motor system"
-
-2. **Primary motor cortex M1** (CorticalArea):
-   - Motor primitive execution: population-coded movement commands
-   - Output: joint angle targets / velocities / torques (configurable)
-   - Somatotopic map (body part → spatial position in M1)
-   - Reference: Georgopoulos et al. (1986) — population vector coding
-
-3. **Body interface** (`body_interface.py`):
-   - Abstract interface: `send_motor_command(joint_targets)`, `receive_sensory(modality)`
-   - Unity adapter: gRPC/WebSocket to Unity simulation
-   - MuJoCo adapter: Direct Python bindings
-   - Real robot adapter: ROS2 messages
-   - Reference: Pfeifer & Bongard (2006) "How the Body Shapes the Way We Think"
-
-### 4.2 Phoneme / speech system
-
-Create `motor/speech.py`:
-
-1. **Phoneme inventory** (configurable, default IPA subset):
-   - ~40 phonemes for English (expandable)
-   - Each phoneme = activation pattern in speech motor cortex
-   - Reference: Levelt (1989) "Speaking: From Intention to Articulation"
-
-2. **Broca's area** (CorticalArea):
-   - Phoneme sequence planning
-   - Receives from: PFC (intended meaning), Wernicke's (comprehended speech for repetition)
-   - Outputs: Ordered phoneme activations
-   - Syllabification and prosody
-   - Reference: Flinker et al. (2015) "Redefining the role of Broca's area in speech"
-
-3. **Speech motor cortex** (part of M1):
-   - Phoneme activation → articulatory motor commands
-   - Output: phoneme ID + onset timing → external TTS engine
-   - Reference: Guenther (2006) "Cortical interactions underlying the production of speech sounds"
-
-4. **Babbling loop** (learning mechanism):
-   - **Phase 1 — Vocal babbling**: Random phoneme activation → TTS → audio input → A1 processing
-     - Agent hears its own "voice" through the auditory pipeline
-     - Builds auditory-motor mapping through STDP
-     - Reference: Kuhl (2004) "Early language acquisition: cracking the speech code"
-   - **Phase 2 — Imitation**: Hear external word → activate Wernicke's → attempt reproduction via Broca's → compare heard vs intended
-     - Error signal: prediction error between heard phoneme sequence and target
-     - Drives learning in Broca's→M1 pathway
-     - Reference: Rizzolatti & Arbib (1998) — mirror neuron hypothesis for speech
-   - **Phase 3 — Naming**: See object → retrieve associated word → produce speech
-     - Cross-modal binding: visual concept → semantic → phonological → motor
-     - Reference: Levelt et al. (1999) "A theory of lexical access in speech production"
-
-### 4.3 Wernicke's area
-
-Part of auditory hierarchy (STS + posterior temporal):
-
-- Phoneme sequences → word recognition
-- Maps to semantic concepts
-- Reference: Hickok & Poeppel (2007) "The cortical organization of speech processing" (dual-stream model)
-
----
-
-## PHASE 5: MEMORY SYSTEMS
-
-### 5.1 Working memory (PFC refactoring)
-
-Refactor `core/working_memory.py`:
-
-- Keep current attractor + dual ACh/DA gating (well-implemented)
-- Add: **Multiple WM slots** — not one monolithic WM, but N independent attractor networks (each with ~64-128 neurons)
-  - Capacity ~4±1 chunks (Cowan 2001)
-  - Each slot maintained by persistent activity + NMDA currents
-  - Slots compete via lateral inhibition
-  - Reference: Bays & Husain (2008) "Dynamic shifts of limited working memory resources"
-- Add: **Goal register** — special WM slot for current goal, gated by dorsolateral PFC
-  - Maintained until goal is achieved or explicitly overwritten
-  - Reference: Miller & Cohen (2001) "An integrative theory of prefrontal cortex function"
-- Switch to AdEx neurons (needed for persistent activity / attractor stability)
-
-### 5.2 Episodic memory (Hippocampus expansion)
-
-Refactor `core/episodic_memory.py` → `core/hippocampus.py`:
-
-- Keep current DG sparse coding + CA3 pattern completion
-- Add: **CA1 temporal binding** — temporal context vectors that allow time-stamping memories
-  - Reference: Howard & Kahana (2002) "A distributed representation of temporal context"
-  - Implementation: Slowly drifting context vector that provides temporal tagging
-- Add: **Place cells / Grid cells** (for spatial navigation in embodied env)
-  - Grid cells: periodic spatial firing patterns (Hafting et al. 2005)
-  - Place cells: location-specific firing (O'Keefe & Nadel 1978)
-  - Implementation: Population of neurons with grid-like response functions + Hebbian learning
-  - These form the spatial scaffold for episodic memories
-  - Reference: Moser et al. (2008) "Place cells, grid cells, and the brain's spatial representation system"
-- Add: **Sharp-wave ripple (SWR) generation** — currently SWRs are externally triggered; make them endogenous
-  - CA3 recurrent excitation builds up → CA1 ripple → cortical reactivation
-  - Reference: Buzsáki (2015) "Hippocampal sharp wave-ripple"
-- Add: **Consolidation pathway**: Hippocampus → cortex (slow, during sleep)
-  - Repeated replay gradually transfers episodic → semantic memory
-  - Reference: McClelland et al. (1995) — complementary learning systems theory
-
-### 5.3 Semantic memory (Temporal cortex)
-
-New: Represented as stable weight patterns in association cortex
-
-- Formed through repeated activation (consolidation from episodic)
-- Cross-modal: concept "apple" = visual features + taste + word sound + motor grasp
-- Implemented via convergence zone architecture
-- Reference: Damasio (1989) "Time-locked multiregional retroactivation" — convergence zones for concepts
-- Not a separate module — emerges from connectivity between sensory areas + PFC + hippocampus
-
-### 5.4 Procedural memory (BG habits)
-
-Already partially implemented in `basal_ganglia.py`:
-
-- D1/D2 STDP-based learning → habit formation
-- Keep but streamline: Remove RL-specific scaffolding, make generic action selection
-- Add: **Chunking** — sequences of actions that become automatic
-  - Fast-learning BG pathway for initial learning → slow transfer to cortical habits
-  - Reference: Graybiel (2008) "Habits, rituals, and the evaluative brain"
-
-### 5.5 Sleep consolidation (Replay buffer refactoring)
-
-Refactor `core/replay_buffer.py`:
-
-- Keep SWS + REM two-phase design
-- Fix ML hacks:
-  - Replace `max(abs(rpe), 0.1)` floor with astrocyte-derived metabolic modulation (ATP level → learning gate)
-  - Replace fixed `m_t = 0.5` for REM with serotonin-modulated learning rate
-  - Replace `2.5` GABA surge with astrocyte-calibrated inhibitory gain
-- Add: **Dreaming** — REM forward replay that generates novel combinations
-  - Not just replaying stored experiences, but recombining them
-  - Reference: Hobson (2009) "REM sleep and dreaming"
-  - Implementation: World model generates imagined trajectories → train on them
-- Wire astrocyte ATP to sleep trigger (currently dead code — Phase 0 fix)
-
----
-
-## PHASE 6: LEARNING & PLASTICITY
-
-### 6.1 Synaptic plasticity (clean up existing)
-
-- **STDP**: Keep Bi & Poo (2001) kernel. Fix `a_plus` double application.
-- **Three-factor**: Keep modulation × eligibility × error. Clean up unit mismatches.
-- **Homeostatic scaling**: Keep Turrigiano (2008). Fix hardcoded `0.05` rate — use config.
-- **BCM threshold**: Keep. Already well-implemented.
-- All learning rules ported to JAX (differentiable for debugging, but not used for backprop)
-
-### 6.2 Structural plasticity (NEW)
-
-Add to `core/sparse.py`:
-
-- **Synaptogenesis**: Correlated pre/post activity without direct connection → add synapse
-  - Rule: If pre and post spike within 20ms AND no synapse exists AND random test passes → create synapse with small initial weight
-  - Reference: Butz & van Ooyen (2013)
-  - Rate: ~0.1% of potential connections checked per second (stochastic)
-- **Pruning**: Synapses with weight below threshold for extended period → remove
-  - Threshold: 1% of mean weight in population
-  - Holdout period: ~10 minutes (biological: days-weeks, compressed)
-  - Reference: Chechik et al. (1998) "Synaptic pruning in development"
-- This is how the brain GROWS new circuits for new concepts
-
-### 6.3 Neuromodulation (keep + expand)
-
-Keep current 4-channel system (DA, ACh, NE, 5-HT). Modifications:
-
-- Wire astrocytes to all layers (currently dead in production)
-- Add **regional neuromodulation** — currently global; make per-region:
-  - VTA → dorsal striatum (phasic DA for action learning)
-  - VTA → PFC (tonic DA for working memory gating)
-  - Locus coeruleus → all cortex (NE for arousal/attention)
-  - Basal forebrain → cortex (ACh for learning mode vs recall mode)
-  - Dorsal raphe → everywhere (5-HT for temporal horizon + mood)
-  - Reference: Doya (2002) "Metalearning and neuromodulation"
-
-### 6.4 Continuous learning (meta-learning via neuromodulation)
-
-The brain must never stop learning, but must also not catastrophically forget.
-
-- **Consolidation**: Sleep replays + hippocampal→cortical transfer
-- **Protection of old memories**: Elastic weight consolidation-like mechanism, but biological:
-  - Synaptic tagging and capture (Frey & Morris 1997): Strong synaptic events create "tags" that protect potentiated synapses
-  - Implementation: Per-synapse "consolidation" flag (from replay count in episodic memory), consolidated synapses have slower learning rate
-  - Reference: Redondo & Morris (2011) "Making memories last"
-- **Novelty-driven plasticity**: NE/ACh increase plasticity for novel stimuli, decrease for familiar
-  - Already partially implemented via neuromodulator system
-  - Make more explicit: NE high → all STDP traces have shorter τ (faster learning)
-
----
-
-## PHASE 7: CROSS-MODAL BINDING & CONCEPTS
-
-### 7.1 Temporal binding via gamma synchronization
-
-- Neurons representing features of same object fire in same gamma cycle
-- Binding by synchrony (Engel & Singer 2001, Gray 1994)
-- Implementation: Oscillator phase resets group co-active neurons
-- Already partially implemented via theta-gamma oscillator; extend to per-region gamma
-- Reference: Fries (2005) "A mechanism for cognitive dynamics: neuronal communication through neuronal coherence"
-
-### 7.2 Convergence zones
-
-- Create association areas where multiple sensory streams converge
-- **Temporal pole**: Auditory + visual → audiovisual concepts
-- **Angular gyrus**: Visual + auditory + somatosensory → rich multi-modal concepts
-- **PFC**: All modalities + goals + memory → executive representations
-- Implementation: CorticalAreas that receive projections from multiple sensory hierarchies
-- Learning: Hebbian — co-activated features across modalities strengthen connections
-- Reference: Damasio (1989) convergence zones, Patterson et al. (2007) "Where do you know what you know?"
-
-### 7.3 Concept formation
-
-A "concept" is a stable attractor in association cortex activated by any associated modality:
-
-- See apple → visual pathway → IT features → apple concept activation
-- Hear "apple" → auditory pathway → word recognition → apple concept activation
-- Feel apple → tactile pathway → shape/texture → apple concept activation
-- All three activate the SAME attractor population in convergence zone
-- Reference: Binder et al. (2009) "Where is the semantic system?"
-
-### 7.4 Inner speech / thought
-
-"Thinking" = sequential activation of concept attractors without external input:
-
-- PFC goal representation → primes relevant concepts in association cortex
-- Hippocampal replay can trigger chains of associated concepts
-- Working memory maintains current "thought" while next is being activated
-- Reference: Fodor (1975) "Language of Thought", Carruthers (2002) "The cognitive functions of language"
-- Implementation: PFC → BG action selection operates on internal "actions" (concept retrieval, WM slot manipulation) in addition to external motor actions
-- **Key insight**: Same BG selection mechanism that chooses physical actions also chooses "mental actions" — which concept to attend to, what to retrieve from memory, what to say
-  - Reference: Frank & Badre (2012) "Mechanisms of hierarchical reinforcement learning in corticostriatal circuits"
-
----
-
-## PHASE 8: INTEGRATION — THE BRAIN CLASS
-
-### 8.1 Brain class
-
-Create `brain.py` — top-level orchestrator:
-
-```
-Brain
-├── sensory/
-│   ├── vision: RetinalProcessor → LGN → V1 → V2 → V4/IT
-│   ├── auditory: Cochlea → MGN → A1 → Belt → STS
-│   ├── somatosensory: Mechanoreceptors → VPL → S1 → S2
-│   └── interoception: InternalState → Insula
-├── cortex/
-│   ├── temporal_association: V4/IT + STS → concepts
-│   ├── parietal: S2 + V2 → spatial processing
-│   ├── prefrontal: dlPFC (goals) + vmPFC (values) + Broca's
-│   └── motor: Premotor → M1 → body_interface
-├── subcortical/
-│   ├── thalamus: LGN, MGN, VPL, Pulvinar, MD
-│   ├── basal_ganglia: D1/D2 pathways (action selection)
-│   ├── hippocampus: DG → CA3 → CA1 (memory)
-│   ├── cerebellum: Forward models
-│   ├── vta: Dopamine (RPE)
-│   └── amygdala: (future — valence tagging)
-├── neuromodulation/
-│   ├── dopamine: VTA → BG, PFC
-│   ├── noradrenaline: LC → all cortex
-│   ├── acetylcholine: BF → cortex
-│   └── serotonin: DR → everywhere
-├── oscillator: Global theta-gamma + per-region phase
-├── astrocyte_field: Per-region metabolic regulation
-└── body_interface: Motor output + sensory input
-```
-
-### 8.2 Main loop (replaces SNNAgent)
-
-```
-every 1ms (dt):
-  1. Receive sensory input from body_interface
-  2. Encode through sensory pipelines (retina, cochlea, etc.)
-  3. Thalamic relay (burst/tonic gating)
-  4. Cortical processing (all areas in parallel, respect delays)
-  5. PFC goal maintenance + BG action selection
-  6. Motor output → body_interface
-  7. Neuromodulator update (global)
-  8. Astrocyte update (per-region)
-  9. Oscillator tick
-  10. STDP + homeostatic plasticity
-
-every sleep_cycle:
-  SWS: reverse replay + hippocampal consolidation
-  REM: forward replay + dreaming + sequence learning
-```
-
-### 8.3 Body interface protocol
-
-Create `body_interface.py`:
-
-```python
-class BodyInterface(ABC):
-    def receive_vision(self) -> jnp.ndarray:  # RGB image
-    def receive_audio(self) -> jnp.ndarray:   # waveform
-    def receive_touch(self) -> jnp.ndarray:   # pressure map
-    def receive_proprioception(self) -> jnp.ndarray:  # joint angles
-    def send_motor(self, joint_targets: jnp.ndarray) -> None
-    def send_speech(self, phoneme_ids: jnp.ndarray) -> None
-```
-
-Implementations:
-
-- `UnityInterface(BodyInterface)` — gRPC to Unity
-- `MuJoCoInterface(BodyInterface)` — direct Python bindings
-- `ROS2Interface(BodyInterface)` — ROS2 topics
-
----
-
-## RELEVANT FILES
-
-### Keep & Modify
-
-- `core/config.py` — Refactor into per-region configs, fix mg_concentration bug, remove dead fields
-- `core/neuron.py` — Add LIF+SFA mode, port to JAX, fix a_plus bug, fix Jacobian
-- `core/synapse.py` — Port to JAX, add sparse matmul path
-- `core/neuromodulator.py` — Port to JAX, add per-region modulation
-- `core/receptor.py` — Port to JAX (minimal changes)
-- `core/vta.py` — Port to JAX (minimal changes)
-- `core/oscillator.py` — Port to JAX, add multi-regional phase
-- `core/astrocyte.py` — Port to JAX, wire to production
-- `core/free_energy.py` — Port to JAX (minimal changes)
-- `core/simulation_context.py` — Port to JAX
-- `core/working_memory.py` — Multi-slot WM, AdEx mode
-- `core/episodic_memory.py` → rename to `core/hippocampus.py`, expand
-- `core/basal_ganglia.py` — Streamline, remove RL scaffolding
-- `core/sequence_memory.py` — Port to JAX (minimal changes)
-- `core/replay_buffer.py` — Fix ML hacks, add dreaming
-- `core/attention.py` — Expand to thalamic gating
-- `core/network.py` → refactor into `core/brain_graph.py`
-- `core/error_neuron.py` — Port to JAX, absorb predictive_coding logic
-- `core/interneuron.py` — Port to JAX, merge into cortex module
-- `core/spike_encoder.py` — Port to JAX, add modality-specific encoders
-- `arena/core.py` — Keep interface ABCs, remove Trainer (replaced by brain loop)
-
-### Delete
-
-- `core/pyramidal_neuron.py` — Dead, merge BAC firing into cortex
-- `core/columnar.py` — Dead, replace with cortex.py
-- `core/predictive_coding.py` — Merge into error_neuron.py
-- `core/competitive_layer.py` — Merge into cortex.py
-- `arena/snn_agent.py` — Replace with brain.py
-- `arena/agent_factory.py` — Replace with brain configuration
-- `arena/benchmark.py` — Replace with embodied evaluation
-- `arena/task_config.py` — Replace with embodied task configs
-- `arena/environments.py` — Replace with body_interface
-- `arena/gym_env.py` — Replace with body_interface adapters
-
-### Create New
-
-- `core/backend.py` — JAX backend abstraction
-- `core/sparse.py` — Sparse connectivity engine
-- `core/cortex.py` — Generic cortical area factory
-- `core/thalamus.py` — Thalamic relay module
-- `core/cerebellum.py` — Forward model circuit
-- `core/hippocampus.py` — Expanded hippocampal formation (from episodic_memory)
-- `core/brain_graph.py` — Hierarchical brain region orchestrator
-- `sensory/vision.py` — Visual processing pipeline
-- `sensory/auditory.py` — Auditory processing pipeline
-- `sensory/somatosensory.py` — Touch + proprioception
-- `sensory/interoception.py` — Internal state sensing
-- `motor/motor_cortex.py` — Motor output system
-- `motor/speech.py` — Phoneme system + babbling
-- `brain.py` — Top-level Brain class
-- `body_interface.py` — Abstract embodiment interface
-
----
-
-## VERIFICATION
-
-1. **Unit tests**: Each brain region independently testable — fixed input → expected firing pattern
-2. **Integration test — Babbling**: Brain produces random phonemes → hears own voice → reduces error over time (auditory-motor mapping forms)
-3. **Integration test — Object naming**: Present object + play word → brain associates → later, present object → brain produces word
-4. **Integration test — Navigation**: Simple grid world → brain learns to navigate to goal using hippocampal place cells + BG action selection
-5. **Benchmark — Spike statistics**: Verify biologically plausible firing rates (1-20 Hz cortical, 50-200 Hz interneurons) across all regions
-6. **Benchmark — Memory**: Store N episodes → recall accuracy > 80% for recent, graceful degradation for old
-7. **Benchmark — Scaling**: 1M neurons, <100ms wall-clock per brain step on single GPU (JAX jit)
-8. **Benchmark — Continuous learning**: Train task A → train task B → verify task A performance retained above 70%
-9. **Diagnostic — Weight statistics**: No runaway weights, mean weight per region stays within 2× initial over 10K steps
-10. **Diagnostic — ATP dynamics**: Astrocyte ATP depletes during sustained activity, recovers during sleep, triggers sleep when critical
-
----
-
-## DECISIONS
-
-1. **AdEx vs LIF**: LIF+SFA for 90% of neurons (3× cheaper), AdEx only for PFC attractor and thalamic burst mode. Justified: Benda & Herz (2003) show SFA captures essential adaptation dynamics.
-2. **Vision**: Hybrid Gabor V1 (fixed, not learned) + spiking V2+ (STDP learned). Most future-proof — scales to real cameras, allows incremental learning, biologically grounded (Hubel & Wiesel 1962). Optional DINOv2 shortcut for bootstrapping.
-3. **Speech**: Phoneme inventory in SNN → external TTS. Learning via babbling loop. Most biologically accurate approach (Kuhl 2004).
-4. **JAX**: Full migration from NumPy. Required for 1M+ neuron scale. Equinox for class-based modules.
-5. **Sparse connectivity**: 5-15% density (Braitenberg & Schüz 1998). CSR format via jax.experimental.sparse. Critical for O(N) vs O(N²) scaling.
-6. **No backprop anywhere**: All learning is local (STDP, Hebbian, three-factor). Biologically grounded.
-7. **Body interface**: Abstract ABC with Unity/MuJoCo/ROS2 adapters. Start with Unity, migrate to real robot later.
-8. **Sleep**: ATP-driven (endogenous), not episode-boundary triggered. Finally wire dormant astrocyte pathway.
-9. **Concepts**: Emerge from cross-modal Hebbian binding in convergence zones, not explicitly programmed.
-10. **Thought**: Same BG selection mechanism for internal "mental actions" as for external motor actions (Frank & Badre 2012).
-
----
-
-## FURTHER CONSIDERATIONS
-
-1. **Amygdala**: Valence tagging (fear/reward) for emotional memory. Not included in initial plan but natural extension. Would add prioritization to episodic storage and bias BG selection. Reference: LeDoux (2000).
-2. **Mirror neurons**: Premotor neurons that fire both during action execution and observation. Important for imitation learning and empathy. Could emerge naturally from sensory-motor predictive coding. Reference: Rizzolatti & Craighero (2004).
-3. **Attention schema**: Explicit self-model for attention allocation. The brain modeling its own attention process. Would support metacognition. Reference: Graziano (2013) "Consciousness and the Social Brain".
-
----
-
-## IMPLEMENTATION ORDER
-
-The phases are ordered by dependency:
-
-```
-Phase 0 (Cleanup) ─────────┐
-                            ▼
-Phase 1 (JAX + Core) ──────┤  ← Foundation, everything depends on this
-                            ▼
-Phase 2 (Brain Regions) ────┤  ← depends on Phase 1
-      ┌─────────┬──────────┤
-      ▼         ▼          ▼
-Phase 3      Phase 4    Phase 5    ← Sensory, Motor, Memory (parallel)
-(Sensory)    (Motor)    (Memory)
-      └─────────┴──────────┘
-                ▼
-Phase 6 (Learning) ────────── ← depends on all above
-                ▼
-Phase 7 (Cross-modal) ─────── ← depends on sensory + memory
-                ▼
-Phase 8 (Integration) ──────── ← depends on everything
-```
-
-Phases 3, 4, 5 can be developed in parallel once Phase 2 is complete.
+## Co wreszcie zaowocuje (po Phase 8)
+
+Embodied agent w MJX który:
+
+- ma stabilne _koncepty_ (ATL attractors aktywowane przez dowolny modal),
+- _pamięta epizody_ (HC), _konsoliduje je w nocy_ (SWS+REM),
+- _patrzy aktywnie_ (saccade info-gain), _słucha aktywnie_ (audio attention),
+- _manipuluje ramieniem_ (MJX + M1 + cerebellum forward model),
+- _gaworzy_, _uczy się słów od opiekuna_, _mówi w odpowiedzi na koncept_,
+- _myśli wewnętrznie_ (PFC sequence replay z motor suppression),
+- _dryfuje między snem a czuwaniem endogenicznie_ (ATP-driven),
+- nigdy nie używa backprop, softmax policy ani żadnego ML-shortcuta.
+
+To jest baseline AGI-substrate. Phase 9+ to dopisywanie kompetencji wyższego rzędu (gramatyka, ToM, narzędzia, planowanie z EFE).

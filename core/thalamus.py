@@ -298,12 +298,18 @@ def thalamic_step(
     *,
     ach: Array | float = 0.5,
     ne: Array | float = 0.5,
+    afferent_gain: Array | float = 1.0,   # (n_tc,) or scalar — attention
 ) -> ThalamicOutput:
     """One dt of the full relay+TRN circuit (single nucleus).
 
     ACh + NE depolarise TC cells via the bias current, switching them
     from burst to tonic mode (McCormick & Bal 1997). The caller owns
     the neuromodulator scheduler — no hidden state here.
+
+    ``afferent_gain`` is a per-TC multiplicative factor on the afferent
+    AMPA conductance. This models pulvinar / top-down attention
+    modulation of LGN/first-order relay responses (Saalmann 2012;
+    Reynolds & Heeger 2009). Default 1.0 = no modulation.
     """
     af = afferent.astype(DTYPE)
     ct = ct_drive.astype(DTYPE)
@@ -332,10 +338,13 @@ def thalamic_step(
     )
     i_tc_inh = g_gaba * (relay_params.e_inh - relay.tc.v)
 
-    # Afferent + CT excitation (AMPA)
+    # Afferent + CT excitation (AMPA).  ``afferent_gain`` scales the
+    # sensory afferent pathway (attention); CT remains ungated so the
+    # cortical loop can override a silenced channel.
+    af_gain = jnp.asarray(afferent_gain, DTYPE)
     g_ampa_tc = (
         relay.g_ampa * relay_params.ampa_decay
-        + af @ relay.w_af
+        + af_gain * (af @ relay.w_af)
         + ct @ relay.w_ct
     )
     i_tc_exc = g_ampa_tc * (relay_params.e_exc - relay.tc.v)

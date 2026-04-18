@@ -58,7 +58,10 @@ from .oscillator import (
 from .neuromodulator import (
     NeuromodulatorParams, NeuromodulatorState,
     init_neuromodulator_params, init_neuromodulator_state,
-    neuromodulator_step,
+    neuromodulator_step, transmitter_vector,
+)
+from .receptor import (
+    ReceptorParams, init_receptor_params, compute_layer_modulation,
 )
 from .thalamus import (
     RelayParams, RelayState, TRNParams, TRNState,
@@ -75,6 +78,11 @@ from .cerebellum import (
     CerebellumParams, CerebellumState,
     init_cerebellum_params, init_cerebellum_state,
     cerebellum_step, cerebellum_update,
+)
+from .attention import (
+    AttentionParams, AttentionState,
+    init_attention_params, init_attention_state,
+    attention_step,
 )
 
 
@@ -128,6 +136,66 @@ def delay_push_pop(db: DelayBuffer, x: Array) -> tuple[DelayBuffer, Array]:
 # =====================================================================
 
 
+# Default receptor densities per region (fractional, [0, 1]) along
+# :data:`core.receptor.RECEPTOR_ORDER`:
+# ``(D1, D2, M1, M4, NACHR, ALPHA1, ALPHA2, BETA, HT1A, HT2A)``.
+#
+# These are literature-guided ballpark values for the dominant
+# excitatory pyramidal neuron of each area (not exact quantifications
+# \u2014 cortical receptor counts vary 5-10\u00d7 across studies). They are
+# deliberately conservative; phase-specific regions (PFC, V1, ATL,
+# striatum) override individual subtype densities in their init_*.
+#
+#   Cortex (generic pyramidal):  high M1/HT2A/ALPHA1, moderate D1/NACHR,
+#                                low D2/M4.                              (Seamans & Yang 2004)
+#   PFC override (Phase 0.5):     bump D1 \u2192 0.7, M1 \u2192 0.6.               (Goldman-Rakic 1995)
+#   Thalamic relay (not used \u2014 McCormick bias covers ACh/NE gating).
+#   Striatum (BG already uses receptor.hill_response directly \u2014 keep).
+CORTEX_DEFAULT_DENSITY: tuple[float, ...] = (
+    0.4,  # D1
+    0.2,  # D2
+    0.5,  # M1
+    0.1,  # M4
+    0.3,  # NACHR
+    0.4,  # ALPHA1
+    0.3,  # ALPHA2
+    0.4,  # BETA
+    0.3,  # HT1A
+    0.5,  # HT2A
+)
+
+
+def _region_receptor_gain(
+    receptor_params: ReceptorParams,
+    neuromod: NeuromodulatorState,
+    nm_params: NeuromodulatorParams,
+    density: Array,
+) -> Array:
+    """Multiplicative excitability gain from current neuromod levels.
+
+    Normalised so that at the neuromodulator **baseline** set-points
+    (``baseline_da / _ach / _ne / _sero`` in ``NeuromodulatorParams``)
+    the gain equals exactly 1.0. Phasic deviations above / below the
+    tonic set-point therefore produce proportional multiplicative
+    modulation, which is what the receptor\u2013G-protein cascade does at
+    steady state (Aston-Jones & Cohen 2005; Schultz 1998).
+
+    This is not a "hack" \u2014 the baseline is an intrinsic property of
+    the neuromodulator pytree (not a tuned free parameter); calibrating
+    gain to 1.0 at that baseline preserves the existing weight scales
+    (rheobase targets in ``cortex.init_cortical_area_state``) while
+    enabling D1/D2/M1/\u03b1/\u03b2/5-HT effects to enter the loop.
+    """
+    tx = transmitter_vector(neuromod)
+    baseline_tx = jnp.stack([
+        nm_params.baseline_da, nm_params.baseline_ach,
+        nm_params.baseline_ne, nm_params.baseline_sero,
+    ])
+    curr = compute_layer_modulation(receptor_params, tx, density)
+    base = compute_layer_modulation(receptor_params, baseline_tx, density)
+    return curr.gain_mod / jnp.maximum(base.gain_mod, jnp.asarray(0.1, DTYPE))
+
+
 class MinimalBrainParams(eqx.Module):
     """Params for a reference single-area brain.
 
@@ -142,10 +210,15 @@ class MinimalBrainParams(eqx.Module):
     cerebellum: CerebellumParams
     oscillator: OscillatorParams
     neuromodulator: NeuromodulatorParams
+    receptor: ReceptorParams
+    attention: AttentionParams
 
     # Inter-region projections
     w_l5_ct: Array                # (n_l5, n_ct) cortex L5 \u2192 thalamus CT
     w_l5_mossy: Array             # (n_l5, mossy_size) cortex L5 \u2192 cerebellum mossy
+
+    # Receptor densities per region along RECEPTOR_ORDER (shape (10,))
+    cortex_receptor_density: Array
 
     # Traveling-wave phase offsets (radians, in [0, 2\u03c0))
     phase_offset_thalamus: Array  # scalar
@@ -164,6 +237,7 @@ class MinimalBrainState(eqx.Module):
     cerebellum: CerebellumState
     oscillator: OscillatorState
     neuromodulator: NeuromodulatorState
+    attention: AttentionState
 
     # Delay lines
     delay_ct: DelayBuffer          # carries L5 spikes \u2192 thalamus CT drive
@@ -224,6 +298,8 @@ def init_minimal_brain_params(
     )
     osc_p = init_oscillator_params()
     nm_p = init_neuromodulator_params(ctx)
+    rcp = init_receptor_params()
+    attn_p = init_attention_params(ctx)
 
     # Inter-region projection weights (half-normal, small)
     master = jax.random.PRNGKey(seed)
@@ -240,11 +316,14 @@ def init_minimal_brain_params(
     d_mossy = max(1, int(round(delay_mossy_ms / ctx.dt)))
 
     f = lambda x: jnp.asarray(x, DTYPE)
+    cortex_density = jnp.asarray(CORTEX_DEFAULT_DENSITY, DTYPE)
     return MinimalBrainParams(
         thalamus_relay=tr_p, thalamus_trn=trn_p,
         cortex=cx_p, cerebellum=cb_p,
-        oscillator=osc_p, neuromodulator=nm_p,
+        oscillator=osc_p, neuromodulator=nm_p, receptor=rcp,
+        attention=attn_p,
         w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy,
+        cortex_receptor_density=cortex_density,
         phase_offset_thalamus=f(phase_offsets_rad[0]),
         phase_offset_cortex=f(phase_offsets_rad[1]),
         phase_offset_cerebellum=f(phase_offsets_rad[2]),
@@ -256,13 +335,16 @@ def init_minimal_brain_state(
     key: PRNGKey, params: MinimalBrainParams, *, dtype=DTYPE,
 ) -> MinimalBrainState:
     """Zero-initialised region states + delay buffers."""
-    k_tr, k_trn, k_cx, k_cb = split_key(key, 4)
+    k_tr, k_trn, k_cx, k_cb, k_attn = split_key(key, 5)
     tr_s = init_relay_state(k_tr, params.thalamus_relay)
     trn_s = init_trn_state(k_trn, params.thalamus_trn)
     cx_s = init_cortical_area_state(k_cx, params.cortex)
     cb_s = init_cerebellum_state(k_cb, params.cerebellum)
     osc_s = init_oscillator_state()
     nm_s = init_neuromodulator_state(params.neuromodulator)
+    attn_s = init_attention_state(
+        k_attn, n_assoc=params.cortex.n_l5, n_columns=params.thalamus_relay.n_tc,
+    )
 
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
@@ -270,6 +352,7 @@ def init_minimal_brain_state(
         thalamus_relay=tr_s, thalamus_trn=trn_s,
         cortex=cx_s, cerebellum=cb_s,
         oscillator=osc_s, neuromodulator=nm_s,
+        attention=attn_s,
         delay_ct=init_delay_buffer(n_ct, params.delay_ct_steps, dtype=dtype),
         delay_mossy=init_delay_buffer(
             mossy_size, params.delay_mossy_steps, dtype=dtype,
@@ -294,6 +377,8 @@ def minimal_brain_step(
     novelty: float | Array | None = None,
     apply_cortex_stdp: bool = True,
     apply_cerebellum_update: bool = True,
+    efference_copy: Array | None = None,
+    w_efference_mossy: Array | None = None,
 ) -> MinimalBrainOutput:
     """One ``dt`` of the MinimalBrain wiring.
 
@@ -331,22 +416,46 @@ def minimal_brain_step(
     # head slot. We'll handle this with a second push below.
 
     # ---- 3. Thalamus ----
+    # Top-down attention gate: previous step's cortex L5 rate →
+    # per-TC afferent gain (Saalmann 2012 pulvinar; Reynolds & Heeger
+    # 2009 divisive norm).  Bottom-up saliency would need a per-TC
+    # error signal; omitted here (the TC count does not match the PE
+    # column count).  Can be added via a learned projection later.
+    attn_out = attention_step(
+        state.attention, params.attention,
+        assoc_activity=state.cortex.rate_l5,
+        bottom_up_errors=None,
+        global_ach=state.neuromodulator.acetylcholine,
+        ne_level=state.neuromodulator.noradrenaline,
+    )
+
     thal = thalamic_step(
         state.thalamus_relay, params.thalamus_relay,
         state.thalamus_trn, params.thalamus_trn,
         ctx, sensory, ct_delayed,
         ach=state.neuromodulator.acetylcholine,
         ne=state.neuromodulator.noradrenaline,
+        afferent_gain=attn_out.gains,
     )
 
     # ---- 4. Cortex ----
+    cortex_gain = _region_receptor_gain(
+        params.receptor, state.neuromodulator, params.neuromodulator,
+        params.cortex_receptor_density,
+    )
+    # Theta-phase excitability (Lakatos 2008): 1 + 0.1·cos(θ + φ_cortex).
+    # Peak excitability at θ=−φ_cortex (encoding phase), trough at θ=π−φ_cortex.
+    theta_exc = jnp.asarray(1.0, DTYPE) + jnp.asarray(0.1, DTYPE) * jnp.cos(
+        new_osc.theta_phase + params.phase_offset_cortex
+    )
     cx_inputs = CorticalInputs(
         ff_input=thal.relay_spikes,
         td_prediction=None,
         ach=state.neuromodulator.acetylcholine,
         da=state.neuromodulator.dopamine,
         ne=state.neuromodulator.noradrenaline,
-        receptor_gain=jnp.asarray(1.0, DTYPE),
+        receptor_gain=cortex_gain,
+        excitability_mod=theta_exc,
     )
     cx_out = cortical_area_step(
         state.cortex, params.cortex, ctx, cx_inputs,
@@ -375,6 +484,16 @@ def minimal_brain_step(
     # Cleaner: skip the placeholder push above and inline it here.
     l5_new_ct_drive = cx_out.l5_spikes @ params.w_l5_ct
     l5_new_mossy_drive = cx_out.l5_rate @ params.w_l5_mossy
+
+    # Wolpert (1998): the cerebellum receives an *efference copy* of the
+    # motor command as a mossy afferent, enabling forward-model learning
+    # on the actual command issued (rather than inferring it from L5
+    # post-hoc).  Passed by the caller (ActionBrain) as a one-hot vector
+    # of body \u2295 saccade; silent in MinimalBrain where no body exists.
+    if (efference_copy is not None) and (w_efference_mossy is not None):
+        l5_new_mossy_drive = l5_new_mossy_drive + (
+            efference_copy.astype(DTYPE) @ w_efference_mossy.astype(DTYPE)
+        )
 
     pre_head_ct = state.delay_ct.head
     pre_head_mossy = state.delay_mossy.head
@@ -407,6 +526,7 @@ def minimal_brain_step(
         cerebellum=cb_state_final,
         oscillator=new_osc,
         neuromodulator=nm_new,
+        attention=attn_out.state,
         delay_ct=delay_ct_final,
         delay_mossy=delay_mossy_final,
     )
@@ -501,6 +621,11 @@ from .world_model import (
     init_world_model_params, init_world_model_state,
     wm_predict, wm_update, wm_curiosity_signal, wm_reset_transient,
 )
+from .pfc import (
+    PFCParams, PFCState,
+    init_pfc_params, init_pfc_state,
+    pfc_step, pfc_select_reset,
+)
 
 
 # ---------------------------------------------------------------------
@@ -559,18 +684,29 @@ class ActionBrainParams(eqx.Module):
     cerebellum: CerebellumParams
     oscillator: OscillatorParams
     neuromodulator: NeuromodulatorParams
+    receptor: ReceptorParams
+    attention: AttentionParams
     critic: CriticParams
     actor_body: ActorParams
     actor_saccade: ActorParams
     vta: VTAParams
     world_model: WorldModelParams
+    pfc: PFCParams
 
     # Inter-region projections (L5 → CT drive, L5 → mossy fibre)
     w_l5_ct: Array              # (n_l5, n_ct)
     w_l5_mossy: Array           # (n_l5, mossy_size)
 
+    # Wolpert 1998 efference copy: motor command (body \u2295 saccade one-hot)
+    # routed directly into cerebellum mossy fibres for forward-model
+    # learning.  Shape ``(n_body + n_saccade, mossy_size)``.
+    w_efference_mossy: Array
+
     # Inferior-olive proxy: sensory PE → climbing fibres (Purkinje)
     w_io_pc: Array              # (sensory_size, n_purkinje)
+
+    # Receptor densities along RECEPTOR_ORDER
+    cortex_receptor_density: Array
 
     # Traveling-wave phase offsets (radians)
     phase_offset_thalamus: Array
@@ -580,6 +716,7 @@ class ActionBrainParams(eqx.Module):
     # Intrinsic-drive coefficients (paper-documented, not task-tuned)
     beta_curiosity: Array       # Pathak 2017 ICM lower bound
     beta_homeostasis: Array     # Keramati & Gutkin 2014
+    beta_saccade: Array         # Itti & Baldi 2009 info-gain on saccade actor
 
     # Static
     n_body_actions: int = eqx.field(static=True)
@@ -604,6 +741,8 @@ class ActionBrainState(eqx.Module):
     actor_saccade: ActorState
     vta: VTAState
     world_model: WorldModelState
+    pfc: PFCState
+    attention: AttentionState
 
     delay_ct: DelayBuffer
     delay_mossy: DelayBuffer
@@ -620,6 +759,7 @@ class ActionBrainState(eqx.Module):
     last_sensory: Array              # (sensory_size,)
     last_rpe: Array                  # scalar — diagnostic only
     last_total_reward: Array         # scalar — diagnostic only
+    last_info_gain: Array            # scalar — saccade info-gain, diagnostic
 
 
 class ActionBrainOutput(NamedTuple):
@@ -676,6 +816,7 @@ def init_action_brain_params(
     # intrinsic drives (paper-grounded, not task-tuned)
     beta_curiosity: float = 0.1,
     beta_homeostasis: float = 0.05,
+    beta_saccade: float = 0.05,     # Itti & Baldi 2009 info-gain weight
     seed: int = 0,
 ) -> ActionBrainParams:
     """Build an ActionBrain params pytree.
@@ -707,8 +848,14 @@ def init_action_brain_params(
     )
     osc_p = init_oscillator_params()
     nm_p = init_neuromodulator_params(ctx)
+    rcp = init_receptor_params()
+    attn_p = init_attention_params(ctx)
 
-    state_size = cortex_n_l23_state + sensory_size
+    # PFC: persistent content attractor biasing BG (Frank & Badre 2012).
+    # Reads cortex L2/3 belief; output rate projected to striatum.
+    pfc_p = init_pfc_params(ctx, input_size=cortex_n_l23_state)
+
+    state_size = cortex_n_l23_state + sensory_size + pfc_p.n_content
     critic_p = init_critic_params(
         ctx, state_size=state_size, hidden_size=critic_hidden,
     )
@@ -731,7 +878,7 @@ def init_action_brain_params(
     )
 
     master = jax.random.PRNGKey(seed)
-    k1, k2, k3 = split_key(master, 3)
+    k1, k2, k3, k4 = split_key(master, 4)
     w_l5_ct = jnp.abs(
         jax.random.normal(k1, (cortex_n_l5, n_ct), dtype=DTYPE)
     ) * jnp.asarray(w_l5_ct_mean, DTYPE)
@@ -741,25 +888,39 @@ def init_action_brain_params(
     w_io_pc = jax.random.normal(
         k3, (sensory_size, cerebellum_n_purkinje), dtype=DTYPE,
     ) * jnp.asarray(w_io_pc_sigma, DTYPE)
+    # Wolpert 1998: efference copy projection onto mossy fibres.
+    # Sparse-positive random (same scale as L5\u2192mossy) so that one-hot
+    # motor commands inject a bounded afferent pulse without dominating
+    # the cortical drive.  Shape: (body + saccade, mossy_size).
+    n_efference = int(n_body_actions + n_saccade_actions)
+    w_efference_mossy = jnp.abs(
+        jax.random.normal(k4, (n_efference, mossy_size), dtype=DTYPE)
+    ) * jnp.asarray(w_l5_mossy_mean, DTYPE)
 
     d_ct = max(1, int(round(delay_ct_ms / ctx.dt)))
     d_mossy = max(1, int(round(delay_mossy_ms / ctx.dt)))
 
     f = lambda x: jnp.asarray(x, DTYPE)
+    cortex_density = jnp.asarray(CORTEX_DEFAULT_DENSITY, DTYPE)
     return ActionBrainParams(
         thalamus_relay=tr_p, thalamus_trn=trn_p,
         cortex=cx_p, cerebellum=cb_p,
-        oscillator=osc_p, neuromodulator=nm_p,
+        oscillator=osc_p, neuromodulator=nm_p, receptor=rcp,
+        attention=attn_p,
         critic=critic_p,
         actor_body=actor_body_p,
         actor_saccade=actor_saccade_p,
         vta=vta_p, world_model=wm_p,
+        pfc=pfc_p,
         w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy, w_io_pc=w_io_pc,
+        w_efference_mossy=w_efference_mossy,
+        cortex_receptor_density=cortex_density,
         phase_offset_thalamus=f(phase_offsets_rad[0]),
         phase_offset_cortex=f(phase_offsets_rad[1]),
         phase_offset_cerebellum=f(phase_offsets_rad[2]),
         beta_curiosity=f(beta_curiosity),
         beta_homeostasis=f(beta_homeostasis),
+        beta_saccade=f(beta_saccade),
         n_body_actions=int(n_body_actions),
         n_saccade_actions=int(n_saccade_actions),
         sensory_size=int(sensory_size),
@@ -771,7 +932,7 @@ def init_action_brain_params(
 def init_action_brain_state(
     key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
 ) -> ActionBrainState:
-    keys = split_key(key, 9)
+    keys = split_key(key, 11)
     tr_s = init_relay_state(keys[0], params.thalamus_relay)
     trn_s = init_trn_state(keys[1], params.thalamus_trn)
     cx_s = init_cortical_area_state(keys[2], params.cortex)
@@ -783,6 +944,12 @@ def init_action_brain_state(
     actor_saccade_s = init_actor_state(keys[6], params.actor_saccade)
     vta_s = init_vta_state(keys[7], params.vta)
     wm_s = init_world_model_state(keys[8], params.world_model)
+    pfc_s = init_pfc_state(keys[9], params.pfc)
+    attn_s = init_attention_state(
+        keys[10],
+        n_assoc=params.cortex.n_l5,
+        n_columns=params.thalamus_relay.n_tc,
+    )
 
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
@@ -794,6 +961,8 @@ def init_action_brain_state(
         actor_body=actor_body_s,
         actor_saccade=actor_saccade_s,
         vta=vta_s, world_model=wm_s,
+        pfc=pfc_s,
+        attention=attn_s,
         delay_ct=init_delay_buffer(n_ct, params.delay_ct_steps, dtype=dtype),
         delay_mossy=init_delay_buffer(
             mossy_size, params.delay_mossy_steps, dtype=dtype,
@@ -805,6 +974,7 @@ def init_action_brain_state(
         last_sensory=jnp.zeros(params.sensory_size, dtype),
         last_rpe=jnp.asarray(0.0, dtype),
         last_total_reward=jnp.asarray(0.0, dtype),
+        last_info_gain=jnp.asarray(0.0, dtype),
     )
 
 
@@ -820,6 +990,7 @@ def _perceive_substep(
     sensory: Array,
     td_error: Array,
     novelty: Array,
+    key: PRNGKey,
 ) -> tuple[ActionBrainState, tuple[Array, Array, Array]]:
     """One ``dt`` of perception: thalamus, cortex, cerebellum, critic,
     actor, world-model prediction, neuromodulator.
@@ -837,6 +1008,7 @@ def _perceive_substep(
         thalamus_trn=state.thalamus_trn,
         cortex=state.cortex, cerebellum=state.cerebellum,
         oscillator=state.oscillator, neuromodulator=state.neuromodulator,
+        attention=state.attention,
         delay_ct=state.delay_ct, delay_mossy=state.delay_mossy,
     )
     mb_params = MinimalBrainParams(
@@ -844,7 +1016,10 @@ def _perceive_substep(
         thalamus_trn=params.thalamus_trn,
         cortex=params.cortex, cerebellum=params.cerebellum,
         oscillator=params.oscillator, neuromodulator=params.neuromodulator,
+        receptor=params.receptor,
+        attention=params.attention,
         w_l5_ct=params.w_l5_ct, w_l5_mossy=params.w_l5_mossy,
+        cortex_receptor_density=params.cortex_receptor_density,
         phase_offset_thalamus=params.phase_offset_thalamus,
         phase_offset_cortex=params.phase_offset_cortex,
         phase_offset_cerebellum=params.phase_offset_cerebellum,
@@ -859,14 +1034,37 @@ def _perceive_substep(
         novelty=novelty,                      # ACh tracks curiosity
         apply_cortex_stdp=True,
         apply_cerebellum_update=False,        # no IO signal during perceive
+        efference_copy=jnp.concatenate(
+            [state.last_body_action, state.last_saccade_action], axis=0,
+        ),
+        w_efference_mossy=params.w_efference_mossy,
+    )
+
+    # PFC: persistent content slot reading L2/3 belief.  Frank & Badre
+    # (2012): PFC biases BG action selection with a slower-than-cortex
+    # attractor.  Theta-phase gating (Hasselmo 2005) uses the same
+    # cortex phase offset — PFC is a peer-area to sensory cortex.
+    k_pfc, _ = split_key(key, 2)
+    pfc_out = pfc_step(
+        state.pfc, params.pfc, ctx,
+        cortex_belief=mb_out.cortex_belief,
+        ach=mb_out.neuromod.acetylcholine,
+        da=mb_out.neuromod.dopamine,
+        key=k_pfc,
+        theta_phase=mb_out.state.oscillator.theta_phase,
+        phase_offset=params.phase_offset_cortex,
     )
 
     # BG critic/actor read cortico-thalamic convergent drive: cortex
     # L2/3 belief (continuous rate) concatenated with the raw sensory
-    # afferent vector. This models the parallel thalamostriatal
+    # afferent vector, plus the PFC content rate (Frank & Badre 2012
+    # hierarchical gating).  This models the parallel thalamostriatal
     # pathway (Smith 2004; McFarland & Haber 2002) that bypasses cortex
-    # and lets striatum learn directly from subcortical sensory input.
-    striatal_drive = jnp.concatenate([mb_out.cortex_belief, sensory], axis=0)
+    # and lets striatum learn directly from subcortical sensory input,
+    # while PFC provides slow goal/context bias.
+    striatal_drive = jnp.concatenate(
+        [mb_out.cortex_belief, sensory, pfc_out.content_rate], axis=0,
+    )
     critic_out = critic_step(
         state.critic, params.critic, ctx, striatal_drive,
     )
@@ -914,6 +1112,8 @@ def _perceive_substep(
         actor_saccade=saccade_out.state,
         vta=state.vta,
         world_model=wm_out.state,
+        pfc=pfc_out.state,
+        attention=mb_out.state.attention,
         delay_ct=mb_out.state.delay_ct,
         delay_mossy=mb_out.state.delay_mossy,
         last_body_action=state.last_body_action,
@@ -923,6 +1123,7 @@ def _perceive_substep(
         last_sensory=state.last_sensory,
         last_rpe=state.last_rpe,
         last_total_reward=state.last_total_reward,
+        last_info_gain=state.last_info_gain,
     ), (mb_out.cortex_belief, mb_out.cortex_l5_rate, mb_out.relay_spikes)
 
 
@@ -939,6 +1140,8 @@ def action_brain_step(
     prev_reward: float | Array,
     prev_done: float | Array,
     key: PRNGKey,
+    *,
+    info_gain: float | Array = 0.0,
 ) -> ActionBrainOutput:
     """Run one full decision cycle on sensory ``s_{t+1}``.
 
@@ -949,6 +1152,12 @@ def action_brain_step(
       * ``prev_done``    : terminal flag for the transition.
       * ``key``          : PRNG for action sampling (independently
         split between the body-actor and saccade-actor tie-breaks).
+      * ``info_gain``    : scalar Itti & Baldi (2009) Bayesian surprise
+        reduction from the saccade, typically
+        ``max(prev_v1_pe - current_v1_pe, 0)`` when a ``SensoryStack``
+        wraps the body; default ``0.0`` when no stack is used.
+        Routed ONLY to the saccade actor (Tatler 2011 active sampling
+        — body actor is reward-driven, saccade actor is info-driven).
 
     Output:
       * ``body_action``    : the newly committed skeletomotor command.
@@ -968,6 +1177,15 @@ def action_brain_step(
     """
     r_ext = jnp.asarray(prev_reward, DTYPE)
     done = jnp.asarray(prev_done, DTYPE)
+
+    # --- 0. Conditional PFC reset on episode boundary.  Biologically:
+    # when a task episode ends, PFC abandons the current goal/context
+    # attractor and returns to baseline (Fuster 2001).  JAX-safe via
+    # elementwise ``where`` — no Python branch.
+    state = eqx.tree_at(
+        lambda s: s.pfc, state,
+        pfc_select_reset(state.pfc, params.pfc, done),
+    )
 
     # --- 1. Perceive s_{t+1} first so critic.activation = V(s_{t+1}).
     # Clear BG evidence on BOTH parallel loops at the start of a new
@@ -989,15 +1207,21 @@ def action_brain_step(
     prev_rpe = state.last_rpe
     prev_curiosity = wm_curiosity_signal(state.world_model, params.world_model)
 
-    def scan_body(st: ActionBrainState, _):
+    # Split keys: one per perception substep (PFC gate needs membrane
+    # noise each dt), plus two for action selection at the end.
+    k_scan, k_body, k_saccade = split_key(key, 3)
+    substep_keys = jax.random.split(k_scan, params.substeps)
+
+    def scan_body(st: ActionBrainState, step_key):
         new_st, readouts = _perceive_substep(
             st, params, ctx, sensory,
             td_error=prev_rpe, novelty=prev_curiosity,
+            key=step_key,
         )
         return new_st, readouts
 
     state, readouts_hist = jax.lax.scan(
-        scan_body, state, None, length=params.substeps,
+        scan_body, state, substep_keys,
     )
     belief_hist, l5_rate_hist, relay_hist = readouts_hist
     cortex_belief = belief_hist[-1]
@@ -1054,8 +1278,17 @@ def action_brain_step(
         state.actor_body, params.actor_body, rpe,
         state.last_body_action_id,
     )
+    # Saccade actor RPE is augmented by β_saccade·info_gain.  Itti &
+    # Baldi (2009): orienting is driven by Bayesian surprise, which is
+    # orthogonal to extrinsic reward — so we add it only to the
+    # eye-movement loop.  Routing via separate TD keeps credit
+    # assignment clean (body actor stays reward-driven; saccade actor
+    # becomes information-driven).  No eligibility masking needed:
+    # each actor maintains its own traces gated by its own actions.
+    ig = jnp.asarray(info_gain, DTYPE)
+    rpe_saccade = rpe + params.beta_saccade * ig
     actor_saccade_state = actor_update(
-        state.actor_saccade, params.actor_saccade, rpe,
+        state.actor_saccade, params.actor_saccade, rpe_saccade,
         state.last_saccade_action_id,
     )
 
@@ -1064,8 +1297,8 @@ def action_brain_step(
 
     # --- 4. Select a_{t+1} from each loop's evidence accumulated in
     #     the scan. Independent PRNG keys so tie-breaking in one loop
-    #     does not correlate with the other.
-    k_body, k_saccade = split_key(key, 2)
+    #     does not correlate with the other. ``k_body`` / ``k_saccade``
+    #     were pre-split at the top of this function.
     body_action_id = actor_select_action(
         actor_body_state, params.actor_body, k_body,
     )
@@ -1093,6 +1326,8 @@ def action_brain_step(
         actor_saccade=actor_saccade_state,
         vta=vta_state,
         world_model=wm_out.state,
+        pfc=state.pfc,
+        attention=state.attention,
         delay_ct=state.delay_ct, delay_mossy=state.delay_mossy,
         last_body_action=body_action_oh,
         last_body_action_id=body_action_id,
@@ -1101,6 +1336,7 @@ def action_brain_step(
         last_sensory=sensory.astype(DTYPE),
         last_rpe=rpe,
         last_total_reward=r_total,
+        last_info_gain=ig,
     )
 
     return ActionBrainOutput(

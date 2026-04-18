@@ -47,8 +47,15 @@ import jax
 import jax.numpy as jnp
 
 from .backend import DTYPE, Array, PRNGKey, BackendContext, split_key
-from .state import NeuronParams, NeuronState, init_neuron_state
-from .neuron import init_neuron_params, neuron_step
+from .state import NeuronParams, NeuronState, init_neuron_state, AstrocyteState
+from .neuron import init_neuron_params, neuron_step, AstroMod
+from .astrocyte import (
+    AstrocyteParams, init_astrocyte_params,
+    astrocyte_step, aggregate_to_zones,
+    threshold_shift as astro_threshold_shift,
+    leak_gain as astro_leak_gain,
+)
+from .state import init_astrocyte_state
 from .interneuron import (
     IPoolParams, IPoolState, init_ipool_params, init_ipool_state,
     ipool_step, ipool_reset_transient,
@@ -90,12 +97,21 @@ class CorticalAreaParams(eqx.Module):
     rate_decay_l4: Array
     rate_decay_l5: Array
 
+    # Astrocyte field (Ca²⁺/D-Ser/ATP) — shared by L4/L5 via zone mapping.
+    # Models tripartite synapse (Araque 2014) + metabolic coupling
+    # (Attwell & Laughlin 2001). ATP depletion raises V_T / g_L so
+    # sustained activity self-throttles; regen happens on quiet/rest.
+    astrocyte: AstrocyteParams
+    l4_zone_idx: Array          # (n_l4,) int32 — neuron → zone
+    l5_zone_idx: Array          # (n_l5,) int32
+
     # Sizes (static)
     input_size: int = eqx.field(static=True)
     n_l4: int = eqx.field(static=True)
     n_l23_state: int = eqx.field(static=True)
     n_l23_error: int = eqx.field(static=True)
     n_l5: int = eqx.field(static=True)
+    n_zones: int = eqx.field(static=True)
     l4_target_sparsity: float = eqx.field(static=True)
     l5_target_sparsity: float = eqx.field(static=True)
 
@@ -124,6 +140,9 @@ class CorticalAreaState(eqx.Module):
     x_pre_l5: Array           # (n_l23_state,) i.e. L2/3 state rate trace
     x_post_l5: Array          # (n_l5,)
 
+    # Astrocyte field state (per zone)
+    astrocyte: AstrocyteState
+
 
 class CorticalInputs(NamedTuple):
     """Per-step drives to a cortical area.
@@ -131,6 +150,10 @@ class CorticalInputs(NamedTuple):
     ``ff_input`` is treated as an excitatory drive (spike vector or rate
     vector in [0, 1]). ``td_prediction`` is a pre-projected (n_l23_state,)
     array injected into L2/3 via ``en_receive_prediction``.
+
+    ``excitability_mod`` is a scalar multiplier on synaptic conductance
+    (multiplicatively combined with receptor_gain / cond_scale); feed it
+    ``1 + amp·cos(theta_phase)`` for theta-phase gating (Lakatos 2008).
     """
 
     ff_input: Array
@@ -139,6 +162,7 @@ class CorticalInputs(NamedTuple):
     da: Array | float = 0.5
     ne: Array | float = 0.5
     receptor_gain: Array | float = 1.0
+    excitability_mod: Array | float = 1.0
 
 
 class CorticalOutput(NamedTuple):
@@ -214,6 +238,7 @@ def init_cortical_area_params(
     n_l23_state: int = 128,
     n_l23_error: int = 128,
     n_l5: int = 64,
+    n_zones: int = 8,
     tau_m_l4: float = 20.0,
     tau_m_l5: float = 25.0,
     l4_target_sparsity: float = 0.1,
@@ -279,11 +304,15 @@ def init_cortical_area_params(
         ampa_frac=f(ampa_frac),
         rate_decay_l4=f(ctx.decay(tau_rate)),
         rate_decay_l5=f(ctx.decay(tau_rate)),
+        astrocyte=init_astrocyte_params(ctx),
+        l4_zone_idx=(jnp.arange(n_l4) * n_zones // n_l4).astype(jnp.int32),
+        l5_zone_idx=(jnp.arange(n_l5) * n_zones // n_l5).astype(jnp.int32),
         input_size=input_size,
         n_l4=n_l4,
         n_l23_state=n_l23_state,
         n_l23_error=n_l23_error,
         n_l5=n_l5,
+        n_zones=int(n_zones),
         l4_target_sparsity=float(l4_target_sparsity),
         l5_target_sparsity=float(l5_target_sparsity),
     )
@@ -328,6 +357,10 @@ def init_cortical_area_state(
         x_post_l4=z(params.n_l4),
         x_pre_l5=z(params.n_l23_state),
         x_post_l5=z(params.n_l5),
+        astrocyte=init_astrocyte_state(
+            params.n_zones, atp_max=float(params.astrocyte.atp_max),
+            dtype=dtype,
+        ),
     )
 
 
@@ -342,6 +375,7 @@ def _pop_step(
     pre: Array, w_in: Array, g_nmda: Array,
     *, cond_scale: Array, ampa_frac: Array, nmda_decay: Array,
     e_exc: Array, receptor_gain: Array, apply_stdp_ipool: bool,
+    astro: AstroMod | None = None,
 ):
     """Shared AdEx+IPool block used by L4 and L5.
 
@@ -355,7 +389,9 @@ def _pop_step(
     g_syn = ampa_frac * g_total + (1.0 - ampa_frac) * g_nmda_new * mg
     i_syn = g_syn * (e_exc - nstate.v)
 
-    new_n, spikes = neuron_step(nstate, ncfg, ctx, i_syn=i_syn, g_syn=g_syn)
+    new_n, spikes = neuron_step(
+        nstate, ncfg, ctx, i_syn=i_syn, g_syn=g_syn, astro=astro,
+    )
     ip_out = ipool_step(
         ipool_state, ipool_params, ctx, spikes, new_n.v,
         apply_stdp=apply_stdp_ipool,
@@ -384,7 +420,29 @@ def cortical_area_step(
     """
     ff = inputs.ff_input.astype(DTYPE)
     rg = jnp.asarray(inputs.receptor_gain, DTYPE)
+    # Theta-phase excitability gate (Lakatos 2008). Multiplicative on
+    # synaptic conductance — cheaper than per-neuron V_T shift and
+    # structurally equivalent at small amplitude (±10%).
+    exc_mod = jnp.asarray(inputs.excitability_mod, DTYPE)
+    rg_eff = rg * exc_mod
     ach = jnp.asarray(inputs.ach, DTYPE)
+
+    # -- Astrocyte → per-neuron V_T / g_L modulation (Krok 1.3).
+    # Uses PREVIOUS astrocyte state (slow dynamics, t_d-serine ~200ms,
+    # t_ATP ~200s); this avoids circular self-reference and matches
+    # biology (glia integrate over seconds, neurons fire in ms).
+    astro_state = state.astrocyte
+    astro_p = params.astrocyte
+    t_shift = astro_threshold_shift(astro_state, astro_p)  # (n_zones,)
+    l_gain = astro_leak_gain(astro_state, astro_p)
+    l4_astro = AstroMod(
+        threshold_shift=t_shift[params.l4_zone_idx],
+        leak_gain=l_gain[params.l4_zone_idx],
+    )
+    l5_astro = AstroMod(
+        threshold_shift=t_shift[params.l5_zone_idx],
+        leak_gain=l_gain[params.l5_zone_idx],
+    )
 
     # -- optional TD feedback injection --
     l23_state = state.l23
@@ -397,7 +455,7 @@ def cortical_area_step(
         pre=ff, w_in=state.w_l4_in, g_nmda=state.g_nmda_l4,
         cond_scale=params.l4_cond_scale, ampa_frac=params.ampa_frac,
         nmda_decay=params.nmda_decay, e_exc=params.e_exc,
-        receptor_gain=rg, apply_stdp_ipool=apply_stdp,
+        receptor_gain=rg_eff, apply_stdp_ipool=apply_stdp, astro=l4_astro,
     )
 
     # -- (2) L2/3 PC --
@@ -414,7 +472,7 @@ def cortical_area_step(
         pre=l23_state_drive, w_in=state.w_l23_l5, g_nmda=state.g_nmda_l5,
         cond_scale=params.l5_cond_scale, ampa_frac=params.ampa_frac,
         nmda_decay=params.nmda_decay, e_exc=params.e_exc,
-        receptor_gain=rg, apply_stdp_ipool=apply_stdp,
+        receptor_gain=rg_eff, apply_stdp_ipool=apply_stdp, astro=l5_astro,
     )
 
     # -- (4) Rate EMAs --
@@ -431,6 +489,15 @@ def cortical_area_step(
     x_pre_l5 = state.x_pre_l5 * tr_a + l23_state_drive
     x_post_l5 = state.x_post_l5 * tr_a + l5_spk
 
+    # -- (6) Astrocyte update (aggregate L4+L5 zone activity → Ca/DS/ATP) --
+    # Sum of L4 & L5 contributions per zone (L4 = input drive, L5 = deep
+    # output — both consume ATP; L2/3 excluded: error neurons integrate
+    # but are driven by L4, accounted for via downstream spike cost).
+    l4_zone = aggregate_to_zones(l4_spk, params.l4_zone_idx, params.n_zones)
+    l5_zone = aggregate_to_zones(l5_spk, params.l5_zone_idx, params.n_zones)
+    zone_rates = l4_zone + l5_zone
+    astro_new = astrocyte_step(state.astrocyte, astro_p, ctx, zone_rates)
+
     new_state = CorticalAreaState(
         l4_nstate=l4_n, l4_ipool=l4_ip, w_l4_in=state.w_l4_in,
         g_nmda_l4=l4_g_nmda, rate_l4=rate_l4,
@@ -439,6 +506,7 @@ def cortical_area_step(
         g_nmda_l5=l5_g_nmda, rate_l5=rate_l5,
         x_pre_l4=x_pre_l4, x_post_l4=x_post_l4,
         x_pre_l5=x_pre_l5, x_post_l5=x_post_l5,
+        astrocyte=astro_new,
     )
 
     ff_out = en_prediction_error_rate(en_out.state)  # L2/3 error rate
@@ -518,4 +586,7 @@ def cortical_area_reset_transient(
         x_post_l4=z(params.n_l4),
         x_pre_l5=z(params.n_l23_state),
         x_post_l5=z(params.n_l5),
+        astrocyte=init_astrocyte_state(
+            params.n_zones, atp_max=float(params.astrocyte.atp_max),
+        ),
     )

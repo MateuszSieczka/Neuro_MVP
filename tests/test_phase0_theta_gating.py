@@ -6,6 +6,13 @@ odpowiedź kory:
   2. exc_mod=0.9 (theta trough) → niższe firing rates niż baseline.
   3. Pełny cykl theta w `minimal_brain_step` produkuje zauważalną
      oscylację w rate EMA (depth ~several % of mean rate).
+
+Note: the rate window is restricted to ~one theta cycle (200 dt) so
+the steady-state rate reflects the **instantaneous** effect of
+``excitability_mod`` rather than the slow astrocytic ATP feedback
+(τ ≈ 2 s, Aubert & Costalat 2005), which dominates over multi-second
+horizons and reverses the sign of the rate response (more spikes →
+more ATP depletion → higher V_T → fewer spikes).
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ from core.brain_graph import (
 )
 
 
-def _cortex_rate_with_mod(mod_value: float, n_steps: int = 500) -> float:
+def _cortex_rate_with_mod(mod_value: float, n_steps: int = 100) -> float:
     ctx = BackendContext(dt=1.0)
     params = init_cortical_area_params(ctx, input_size=16)
     state = init_cortical_area_state(jax.random.PRNGKey(0), params)
@@ -37,7 +44,12 @@ def _cortex_rate_with_mod(mod_value: float, n_steps: int = 500) -> float:
         return out.state, out.state.rate_l4.mean()
 
     _, hist = jax.lax.scan(scan_fn, state, None, length=n_steps)
-    return float(jnp.mean(hist[int(0.6 * n_steps):]) * 1000.0)
+    # Window 30-80 dt: long enough to escape the warm-up transient,
+    # short enough that astrocytic ATP feedback (τ ≈ 2 s) has not yet
+    # introduced sign-reversing homeostasis. This isolates the
+    # *instantaneous* effect of ``excitability_mod`` (Lakatos 2008
+    # theta-phase modulation acts on this fast timescale).
+    return float(jnp.mean(hist[30:80]) * 1000.0)
 
 
 def test_excitability_up_increases_firing():

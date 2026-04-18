@@ -5,11 +5,19 @@ Reference:
   De Pittà, Volman, Berry & Ben-Jacob (2011) — Ca²⁺ → D-Serine sigmoid.
   Araque et al. (2014) — tripartite synapse.
   Attwell & Laughlin (2001) — Na⁺/K⁺-ATPase ≈ 10⁹ ATP/spike.
+  Aubert & Costalat (2005) — fast astrocytic glycolysis (τ ≈ 2 s).
+  Rangaraju et al. (2014) — presynaptic ATP transients, seconds.
 
 State (per zone, shape ``(n_zones,)``):
     calcium   — second-messenger integrator, τ_ca ≈ 5 s
     d_serine  — gliotransmitter readout, sigmoid of Ca²⁺, τ ≈ 200 ms
-    atp       — normalised energy pool, [0, 1], τ ≈ 200 s
+    atp       — normalised **local** glial/synaptic energy pool,
+                [0, 1], τ ≈ 2 s (Aubert & Costalat 2005; Rangaraju
+                2014). NOTE: this is the *local* pool consumed by
+                active synapses, NOT the whole-brain ATP reservoir
+                (τ ≈ 200 s, Attwell 2001). At sustained 50 Hz firing
+                it reaches a dynamic equilibrium of ≈ 0.1·atp_max,
+                approached with the τ above.
 
 Outputs consumed by the neuron layer (all shape ``(n_zones,)``, then
 indexed by ``zone_idx`` when feeding ``AstroMod``):
@@ -71,8 +79,17 @@ def init_astrocyte_params(
     tau_d_serine: float = 200.0,
     gap_junction_D: float = 0.01,
     atp_max: float = 1.0,
-    atp_regen_rate: float = 5e-6,
-    atp_spike_cost: float = 1.5e-5,
+    # Local glial/synaptic ATP pool, NOT whole-brain reservoir.
+    # τ_recover = 1 / atp_regen_rate ≈ 2 s  (Aubert & Costalat 2005;
+    #   Rangaraju et al. 2014 show presynaptic ATP transients on a
+    #   seconds timescale at 10–50 Hz firing).
+    # Equilibrium ATP at firing rate r (spikes / ms) satisfies
+    #   ATP_eq = 1 − r · atp_spike_cost / atp_regen_rate.
+    # Defaults give ATP_eq ≈ 0.1 at r = 0.05 (50 Hz), reproducing the
+    # 50 Hz / 5 s depletion target in the P0.11 plan without the
+    # whole-brain timescale mismatch.
+    atp_regen_rate: float = 5e-4,
+    atp_spike_cost: float = 9e-3,
     atp_threshold_shift: float = 10.0,
     atp_leak_gain: float = 0.5,
     gain_baseline: float = 1.0,

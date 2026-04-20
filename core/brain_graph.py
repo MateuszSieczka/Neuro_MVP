@@ -675,7 +675,22 @@ SACCADE_ACTION_DIM: int = 9
 
 
 class ActionBrainParams(eqx.Module):
-    """All MinimalBrain params + two parallel BG loops + VTA + WM."""
+    """All MinimalBrain params + two parallel BG loops + VTA + WM.
+
+    Optional :attr:`sensory_stack` (Phase 0.7) wires a foveated
+    retina → LGN → V1 chain inside the brain itself.  When set, the
+    eye is treated as CNS (Rodieck 1998): :func:`action_brain_step`
+    expects ``image`` + ``fixation_xy`` kwargs and computes the V1
+    L2/3 belief as the ``sensory`` afferent for downstream regions,
+    plus a Bayesian-surprise saccade reward (Itti & Baldi 2009)
+    derived from the V1 prediction-error rate.  When ``None`` the
+    brain takes a flat ``sensory`` vector from the body, preserving
+    backward compatibility with the bandit/gridworld bodies.
+    """
+
+    # Optional sensory front-end (None = flat-sensory legacy mode).
+    # Stored as a pytree leaf-or-None; JAX/eqx handles both.
+    sensory_stack: object | None
 
     # Region modules (body-agnostic)
     thalamus_relay: RelayParams
@@ -728,7 +743,18 @@ class ActionBrainParams(eqx.Module):
 
 
 class ActionBrainState(eqx.Module):
-    """All MinimalBrain state + dual-loop BG + VTA/WM + decision bookkeeping."""
+    """All MinimalBrain state + dual-loop BG + VTA/WM + decision bookkeeping.
+
+    When :attr:`ActionBrainParams.sensory_stack` is set, :attr:`sensory_stack`
+    holds the corresponding :class:`SensoryStackState`; otherwise it is
+    ``None``.  :attr:`prev_pe_rate` is the V1 L2/3 prediction-error rate
+    from the previous decision cycle, used to compute the saccade
+    info-gain ``relu(prev_pe_rate - curr_pe_rate)`` (Itti & Baldi 2009).
+    """
+
+    # Optional sensory front-end state (paired with params.sensory_stack).
+    sensory_stack: object | None
+    prev_pe_rate: Array              # scalar — last V1 L2/3 mean error rate
 
     thalamus_relay: RelayState
     thalamus_trn: TRNState
@@ -783,6 +809,7 @@ def init_action_brain_params(
     sensory_size: int,
     n_body_actions: int,
     n_saccade_actions: int = SACCADE_ACTION_DIM,
+    sensory_stack_params: object | None = None,
     # thalamus
     n_tc: int = 64,
     n_ct: int = 32,
@@ -833,7 +860,15 @@ def init_action_brain_params(
     window (Rayner 1998 reports 200-300 ms inter-saccade intervals,
     i.e. ≥10 decision cycles per saccade — evidence accumulation is
     naturally slower for low-salience inputs).
+
+    When ``sensory_stack_params`` is provided, the effective sensory
+    afferent for thalamus / striatum / world-model is the V1 L4 rate
+    population (Hubel & Wiesel 1962 simple-cell layer; corticostriatal
+    projection — Smith 2004; Reiner 2010).  ``sensory_size`` is then
+    overridden by ``sensory_stack_params.v1.n_l4``.
     """
+    if sensory_stack_params is not None:
+        sensory_size = int(sensory_stack_params.v1.n_l4)
     tr_p = init_relay_params(
         ctx, n_afferent=sensory_size, n_tc=n_tc, n_ct=n_ct,
     )
@@ -903,6 +938,7 @@ def init_action_brain_params(
     f = lambda x: jnp.asarray(x, DTYPE)
     cortex_density = jnp.asarray(CORTEX_DEFAULT_DENSITY, DTYPE)
     return ActionBrainParams(
+        sensory_stack=sensory_stack_params,
         thalamus_relay=tr_p, thalamus_trn=trn_p,
         cortex=cx_p, cerebellum=cb_p,
         oscillator=osc_p, neuromodulator=nm_p, receptor=rcp,
@@ -932,7 +968,7 @@ def init_action_brain_params(
 def init_action_brain_state(
     key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
 ) -> ActionBrainState:
-    keys = split_key(key, 11)
+    keys = split_key(key, 12)
     tr_s = init_relay_state(keys[0], params.thalamus_relay)
     trn_s = init_trn_state(keys[1], params.thalamus_trn)
     cx_s = init_cortical_area_state(keys[2], params.cortex)
@@ -951,9 +987,20 @@ def init_action_brain_state(
         n_columns=params.thalamus_relay.n_tc,
     )
 
+    if params.sensory_stack is not None:
+        # Lazy import keeps core/sensory layered cleanly (sensory
+        # depends on core.cortex; importing it here at runtime avoids
+        # a top-level cycle).
+        from sensory.sensory_stack import init_sensory_stack_state
+        ss_s = init_sensory_stack_state(keys[11], params.sensory_stack)
+    else:
+        ss_s = None
+
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
     return ActionBrainState(
+        sensory_stack=ss_s,
+        prev_pe_rate=jnp.asarray(0.0, dtype),
         thalamus_relay=tr_s, thalamus_trn=trn_s,
         cortex=cx_s, cerebellum=cb_s,
         oscillator=osc_s, neuromodulator=nm_s,
@@ -1101,6 +1148,8 @@ def _perceive_substep(
     )
 
     return ActionBrainState(
+        sensory_stack=state.sensory_stack,
+        prev_pe_rate=state.prev_pe_rate,
         thalamus_relay=mb_out.state.thalamus_relay,
         thalamus_trn=mb_out.state.thalamus_trn,
         cortex=mb_out.state.cortex,
@@ -1136,28 +1185,41 @@ def action_brain_step(
     state: ActionBrainState,
     params: ActionBrainParams,
     ctx: BackendContext,
-    sensory: Array,
-    prev_reward: float | Array,
-    prev_done: float | Array,
-    key: PRNGKey,
+    sensory: Array | None = None,
+    prev_reward: float | Array = 0.0,
+    prev_done: float | Array = 0.0,
+    key: PRNGKey | None = None,
     *,
-    info_gain: float | Array = 0.0,
+    info_gain: float | Array | None = None,
+    image: Array | None = None,
+    fixation_xy: Array | None = None,
 ) -> ActionBrainOutput:
     """Run one full decision cycle on sensory ``s_{t+1}``.
 
-    Inputs:
-      * ``sensory``      : ``s_{t+1}`` just received from
-        ``body.act(body_action_t, saccade_action_t)``.
-      * ``prev_reward``  : ``r_t`` emitted during that transition.
-      * ``prev_done``    : terminal flag for the transition.
+    Two input modes (selected by ``params.sensory_stack``):
+
+    - **Flat-sensory** (``params.sensory_stack is None``): caller passes
+      a precomputed ``sensory`` afferent vector (e.g. the
+      :class:`embodiment.GridWorldBody` one-hot position) and an
+      explicit ``info_gain`` if any.  Backward-compatible with
+      Phase 2/3 bandit/gridworld wiring.
+    - **Foveated-vision** (``params.sensory_stack is not None``):
+      caller passes ``image`` (``(H, W)`` float32 in [0, 1]) and
+      ``fixation_xy`` (``(2,)`` in [0, 1]^2).  The brain runs the
+      retina → LGN → V1 chain itself, uses the V1 L2/3 belief as
+      the ``sensory`` afferent for downstream regions, and computes
+      ``info_gain = relu(prev_pe_rate - curr_pe_rate)`` (Itti & Baldi
+      2009 Bayesian surprise reduction) which is routed only to the
+      saccade actor.  The eye is CNS, not body (Rodieck 1998).
+
+    Inputs (common to both modes):
+      * ``prev_reward``  : ``r_t`` emitted during the prior transition.
+      * ``prev_done``    : terminal flag for that transition.
       * ``key``          : PRNG for action sampling (independently
         split between the body-actor and saccade-actor tie-breaks).
-      * ``info_gain``    : scalar Itti & Baldi (2009) Bayesian surprise
-        reduction from the saccade, typically
-        ``max(prev_v1_pe - current_v1_pe, 0)`` when a ``SensoryStack``
-        wraps the body; default ``0.0`` when no stack is used.
-        Routed ONLY to the saccade actor (Tatler 2011 active sampling
-        — body actor is reward-driven, saccade actor is info-driven).
+      * ``info_gain``    : explicit override (flat-sensory mode); when
+        ``params.sensory_stack`` is wired and the kwarg is ``None``
+        the value is computed from V1 PE delta.
 
     Output:
       * ``body_action``    : the newly committed skeletomotor command.
@@ -1175,6 +1237,81 @@ def action_brain_step(
     All operations are pure; JIT via ``jax.lax.scan`` for the substep
     loop inside perception.
     """
+    if key is None:
+        raise ValueError("action_brain_step requires an explicit PRNG key")
+
+    # --- Sensory front-end --------------------------------------------
+    # When SensoryStack is wired, the brain owns the retina/V1 chain.
+    # Run it ONCE per decision cycle (V1 STDP / belief readouts settle
+    # within a single 20-ms window; image+fixation are constant during
+    # the substep scan anyway).  The V1 belief replaces ``sensory`` and
+    # the V1 PE rate feeds saccade info-gain (Itti & Baldi 2009).
+    if params.sensory_stack is not None:
+        if image is None or fixation_xy is None:
+            raise ValueError(
+                "action_brain_step: sensory_stack is wired but "
+                "`image` / `fixation_xy` were not provided."
+            )
+        from sensory.sensory_stack import sensory_stack_step
+        # V1 integrates the foveated input across the full decision
+        # window (Schall 2002: ≈20 ms cortical evidence accumulation).
+        # Image + fixation are held constant within a single saccade
+        # — only the next decision cycle will commit a new saccade
+        # action.  Running V1 once per dt across ``substeps`` lets the
+        # AdEx population reach spiking threshold and exercise STDP
+        # (Bi & Poo 1998).
+        ach = state.neuromodulator.acetylcholine
+        da = state.neuromodulator.dopamine
+        ne = state.neuromodulator.noradrenaline
+
+        def _ss_body(ss_st, _):
+            o = sensory_stack_step(
+                ss_st, params.sensory_stack, ctx,
+                image, fixation_xy,
+                ach=ach, da=da, ne=ne, apply_stdp=True,
+            )
+            return o.state, (o.l4_rate, o.pe_rate)
+
+        new_ss_state, (l4_rate_hist, pe_hist) = jax.lax.scan(
+            _ss_body, state.sensory_stack, None, length=params.substeps,
+        )
+        # Corticostriatal afferent (Smith 2004; Reiner 2010): V1 L4 is
+        # the granular input layer where Gabor-tuned simple cells live
+        # (Hubel & Wiesel 1962) and is the V1 layer that actually fires
+        # within a single fixation window at our spike-rate scales.
+        # We average the L4 rate-EMA across the fixation (Sherman &
+        # Guillery 2002 sustained-firing relay) and renormalise to
+        # peak-1, matching the magnitude calibration of one-hot
+        # ``sensory`` afferents that ``init_actor_params`` was built
+        # against.  The L2/3 belief readout is left untouched on the
+        # ``SensoryStackOutput.belief`` channel for future predictive-
+        # coding consumers (no current downstream uses it).
+        l4_window = jnp.mean(l4_rate_hist, axis=0)
+        l4_peak = jnp.max(l4_window)
+        sensory = jnp.where(
+            l4_peak > 1e-3,
+            l4_window / (l4_peak + jnp.asarray(1e-6, DTYPE)),
+            l4_window,
+        )
+        new_pe_rate = jnp.mean(pe_hist)
+        new_pe_rate = jnp.mean(pe_hist)
+        # Bayesian-surprise reduction — positive when the current
+        # fixation made V1 "less surprised" than the previous one
+        # (Itti & Baldi 2009).
+        computed_ig = jax.nn.relu(state.prev_pe_rate - new_pe_rate)
+        if info_gain is None:
+            info_gain = computed_ig
+    else:
+        if sensory is None:
+            raise ValueError(
+                "action_brain_step: sensory_stack is None so a flat "
+                "`sensory` afferent vector is required."
+            )
+        if info_gain is None:
+            info_gain = jnp.asarray(0.0, DTYPE)
+        new_ss_state = state.sensory_stack
+        new_pe_rate = state.prev_pe_rate
+
     r_ext = jnp.asarray(prev_reward, DTYPE)
     done = jnp.asarray(prev_done, DTYPE)
 
@@ -1315,6 +1452,8 @@ def action_brain_step(
     cerebellum_nuclei = cb_state.dn_rate
 
     new_state = ActionBrainState(
+        sensory_stack=new_ss_state,
+        prev_pe_rate=new_pe_rate,
         thalamus_relay=state.thalamus_relay,
         thalamus_trn=state.thalamus_trn,
         cortex=state.cortex,

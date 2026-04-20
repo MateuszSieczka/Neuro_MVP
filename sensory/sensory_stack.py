@@ -68,7 +68,8 @@ class SensoryStackState(eqx.Module):
 
 class SensoryStackOutput(NamedTuple):
     state: SensoryStackState
-    belief: Array      # (n_l23_state,) V1 L2/3 state rate — afferent to TC
+    belief: Array      # (n_l23_state,) V1 L2/3 state rate — predictive-coding readout
+    l4_rate: Array     # (n_l4,)        V1 L4 rate EMA — corticostriatal afferent
     pe_rate: Array     # scalar — mean V1 L2/3 error rate, for info-gain
 
 
@@ -173,5 +174,6 @@ def sensory_stack_step(
     pe_rate = jnp.mean(v1_out.ff_out)
 
     return SensoryStackOutput(
-        state=new_state, belief=v1_out.belief, pe_rate=pe_rate,
+        state=new_state, belief=v1_out.belief,
+        l4_rate=v1_out.state.rate_l4, pe_rate=pe_rate,
     )

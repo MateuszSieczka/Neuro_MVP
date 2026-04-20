@@ -230,20 +230,32 @@ class VisualGridBody(eqx.Module, BodyInterface):
 
     # ----------------------------------------------------------------
 
+    def _current_image(self, pos: Array) -> Array:
+        """Return the raw ``(tex, tex)`` texture for the agent's cell.
+
+        Exposed so that the brain-side :mod:`sensory.sensory_stack`
+        (when wired into :class:`ActionBrain`) can run the retina/V1
+        pipeline itself — the eye is a CNS structure, not part of
+        the body proper (Rodieck 1998).
+        """
+        idx = pos[0] * self.size + pos[1]
+        return self.tex_bank[idx]
+
     def _observe(
         self,
         pos: Array,
         retina_state: RetinaState,
         fixation_xy: Array,
-    ) -> tuple[RetinaState, Array]:
+    ) -> tuple[RetinaState, Array, Array]:
         """Fetch the current cell's texture and run the retina on it.
 
-        Returns ``(new_retina_state, afferent_vector)``. ``fixation_xy``
-        is supplied by the caller (updated by saccades from the
-        oculomotor BG loop).
+        Returns ``(new_retina_state, afferent_vector, image)``.
+        ``fixation_xy`` is supplied by the caller (updated by saccades
+        from the oculomotor BG loop).  The raw ``image`` is also
+        returned so the brain-side ``SensoryStack`` (if wired) can
+        re-process pixels through its own retina/V1 path.
         """
-        idx = pos[0] * self.size + pos[1]
-        img = self.tex_bank[idx]                    # (tex, tex)
+        img = self._current_image(pos)              # (tex, tex)
         new_state, sample = retina_step(
             retina_state, self.retina_cfg, img, fixation_xy,
         )
@@ -251,7 +263,7 @@ class VisualGridBody(eqx.Module, BodyInterface):
         # Poisson-rate operating point the cortex expects, independent
         # of scene contrast (Shapley & Enroth-Cugell 1984).
         aff = lgn_normalize(sample.as_afferent())
-        return new_state, aff
+        return new_state, aff, img
 
     # --- BodyInterface ----------------------------------------------
 
@@ -262,7 +274,7 @@ class VisualGridBody(eqx.Module, BodyInterface):
         fix0 = jnp.asarray(FIXATION_CENTRE, DTYPE)
         # Fresh retina state (no motion across episode boundaries).
         new_retina = init_retina_state(self.retina_cfg)
-        new_retina, aff = self._observe(pos0, new_retina, fix0)
+        new_retina, aff, img0 = self._observe(pos0, new_retina, fix0)
         new_body = eqx.tree_at(
             lambda b: (b.pos, b.step_idx, b.retina_state, b.fixation_xy),
             self,
@@ -272,7 +284,9 @@ class VisualGridBody(eqx.Module, BodyInterface):
             sensory=aff,
             reward=jnp.asarray(0.0, DTYPE),
             done=jnp.asarray(0.0, DTYPE),
-            info={"pos": pos0, "fixation_xy": fix0},
+            info={
+                "pos": pos0, "fixation_xy": fix0, "image": img0,
+            },
         )
 
     def act(
@@ -290,7 +304,9 @@ class VisualGridBody(eqx.Module, BodyInterface):
         done = jnp.logical_or(on_goal, time_out).astype(DTYPE)
         reward = jnp.where(on_goal, self.goal_reward, -self.step_cost).astype(DTYPE)
         new_fix = _apply_saccade(self.fixation_xy, saccade_action)
-        new_retina, aff = self._observe(new_pos, self.retina_state, new_fix)
+        new_retina, aff, img1 = self._observe(
+            new_pos, self.retina_state, new_fix,
+        )
         new_body = eqx.tree_at(
             lambda b: (b.pos, b.step_idx, b.retina_state, b.fixation_xy),
             self,
@@ -305,5 +321,6 @@ class VisualGridBody(eqx.Module, BodyInterface):
                 "on_goal": on_goal,
                 "time_out": time_out,
                 "fixation_xy": new_fix,
+                "image": img1,
             },
         )

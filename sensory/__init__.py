@@ -54,6 +54,11 @@ from .sensory_stack import (
     init_sensory_stack_params, init_sensory_stack_state,
     sensory_stack_step,
 )
+from .proprioception import (
+    ProprioceptionParams, ProprioState,
+    init_proprioception_params, init_proprio_state,
+    proprio_encode, proprio_output_dim,
+)
 
 __all__ = [
     "RetinaConfig", "RetinalSample", "RetinaState",
@@ -67,4 +72,7 @@ __all__ = [
     "SensoryStackParams", "SensoryStackState", "SensoryStackOutput",
     "init_sensory_stack_params", "init_sensory_stack_state",
     "sensory_stack_step",
+    "ProprioceptionParams", "ProprioState",
+    "init_proprioception_params", "init_proprio_state",
+    "proprio_encode", "proprio_output_dim",
 ]

@@ -173,3 +173,40 @@ def uniform_dense(n: int, level: float | Array = 0.3) -> Array:
     """
     lvl = jnp.asarray(level, DTYPE)
     return jnp.broadcast_to(lvl, (int(n),)).astype(DTYPE)
+
+
+def discretise_joint_command(
+    joint_command: Array,
+    n_actions: int,
+) -> Array:
+    """Convert a continuous ``(motor_dim,)`` tanh-bounded joint command
+    into a discrete action id in ``[0, n_actions)``.
+
+    Phase 6A transition adapter: until MJX is wired in (Phase 6B), the
+    existing gridworld / bandit / visual_grid bodies only understand
+    discrete action ids.  We use a **sign-split argmax** over joint
+    channels (Georgopoulos 1986 directional tuning): each motor DoF
+    contributes one positive and one negative "direction", and the
+    dominant direction wins.  This doubles motor_dim channels into
+    ``2 · motor_dim`` candidate actions; the final id is clipped into
+    ``[0, n_actions)``.
+
+    This is a **pure function** — no state, no key — so it composes
+    cleanly inside JIT.
+
+    Parameters
+    ----------
+    joint_command : Array shape (motor_dim,) in [-1, 1]
+    n_actions : int
+        Discrete action space of the body.
+
+    Returns
+    -------
+    Array : int32 scalar in ``[0, n_actions)``.
+    """
+    jc = jnp.asarray(joint_command, DTYPE).reshape(-1)
+    pos = jnp.maximum(jc, 0.0)
+    neg = jnp.maximum(-jc, 0.0)
+    stacked = jnp.concatenate([pos, neg], axis=0)   # (2 * motor_dim,)
+    raw_idx = jnp.argmax(stacked)
+    return jnp.clip(raw_idx, 0, int(n_actions) - 1).astype(jnp.int32)

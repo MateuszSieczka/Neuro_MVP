@@ -181,6 +181,13 @@ from .cerebellum import (
     cerebellum_step, cerebellum_update, cerebellum_reset_transient,
 )
 
+# -- M1 (Phase 6A: continuous motor readout head) --
+from .m1 import (
+    M1Params, M1State, M1Output,
+    init_m1_params, init_m1_state,
+    m1_step, m1_learn_readout,
+)
+
 # -- Thalamus (relay nuclei + TRN) --
 from .thalamus import (
     RelayParams, RelayState, TRNParams, TRNState, ThalamicOutput,

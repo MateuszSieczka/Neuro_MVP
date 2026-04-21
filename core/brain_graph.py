@@ -49,6 +49,7 @@ import jax.numpy as jnp
 
 if TYPE_CHECKING:
     from sensory.sensory_stack import SensoryStackParams, SensoryStackState
+    from sensory.proprioception import ProprioceptionParams
 
 from .backend import DTYPE, Array, PRNGKey, BackendContext, split_key
 from .state import OscillatorState, init_oscillator_state
@@ -137,6 +138,11 @@ from .hippocampus import (
 from .learning_pipeline import (
     critic_learn_step, actors_learn_step,
     cortex_learn_step, attention_learn_step,
+)
+from .m1 import (
+    M1Params, M1State,
+    init_m1_params, init_m1_state,
+    m1_step, m1_learn_readout,
 )
 
 
@@ -440,6 +446,22 @@ class ActionBrainParams(eqx.Module):
     # ActionBrainState's signature again.
     sleep: SleepParams
 
+    # Phase 6A: continuous motor substrate.
+    # M1 is a learned linear readout on cortex L5 producing a bounded
+    # joint command (Lemon 2008; Doya 2000).  Proprioception encoder
+    # population-codes synthetic joint angles + velocities (Georgopoulos
+    # 1986; Pouget & Sejnowski 1997).  Cerebellar motor-PE is projected
+    # onto Purkinje cells via ``w_motor_pc`` (Wolpert 1998 internal
+    # forward model) and the deep-nuclei output is projected back onto
+    # the joint-command via ``w_dn_motor`` for additive M1 correction.
+    # When ``bypass_m1`` is True (default, Phase 6A regression-safe),
+    # the entire continuous path is skipped and the body receives the
+    # BG discrete action unchanged — pre-6A bit-identical behaviour.
+    m1: "M1Params"
+    proprio: "ProprioceptionParams"
+    w_motor_pc: Array              # (n_proprio_enc, n_purkinje)
+    w_dn_motor: Array              # (n_dn, motor_dim)
+
     # Static
     n_body_actions: int = eqx.field(static=True)
     n_saccade_actions: int = eqx.field(static=True)
@@ -447,6 +469,7 @@ class ActionBrainParams(eqx.Module):
     substeps: int = eqx.field(static=True)
     delay_ct_steps: int = eqx.field(static=True)
     delay_mossy_steps: int = eqx.field(static=True)
+    bypass_m1: bool = eqx.field(static=True, default=True)
 
 
 class ActionBrainState(eqx.Module):
@@ -511,6 +534,12 @@ class ActionBrainState(eqx.Module):
     # Sleep-phase state machine (Phase 5A).  Updated each cognitive
     # cycle from the cortical ATP mean (sleep pressure).
     sleep: SleepState
+
+    # Phase 6A: continuous motor substrate state.
+    m1: M1State
+    last_joint_angles: Array        # (n_joints,) synthetic proprio angles (t)
+    last_joint_velocities: Array    # (n_joints,) synthetic proprio velocities (t)
+    last_predicted_joint_angles: Array  # (n_joints,) M1 predicted angles for PE
 
 
 class ActionBrainOutput(NamedTuple):
@@ -587,6 +616,12 @@ def init_action_brain_params(
     # ``init_sleep_params``; expose a single override knob here for
     # tests that need to force a transition without long simulations.
     sleep_params: SleepParams | None = None,
+    # Phase 6A continuous motor substrate
+    n_joints: int = 2,
+    n_cells_per_joint: int = 16,
+    m1_readout_lr: float = 1e-3,
+    m1_cb_alpha: float = 0.2,
+    bypass_m1: bool = True,
 ) -> ActionBrainParams:
     """Build an ActionBrain params pytree.
 
@@ -721,6 +756,40 @@ def init_action_brain_params(
         n_motor=n_motor,
     )
     hc_p = init_hippocampus_params(input_dim=int(ec_p.output_dim))
+
+    # Phase 6A: continuous motor substrate (M1 + proprio + cerebellar
+    # motor-PE projections).  M1 readout head drives motor_dim =
+    # n_joints channels into [-1, 1]; proprioception encoder Gaussian-
+    # codes angles+velocities; fixed random projections w_motor_pc /
+    # w_dn_motor close the efference-copy loop through cerebellum.
+    from sensory.proprioception import (
+        init_proprioception_params, proprio_output_dim,
+    )
+    motor_dim = int(n_joints)
+    m1_p = init_m1_params(
+        n_l5=int(cortex_n_l5), motor_dim=motor_dim,
+        readout_lr=float(m1_readout_lr),
+        cb_alpha=float(m1_cb_alpha),
+    )
+    proprio_p = init_proprioception_params(
+        n_joints=int(n_joints),
+        n_cells_per_joint=int(n_cells_per_joint),
+    )
+    n_proprio_enc = proprio_output_dim(proprio_p)
+    k_motor_pc, k_dn_motor = split_key(jax.random.PRNGKey(seed + 1), 2)
+    # Proprioception PE → Purkinje climbing (inferior-olive motor
+    # channel; Wolpert 1998).  Same scale as ``w_io_pc`` for matched
+    # climbing-fibre magnitudes.
+    w_motor_pc = jax.random.normal(
+        k_motor_pc, (n_proprio_enc, cerebellum_n_purkinje), dtype=DTYPE,
+    ) * jnp.asarray(w_io_pc_sigma, DTYPE)
+    # Deep nuclei → motor correction vector (half-normal positive; DN
+    # output is disinhibition-driven excitatory on motor structures).
+    w_dn_motor = jnp.abs(
+        jax.random.normal(
+            k_dn_motor, (cb_p.n_dn, motor_dim), dtype=DTYPE,
+        )
+    ) / jnp.sqrt(jnp.asarray(cb_p.n_dn, DTYPE))
     return ActionBrainParams(
         sensory_stack=sensory_stack_params,
         thalamus_relay=tr_p, thalamus_trn=trn_p,
@@ -744,18 +813,23 @@ def init_action_brain_params(
         precision_info_gain_init=pc_info_gain_init,
         replay=replay_p,
         sleep=sleep_p,
+        m1=m1_p,
+        proprio=proprio_p,
+        w_motor_pc=w_motor_pc,
+        w_dn_motor=w_dn_motor,
         n_body_actions=int(n_body_actions),
         n_saccade_actions=int(n_saccade_actions),
         sensory_size=int(sensory_size),
         substeps=int(substeps),
         delay_ct_steps=d_ct, delay_mossy_steps=d_mossy,
+        bypass_m1=bool(bypass_m1),
     )
 
 
 def init_action_brain_state(
     key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
 ) -> ActionBrainState:
-    keys = split_key(key, 15)
+    keys = split_key(key, 16)
     tr_s = init_relay_state(keys[0], params.thalamus_relay)
     trn_s = init_trn_state(keys[1], params.thalamus_trn)
     cx_s = init_cortical_area_state(keys[2], params.cortex)
@@ -780,9 +854,12 @@ def init_action_brain_state(
     sleep_s = init_sleep_state(keys[12], initial_phase=SleepPhase.WAKE)
     ec_s = init_ec_state(keys[13], params.ec, dtype=dtype)
     hc_s = init_hippocampus_state(keys[14], params.hippocampus, dtype=dtype)
+    m1_s = init_m1_state(keys[15], params.m1)
 
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
+    n_joints = int(params.proprio.n_joints)
+    zero_j = jnp.zeros(n_joints, dtype)
     return ActionBrainState(
         sensory_stack=ss_s,
         prev_pe_rate=jnp.asarray(0.0, dtype),
@@ -814,6 +891,10 @@ def init_action_brain_state(
         sleep=sleep_s,
         ec=ec_s,
         hippocampus=hc_s,
+        m1=m1_s,
+        last_joint_angles=zero_j,
+        last_joint_velocities=zero_j,
+        last_predicted_joint_angles=zero_j,
     )
 
 
@@ -1021,6 +1102,10 @@ def _perceive_substep(
         sleep=state.sleep,
         ec=state.ec,
         hippocampus=state.hippocampus,
+        m1=state.m1,
+        last_joint_angles=state.last_joint_angles,
+        last_joint_velocities=state.last_joint_velocities,
+        last_predicted_joint_angles=state.last_predicted_joint_angles,
     ), (cx_out.belief, cx_out.l5_rate, thal.relay_spikes, attn_out.gains)
 
 
@@ -1197,7 +1282,49 @@ def action_brain_cognitive_step(
         ach=state.neuromodulator.acetylcholine,
     )
     sensory_pe = wm_out.prediction_error                 # (sensory_size,)
-    climbing = sensory_pe @ params.w_io_pc               # (n_purkinje,)
+    climbing_sensory = sensory_pe @ params.w_io_pc       # (n_purkinje,)
+
+    # --- 2a.2 Phase 6A: synthetic proprioception + motor PE --------
+    # Derive a pseudo-joint kinematics signal from the previously
+    # committed body action (one-hot → signed direction per joint) so
+    # the downstream M1 / cerebellum forward-model loop has an
+    # exercised data path even while the current bodies remain
+    # discrete (plan 6A.4).  Phase 6B swaps this for real MJX joint
+    # sensors without changing consumer wiring.
+    prev_body_id = state.last_body_action_id
+    proprio_p = params.proprio
+    n_joints_int = int(proprio_p.n_joints)
+    # Map action id 0..2*n_joints into per-joint signed direction
+    # (sign-split, the inverse of ``discretise_joint_command``).
+    joint_idx = jnp.mod(prev_body_id, jnp.asarray(n_joints_int, jnp.int32))
+    sign_bit = jnp.where(
+        prev_body_id >= jnp.asarray(n_joints_int, jnp.int32),
+        jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
+    )
+    one_hot_joint = (
+        jnp.arange(n_joints_int) == joint_idx
+    ).astype(DTYPE)
+    joint_direction = one_hot_joint * sign_bit           # (n_joints,)
+    # Simple first-order kinematics: angles integrate direction,
+    # velocities = direction scaled by dt-proxy.
+    delta_angle = jnp.asarray(0.1, DTYPE) * joint_direction
+    new_angles = jnp.clip(
+        state.last_joint_angles + delta_angle,
+        jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
+    )
+    new_velocities = delta_angle
+    from sensory.proprioception import proprio_encode as _proprio_encode
+    proprio_actual_enc = _proprio_encode(
+        proprio_p, new_angles, new_velocities,
+    )
+    # Predicted proprio comes from the cerebellar/M1 forward estimate
+    # stored at the previous cycle (``last_predicted_joint_angles``).
+    proprio_pred_enc = _proprio_encode(
+        proprio_p, state.last_predicted_joint_angles, new_velocities,
+    )
+    motor_pe_vec = proprio_actual_enc - proprio_pred_enc
+    climbing_motor = motor_pe_vec @ params.w_motor_pc    # (n_purkinje,)
+    climbing = climbing_sensory + climbing_motor
     cb_state = cerebellum_update(
         state.cerebellum, params.cerebellum, climbing, modulator=1.0,
     )
@@ -1352,6 +1479,46 @@ def action_brain_cognitive_step(
         jnp.arange(params.n_saccade_actions) == saccade_action_id
     ).astype(DTYPE)
 
+    # --- 4a. Phase 6A M1 continuous head --------------------------
+    # Bypass path (default, regression-safe): skip M1 entirely and
+    # keep the discrete BG body action unchanged.  Active path: run
+    # M1 on cortex L5 rate with cerebellar motor correction from the
+    # deep nuclei (Wolpert 1998), learn the readout via three-factor
+    # Hebbian gated by VTA RPE (Doya 2000), and override body_action_id
+    # with the sign-split argmax of the joint command (plan 6A.3).
+    if params.bypass_m1:
+        m1_new_state = state.m1
+        jc_out = state.m1.last_joint_command
+        predicted_angles_next = state.last_predicted_joint_angles
+    else:
+        cb_correction = cb_state.dn_rate @ params.w_dn_motor    # (motor_dim,)
+        m1_out = m1_step(
+            state.m1, params.m1, cortex_l5_rate,
+            cb_motor_correction=cb_correction,
+        )
+        jc_out = m1_out.joint_command
+        # Override the BG-selected body action with the discretised
+        # M1 command so the env still receives an int.
+        from embodiment.body_interface import (
+            discretise_joint_command as _disc,
+        )
+        body_action_id = _disc(jc_out, params.n_body_actions)
+        body_action_oh = (
+            jnp.arange(params.n_body_actions) == body_action_id
+        ).astype(DTYPE)
+        # Three-factor Hebbian update on motor_readout.
+        m1_new_state = m1_learn_readout(
+            m1_out.state, params.m1,
+            rpe=rpe,
+            l5_rate_normalised=m1_out.l5_rate_normalised,
+            joint_command=jc_out,
+            cb_motor_err=None,
+        )
+        # Forward-model prediction of joint angles for next-cycle motor
+        # PE — use the tanh-saturated joint command as the expected
+        # next-step angle (position-servo analogue).
+        predicted_angles_next = jc_out
+
     # --- 4b. Freeze eligibility traces + action one-hot at cycle end.
     # The live traces at this point represent the correlation
     # pre(s_t) × post(s_t) built during the perceive loop; combined
@@ -1401,6 +1568,10 @@ def action_brain_cognitive_step(
         sleep=new_sleep,
         ec=state.ec,
         hippocampus=state.hippocampus,
+        m1=m1_new_state,
+        last_joint_angles=new_angles,
+        last_joint_velocities=new_velocities,
+        last_predicted_joint_angles=predicted_angles_next,
     )
 
     return ActionBrainOutput(

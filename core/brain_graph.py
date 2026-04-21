@@ -60,6 +60,7 @@ from .neuromodulator import (
     NeuromodulatorParams, NeuromodulatorState,
     init_neuromodulator_params, init_neuromodulator_state,
     neuromodulator_step, transmitter_vector,
+    adenosine_update,
 )
 from .receptor import (
     ReceptorParams, init_receptor_params, compute_layer_modulation,
@@ -114,6 +115,28 @@ from .pfc import (
     PFCParams, PFCState,
     init_pfc_params, init_pfc_state,
     pfc_step, pfc_select_reset,
+)
+from .replay_buffer import (
+    ReplayParams, ReplayState, Experience,
+    init_replay_params, init_replay_state, replay_store,
+)
+from .sleep import (
+    SleepPhase, SleepParams, SleepState,
+    init_sleep_params, init_sleep_state, sleep_step,
+    is_sws, is_wake, is_rem,
+)
+from .sleep_replay import sws_replay_step, rem_rollout_step
+from .ec import (
+    EntorhinalParams, EntorhinalState,
+    init_ec_params, init_ec_state, ec_step,
+)
+from .hippocampus import (
+    HippocampusParams, HippocampusState, HippocampusOutput,
+    init_hippocampus_params, init_hippocampus_state, hippocampus_step,
+)
+from .learning_pipeline import (
+    critic_learn_step, actors_learn_step,
+    cortex_learn_step, attention_learn_step,
 )
 
 
@@ -359,6 +382,15 @@ class ActionBrainParams(eqx.Module):
     world_model: WorldModelParams
     pfc: PFCParams
 
+    # Medial-temporal memory system (Phase 5B): EC gathers
+    # neocortical/PFC/motor streams into the perforant path, HC
+    # performs DG-sparse encoding + CA3 pattern completion + CA1
+    # mismatch comparison.  HC output routes back into the wake cycle
+    # as a novelty/ACh boost and serves as the source of salience for
+    # replay sampling during SWS.
+    ec: EntorhinalParams
+    hippocampus: HippocampusParams
+
     # Inter-region projections (L5 → CT drive, L5 → mossy fibre)
     w_l5_ct: Array              # (n_l5, n_ct)
     w_l5_mossy: Array           # (n_l5, mossy_size)
@@ -391,6 +423,22 @@ class ActionBrainParams(eqx.Module):
     precision_r_ext_init: PrecisionChannel
     precision_curiosity_init: PrecisionChannel
     precision_info_gain_init: PrecisionChannel
+
+    # Experience-replay buffer (Phase 5A): written each cognitive
+    # cycle with the (s_t, a_t, r_t, s_{t+1}) transition just closed,
+    # prioritised by the world-model's smoothed |PE| surprise signal
+    # (wm_curiosity_signal — Schaul et al. 2016 prioritised experience
+    # replay uses |TD error|; pe_short_abs is its EMA-smoothed analogue
+    # and is bootstrap-safe unlike signed learning-progress).  Read by
+    # Phase 5B's SWS reverse replay + REM rollout.
+    replay: ReplayParams
+
+    # Sleep-phase state machine (Phase 5A).  In Phase 5A the agent is
+    # always awake in practice (sleep_step is invoked but no phase-
+    # specific learning fires yet); the pytree fields exist so that
+    # Phase 5B can drop in the SWS/REM dispatch without widening
+    # ActionBrainState's signature again.
+    sleep: SleepParams
 
     # Static
     n_body_actions: int = eqx.field(static=True)
@@ -427,6 +475,10 @@ class ActionBrainState(eqx.Module):
     pfc: PFCState
     attention: AttentionState
 
+    # Medial-temporal memory system (Phase 5B).
+    ec: EntorhinalState
+    hippocampus: HippocampusState
+
     delay_ct: DelayBuffer
     delay_mossy: DelayBuffer
 
@@ -451,6 +503,14 @@ class ActionBrainState(eqx.Module):
     precision_r_ext: PrecisionChannel
     precision_curiosity: PrecisionChannel
     precision_info_gain: PrecisionChannel
+
+    # Experience-replay ring buffer (Phase 5A).  Stored each cognitive
+    # cycle with the transition that was just closed.
+    replay: ReplayState
+
+    # Sleep-phase state machine (Phase 5A).  Updated each cognitive
+    # cycle from the cortical ATP mean (sleep pressure).
+    sleep: SleepState
 
 
 class ActionBrainOutput(NamedTuple):
@@ -521,6 +581,12 @@ def init_action_brain_params(
     # decision cycle
     substeps: int = 20,
     seed: int = 0,
+    # replay buffer (Phase 5A)
+    replay_capacity: int = 10_000,
+    # sleep (Phase 5A) — biophysically calibrated defaults live in
+    # ``init_sleep_params``; expose a single override knob here for
+    # tests that need to force a transition without long simulations.
+    sleep_params: SleepParams | None = None,
 ) -> ActionBrainParams:
     """Build an ActionBrain params pytree.
 
@@ -629,6 +695,32 @@ def init_action_brain_params(
     pc_r_ext_init = init_precision_channel(ctx, tau_ms=10_000.0)
     pc_curiosity_init = init_precision_channel(ctx, tau_ms=10_000.0)
     pc_info_gain_init = init_precision_channel(ctx, tau_ms=10_000.0)
+
+    # Replay buffer template (Phase 5A).  State size = flattened
+    # sensory afferent (V1 L4 rate) — the same vector fed to thalamus
+    # / striatum / world_model — so replay_store can persist the
+    # exact input the policy conditioned on.  Capacity 10 000 ≈ 10 s
+    # of wake at dt=1 ms × 1 decision/cycle, or ~3 min at 20 ms/cycle;
+    # either way sufficient for one HC-consolidation session
+    # (Stickgold 2013).
+    replay_p = init_replay_params(
+        capacity=int(replay_capacity),
+        state_size=int(sensory_size),
+    )
+    sleep_p = sleep_params if sleep_params is not None else init_sleep_params()
+
+    # --- Medial-temporal memory system (Phase 5B) ------------------
+    # EC afferents = [cortex_l23_belief, pfc_content, body⊕saccade].
+    # Size the single EC cortical microcircuit so its output width
+    # (``n_l23_state``) matches the HC input vocabulary exactly.
+    n_motor = int(n_body_actions + n_saccade_actions)
+    ec_p = init_ec_params(
+        ctx,
+        n_sensory=int(cortex_n_l23_state),
+        n_pfc=int(pfc_p.n_content),
+        n_motor=n_motor,
+    )
+    hc_p = init_hippocampus_params(input_dim=int(ec_p.output_dim))
     return ActionBrainParams(
         sensory_stack=sensory_stack_params,
         thalamus_relay=tr_p, thalamus_trn=trn_p,
@@ -640,6 +732,7 @@ def init_action_brain_params(
         actor_saccade=actor_saccade_p,
         vta=vta_p, world_model=wm_p,
         pfc=pfc_p,
+        ec=ec_p, hippocampus=hc_p,
         w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy, w_io_pc=w_io_pc,
         w_efference_mossy=w_efference_mossy,
         cortex_receptor_density=cortex_density,
@@ -649,6 +742,8 @@ def init_action_brain_params(
         precision_r_ext_init=pc_r_ext_init,
         precision_curiosity_init=pc_curiosity_init,
         precision_info_gain_init=pc_info_gain_init,
+        replay=replay_p,
+        sleep=sleep_p,
         n_body_actions=int(n_body_actions),
         n_saccade_actions=int(n_saccade_actions),
         sensory_size=int(sensory_size),
@@ -660,7 +755,7 @@ def init_action_brain_params(
 def init_action_brain_state(
     key: PRNGKey, params: ActionBrainParams, *, dtype=DTYPE,
 ) -> ActionBrainState:
-    keys = split_key(key, 12)
+    keys = split_key(key, 15)
     tr_s = init_relay_state(keys[0], params.thalamus_relay)
     trn_s = init_trn_state(keys[1], params.thalamus_trn)
     cx_s = init_cortical_area_state(keys[2], params.cortex)
@@ -681,6 +776,10 @@ def init_action_brain_state(
 
     from sensory.sensory_stack import init_sensory_stack_state
     ss_s = init_sensory_stack_state(keys[11], params.sensory_stack)
+    replay_s = init_replay_state(params.replay, dtype=dtype)
+    sleep_s = init_sleep_state(keys[12], initial_phase=SleepPhase.WAKE)
+    ec_s = init_ec_state(keys[13], params.ec, dtype=dtype)
+    hc_s = init_hippocampus_state(keys[14], params.hippocampus, dtype=dtype)
 
     n_ct = params.thalamus_relay.n_ct
     mossy_size = params.cerebellum.mossy_size
@@ -711,6 +810,10 @@ def init_action_brain_state(
         precision_r_ext=params.precision_r_ext_init,
         precision_curiosity=params.precision_curiosity_init,
         precision_info_gain=params.precision_info_gain_init,
+        replay=replay_s,
+        sleep=sleep_s,
+        ec=ec_s,
+        hippocampus=hc_s,
     )
 
 
@@ -728,9 +831,17 @@ def _perceive_substep(
     td_error: Array,
     novelty: Array,
     key: PRNGKey,
+    sws_mode: Array,
 ) -> tuple[ActionBrainState, tuple[Array, Array, Array, Array]]:
     """One ``dt`` of perception: oscillator, thalamus, cortex, cerebellum,
     critic, actor, world-model prediction, neuromodulator.
+
+    ``sws_mode`` is a bool scalar routed from the sleep-phase state
+    machine (``sleep.phase == SWS``). During SWS the oscillator
+    switches to the ~1 Hz slow-wave clamp and suppresses gamma
+    (Steriade 1993); downstream regions see this through the
+    oscillator output.  During wake or REM it is ``False`` and the
+    normal theta/gamma bus applies.
 
     Returns the advanced state plus per-substep readouts
     ``(cortex_belief, cortex_l5_rate, relay_spikes, attn_gains)``
@@ -742,7 +853,7 @@ def _perceive_substep(
         state.oscillator, params.oscillator, ctx,
         ne_level=state.neuromodulator.noradrenaline,
         sero_level=state.neuromodulator.serotonin,
-        sws_mode=False,
+        sws_mode=sws_mode,
     )
 
     # ---- 2. Pop delayed signals ----
@@ -906,6 +1017,10 @@ def _perceive_substep(
         precision_r_ext=state.precision_r_ext,
         precision_curiosity=state.precision_curiosity,
         precision_info_gain=state.precision_info_gain,
+        replay=state.replay,
+        sleep=state.sleep,
+        ec=state.ec,
+        hippocampus=state.hippocampus,
     ), (cx_out.belief, cx_out.l5_rate, thal.relay_spikes, attn_out.gains)
 
 
@@ -948,7 +1063,30 @@ def action_brain_cognitive_step(
     r_ext = jnp.asarray(prev_reward, DTYPE)
     done = jnp.asarray(prev_done, DTYPE)
 
-    # --- 0. Conditional PFC reset on episode boundary.  Biologically:
+    # --- 0a. Sleep-phase state machine (Phase 5B).
+    #     Sleep pressure is driven by an adenosine Process-S integrator
+    #     (Porkka-Heiskanen 1997; Achermann & Borbély 1992): extracellular
+    #     adenosine accumulates monotonically during sustained wake and
+    #     clears exponentially during NREM.  We advance the integrator
+    #     here once per cognitive cycle and feed ``energy = 1 - adenosine``
+    #     to ``sleep_step`` in place of the earlier raw-ATP proxy.  The
+    #     raw ATP mean from cortical astrocytes is a fast metabolic
+    #     signal (t ~ 200 s) that reaches a wake equilibrium well below
+    #     the sws threshold and would therefore force immediate sleep;
+    #     adenosine is the slow, biologically-correct VLPO drive
+    #     (Saper 2010).  After the update ``sws_flag`` is the live
+    #     ``is_sws`` flag — the oscillator's SWS clamp now engages
+    #     during NREM (Steriade 1993).
+    awake_now = is_wake(state.sleep)
+    nm_with_aden = adenosine_update(
+        state.neuromodulator, params.neuromodulator, is_awake=awake_now,
+    )
+    state = eqx.tree_at(lambda s: s.neuromodulator, state, nm_with_aden)
+    energy = jnp.asarray(1.0, DTYPE) - nm_with_aden.adenosine
+    new_sleep = sleep_step(state.sleep, params.sleep, ctx, energy)
+    sws_flag = is_sws(new_sleep)
+
+    # --- 0b. Conditional PFC reset on episode boundary.  Biologically:
     # when a task episode ends, PFC abandons the current goal/context
     # attractor and returns to baseline (Fuster 2001).  JAX-safe via
     # elementwise ``where`` — no Python branch.
@@ -990,10 +1128,60 @@ def action_brain_cognitive_step(
             state, params, ctx, sensory,
             td_error=prev_rpe, novelty=prev_curiosity,
             key=substep_keys[i],
+            sws_mode=sws_flag,
         )
         last_readouts = readouts
 
     cortex_belief, cortex_l5_rate, relay_spikes, last_attn_gains = last_readouts
+
+    # --- 1b. Medial-temporal memory system (Phase 5B).
+    #     EC gathers neocortex belief + PFC goal + last motor command
+    #     (Witter 2007 perforant-path source) and projects the
+    #     concatenated afferent through its canonical microcircuit; HC
+    #     (DG → CA3 → CA1) then performs one-shot episodic encoding
+    #     and pattern-completed recall under the current theta phase.
+    #     The CA1 mismatch scalar drives a basal-forebrain cholinergic
+    #     release (McGaughy 2008) that boosts the global ACh level and
+    #     therefore the next cycle's cortical plasticity gain (Hasselmo
+    #     2006).  HC runs ONCE per cognitive cycle, not per substep —
+    #     information-theoretically the perforant-path carries one
+    #     theta-indexed snapshot per decision window (Hasselmo 2005),
+    #     which is exactly the resolution we sample at.
+    joint_last_action_hc = jnp.concatenate(
+        [state.last_body_action, state.last_saccade_action], axis=0,
+    )
+    ec_state, ec_belief = ec_step(
+        state.ec, params.ec, ctx,
+        sensory_belief=cortex_belief,
+        pfc_content=state.pfc.output_rate,
+        last_motor=joint_last_action_hc,
+        ach=state.neuromodulator.acetylcholine,
+        da=state.neuromodulator.dopamine,
+    )
+    hc_out: HippocampusOutput = hippocampus_step(
+        state.hippocampus, params.hippocampus,
+        ec_in=ec_belief,
+        theta_phase=state.oscillator.theta_phase,
+        ne_level=state.neuromodulator.noradrenaline,
+        reward=r_ext,
+        action=state.last_body_action_id,
+    )
+    hc_state = hc_out.state
+    # CA1 mismatch → basal-forebrain ACh release (McGaughy 2008).  The
+    # ACh channel stays bounded to [0, 1] by the neuromodulator
+    # homeostat on subsequent cycles; we simply add the mismatch and
+    # clip.
+    nm_boosted = eqx.tree_at(
+        lambda s: s.acetylcholine, state.neuromodulator,
+        jnp.clip(
+            state.neuromodulator.acetylcholine + hc_out.mismatch,
+            jnp.asarray(0.0, DTYPE), jnp.asarray(1.0, DTYPE),
+        ),
+    )
+    state = eqx.tree_at(
+        lambda s: (s.ec, s.hippocampus, s.neuromodulator),
+        state, (ec_state, hc_state, nm_boosted),
+    )
 
     # --- 2. Close the loop on the PREVIOUS transition --------------
     # 2a. World-model learning on (s_t, a_t, s_{t+1}) — sensory PE
@@ -1091,41 +1279,59 @@ def action_brain_cognitive_step(
     #     both parallel loops; credit is assigned per-domain through
     #     the INDEPENDENT eligibility traces each actor maintains.
     vta_state = vta_update(vta_out.state, params.vta, rpe)
-    critic_state = critic_update(state.critic, params.critic, rpe)
+    critic_state = critic_learn_step(state.critic, params.critic, rpe)
     # Actor RPE receives a modality-specific epistemic bonus (the
     # critic RPE does NOT -- V(s) approximates pure expected
     # extrinsic return; Dayan & Yu 2003 dual-process decomposition):
     #   body actor    : + curiosity (transition surprise over the
     #                   world-model posterior, Friston 2017 EFE
-    #                   epistemic component; same unit as rpe via the
-    #                   VTA auto_rms Tobler 2005 normalisation).
+    #                   epistemic component; z-scored so it is
+    #                   unit-variance independent of raw scale).
     #   saccade actor : + info_gain (attention-specific surprise,
     #                   Itti & Baldi 2009).
-    rpe_body = rpe + curiosity_z
-    actor_body_state = actor_update(
-        state.actor_body, params.actor_body, rpe_body,
-    )
-    rpe_saccade = rpe + info_gain_z
-    actor_saccade_state = actor_update(
-        state.actor_saccade, params.actor_saccade, rpe_saccade,
+    actor_body_state, actor_saccade_state = actors_learn_step(
+        state.actor_body, params.actor_body,
+        state.actor_saccade, params.actor_saccade,
+        rpe=rpe,
+        body_bonus=curiosity_z,
+        saccade_bonus=info_gain_z,
     )
 
     # 2e. Cortical three-factor STDP: RPE modulates eligibility traces
     #     accumulated during the perception loop (Step 1 above).
-    cortex_state = cortical_area_update(
-        state.cortex, params.cortex,
-        modulator=rpe,
+    cortex_state = cortex_learn_step(
+        state.cortex, params.cortex, modulator=rpe,
     )
 
     # 2f. Attention Hebbian learning: top-down weights adapt so that
     #     attended columns with high cortical activity are reinforced
     #     (Reynolds & Heeger 2009; Feldman & Friston 2010).
-    attn_state = attention_learn(
+    attn_state = attention_learn_step(
         state.attention, params.attention,
         assoc_activity=cortex_l5_rate,
         column_mean_rates=cortex_belief,
         gains=last_attn_gains,
     )
+
+    # 2g. Persist the (s_t, a_t, r_t, s_{t+1}) transition in the
+    #     replay buffer.  Salience = wm_curiosity_signal
+    #     (= pe_short_abs, EMA-smoothed |PE|).  This is the
+    #     Schaul et al. (2016) |TD error|-prioritised replay rule
+    #     applied at the surprise-EMA timescale — bootstrap-safe
+    #     (unlike signed learning-progress which sign-flips when the
+    #     long EMA has not caught up to the short one).  Exposes the
+    #     transition to Phase 5B's SWS reverse-replay + REM rollout.
+    exp = Experience(
+        state=state.last_sensory,
+        action=state.last_body_action_id,
+        reward=r_ext,
+        next_state=sensory.astype(DTYPE),
+        prediction_error=jnp.abs(rpe),
+        done=done,
+        salience=curiosity,
+        recorded_da=state.neuromodulator.dopamine,
+    )
+    new_replay = replay_store(state.replay, params.replay, exp)
 
     # --- 3. Store V(s_{t+1}) in VTA for next cycle's TD target. -----
     vta_state = vta_store_prediction(vta_state, critic_state.activation)
@@ -1191,6 +1397,10 @@ def action_brain_cognitive_step(
         precision_r_ext=pc_r_ext_new,
         precision_curiosity=pc_curiosity_new,
         precision_info_gain=pc_info_gain_new,
+        replay=new_replay,
+        sleep=new_sleep,
+        ec=state.ec,
+        hippocampus=state.hippocampus,
     )
 
     return ActionBrainOutput(
@@ -1289,4 +1499,158 @@ def action_brain_step(
         prev_done=prev_done,
         key=key,
         info_gain=info_gain,
+    )
+
+
+# =====================================================================
+# Phase-5B sleep-aware top-level dispatcher
+# =====================================================================
+
+
+def _advance_sleep_bookkeeping(
+    state: ActionBrainState,
+    params: ActionBrainParams,
+    ctx: BackendContext,
+    *,
+    awake: bool,
+    sws: bool,
+) -> ActionBrainState:
+    """Off-wake adenosine/oscillator/sleep bookkeeping for SWS & REM.
+
+    During wake, :func:`action_brain_cognitive_step` advances all of
+    these internally on every cognitive cycle.  During sleep we step
+    them ONCE per brain cycle (the offline loops are already iterating
+    a mini-batch of transitions inside the ``scan``).
+    """
+    nm_with_aden = adenosine_update(
+        state.neuromodulator, params.neuromodulator, is_awake=awake,
+    )
+    energy = jnp.asarray(1.0, DTYPE) - nm_with_aden.adenosine
+    new_sleep = sleep_step(state.sleep, params.sleep, ctx, energy)
+    new_osc, _osc_out = oscillator_step(
+        state.oscillator, params.oscillator, ctx,
+        ne_level=nm_with_aden.noradrenaline,
+        sero_level=nm_with_aden.serotonin,
+        sws_mode=sws,
+    )
+    return eqx.tree_at(
+        lambda s: (s.neuromodulator, s.sleep, s.oscillator),
+        state,
+        (nm_with_aden, new_sleep, new_osc),
+    )
+
+
+def _sleep_phase_output(
+    state: ActionBrainState, *, cortex_belief_size: int, l5_size: int,
+    dn_size: int, relay_size: int,
+) -> ActionBrainOutput:
+    """Zero-valued :class:`ActionBrainOutput` used during offline sleep.
+
+    Motor, RPE and reward channels are set to zero — the body does
+    not actuate during sleep — but the pytree shape matches the wake
+    output so downstream code can be written once.
+    """
+    zero = jnp.asarray(0.0, DTYPE)
+    zero_int = jnp.asarray(0, jnp.int32)
+    return ActionBrainOutput(
+        state=state,
+        body_action=zero_int,
+        saccade_action=zero_int,
+        rpe=zero,
+        total_reward=zero,
+        curiosity=zero,
+        cortex_belief=jnp.zeros(cortex_belief_size, DTYPE),
+        cortex_l5_rate=jnp.zeros(l5_size, DTYPE),
+        cerebellum_nuclei=jnp.zeros(dn_size, DTYPE),
+        relay_spikes=jnp.zeros(relay_size, DTYPE),
+        theta_phase=state.oscillator.theta_phase,
+        neuromod=state.neuromodulator,
+    )
+
+
+def brain_cycle(
+    state: ActionBrainState,
+    params: ActionBrainParams,
+    ctx: BackendContext,
+    image: Array,
+    fixation_xy: Array,
+    prev_reward: float | Array = 0.0,
+    prev_done: float | Array = 0.0,
+    key: PRNGKey | None = None,
+    *,
+    info_gain: float | Array | None = None,
+    n_sws_replay: int = 32,
+    n_rem_rollout: int = 10,
+) -> ActionBrainOutput:
+    """Phase-aware top-level brain dispatcher.
+
+    Python-level ``if`` on the CURRENT sleep phase — we do not use
+    ``jax.lax.switch`` because the three branches have fundamentally
+    different signatures (WAKE needs sensory, sleep branches do not)
+    and fundamentally different computational costs (offline replay
+    is a short ``scan`` over replay indices whereas the wake branch
+    runs the entire neural front-end).  Phase transitions themselves
+    are JIT-safe inside :func:`sleep_step`; the dispatch is a
+    host-side control-flow decision, consistent with the
+    neuromodulatory-switching literature (Saper 2010 flip-flop
+    VLPO).
+    """
+    if key is None:
+        raise ValueError("brain_cycle requires an explicit PRNG key")
+
+    phase = int(state.sleep.phase)  # concrete Python int
+
+    if phase == int(SleepPhase.WAKE):
+        return action_brain_step(
+            state, params, ctx, image, fixation_xy,
+            prev_reward=prev_reward, prev_done=prev_done,
+            key=key, info_gain=info_gain,
+        )
+
+    # Offline sleep: SWS or REM.
+    if phase == int(SleepPhase.SWS):
+        k_rep, k_next = jax.random.split(key)
+        wm_new, replay_new, hc_new = sws_replay_step(
+            state.world_model, params.world_model, ctx,
+            state.replay, params.replay,
+            state.hippocampus, params.hippocampus,
+            k_rep,
+            n_replay=n_sws_replay,
+            n_body_actions=int(params.n_body_actions),
+            n_saccade_actions=int(params.n_saccade_actions),
+            ach=state.neuromodulator.acetylcholine,
+        )
+        state = eqx.tree_at(
+            lambda s: (s.world_model, s.replay, s.hippocampus),
+            state, (wm_new, replay_new, hc_new),
+        )
+        state = _advance_sleep_bookkeeping(
+            state, params, ctx, awake=False, sws=True,
+        )
+    else:  # REM
+        k_rem, k_next = jax.random.split(key)
+        wm_new, hc_new = rem_rollout_step(
+            state.world_model, params.world_model, ctx,
+            state.replay, params.replay,
+            state.hippocampus, params.hippocampus,
+            k_rem,
+            k_steps=n_rem_rollout,
+            n_body_actions=int(params.n_body_actions),
+            n_saccade_actions=int(params.n_saccade_actions),
+            ach=state.neuromodulator.acetylcholine,
+        )
+        state = eqx.tree_at(
+            lambda s: (s.world_model, s.hippocampus),
+            state, (wm_new, hc_new),
+        )
+        state = _advance_sleep_bookkeeping(
+            state, params, ctx, awake=False, sws=False,
+        )
+
+    return _sleep_phase_output(
+        state,
+        cortex_belief_size=int(params.cortex.n_l23_state),
+        l5_size=int(params.cortex.n_l5),
+        dn_size=int(params.cerebellum.n_dn),
+        relay_size=int(params.thalamus_relay.n_tc),
     )

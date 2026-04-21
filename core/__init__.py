@@ -76,7 +76,7 @@ from .spike_encoder import (
 from .neuromodulator import (
     NeuromodulatorParams, NeuromodulatorState,
     init_neuromodulator_params, init_neuromodulator_state,
-    neuromodulator_step,
+    neuromodulator_step, adenosine_update,
     learning_rate_modulation, consolidation_gate,
     bottom_up_gain, competition_sharpness, planning_horizon,
     transmitter_vector,
@@ -93,7 +93,19 @@ from .working_memory import (
     init_wm_params, init_wm_state,
     wm_step, wm_update_ff, wm_update_lateral, wm_reset_transient,
 )
-# NOTE: sequence_memory.py, episodic_memory.py kept on disk for Phase 5+; not re-exported yet.
+# -- Hippocampal memory primitives (Phase 5A exports; Phase 5B wires
+#    them into the brain graph via the hippocampus wrapper). --
+from .episodic_memory import (
+    EpisodicParams, EpisodicState, StoreOutput, RecallOutput,
+    init_episodic_params, init_episodic_state,
+    try_store, recall, mark_replayed, episodic_size, dg_encode,
+    episodic_clear,
+)
+from .sequence_memory import (
+    SeqMemParams, SeqMemState, SeqMemOutput,
+    init_seqmem_params, init_seqmem_state,
+    seqmem_step, seqmem_novelty, seqmem_reset_transient,
+)
 
 # -- Inhibitory pool / error neuron / world model / replay --
 from .interneuron import (
@@ -117,6 +129,30 @@ from .world_model import (
     wm_reset_transient,
 )
 # NOTE: replay_buffer.py kept on disk for Phase 5 (sleep); not re-exported yet.
+
+# -- Experience-replay ring buffer (Phase 5A). --
+from .replay_buffer import (
+    ReplayParams, ReplayState, Experience,
+    init_replay_params, init_replay_state,
+    replay_store, replay_size, replay_sample_indices,
+    replay_gather, replay_mark_replayed, replay_recent_indices,
+    replay_clear,
+)
+
+# -- Sleep-phase state machine (Phase 5A). --
+from .sleep import (
+    SleepPhase, SleepParams, SleepState,
+    init_sleep_params, init_sleep_state, sleep_step,
+    is_wake, is_sws, is_rem,
+)
+
+# -- Learning pipeline (Phase 5A extraction; reused by Phase 5B
+#    SWS reverse-replay so wake-learning and replay-learning call
+#    identical plasticity primitives). --
+from .learning_pipeline import (
+    critic_learn_step, actors_learn_step,
+    cortex_learn_step, attention_learn_step,
+)
 
 # -- Basal ganglia (critic + D1/D2 actor) --
 from .basal_ganglia import (
@@ -159,5 +195,17 @@ from .brain_graph import (
     ActionBrainParams, ActionBrainState, ActionBrainOutput,
     init_action_brain_params, init_action_brain_state,
     action_brain_step, action_brain_cognitive_step,
+    brain_cycle,
     SACCADE_ACTION_DIM,
 )
+
+# -- Phase 5B medial-temporal memory system + offline replay. --
+from .ec import (
+    EntorhinalParams, EntorhinalState,
+    init_ec_params, init_ec_state, ec_step,
+)
+from .hippocampus import (
+    HippocampusParams, HippocampusState, HippocampusOutput,
+    init_hippocampus_params, init_hippocampus_state, hippocampus_step,
+)
+from .sleep_replay import sws_replay_step, rem_rollout_step

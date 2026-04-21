@@ -84,6 +84,16 @@ class NeuromodulatorParams(eqx.Module):
     pe_long_decay: Array
     boredom_weight: Array
 
+    # Adenosine / Process-S sleep-pressure integrator (Porkka-Heiskanen
+    # 1997; Achermann & Borbély 1992).  Two exponential-approach rates:
+    # during wake adenosine rises toward ``adenosine_wake_asymptote``
+    # (= 1.0) with τ = ``tau_adenosine_rise_ms``; during SWS/REM it
+    # decays toward 0 with τ = ``tau_adenosine_fall_ms``.  Ratio τ_rise
+    # : τ_fall ≈ 4:1 matches the classical process-S dynamics (rise over
+    # a full day, clearance over one night of sleep).
+    adenosine_rise_decay: Array     # ctx.decay(tau_adenosine_rise_ms)
+    adenosine_fall_decay: Array     # ctx.decay(tau_adenosine_fall_ms)
+
 
 def init_neuromodulator_params(
     ctx: BackendContext,
@@ -107,6 +117,8 @@ def init_neuromodulator_params(
     sero_reward_hill_n: float = 1.0,
     tau_pe_long: float = 10_000.0,
     boredom_weight: float = 0.05,
+    tau_adenosine_rise_ms: float = 120_000.0,
+    tau_adenosine_fall_ms: float = 30_000.0,
     dtype=DTYPE,
 ) -> NeuromodulatorParams:
     """All τ in ms, converted via ``ctx.decay``. ``history_window_steps`` is
@@ -136,6 +148,8 @@ def init_neuromodulator_params(
         sero_reward_hill_n=f(sero_reward_hill_n),
         pe_long_decay=f(ctx.decay(tau_pe_long)),
         boredom_weight=f(boredom_weight),
+        adenosine_rise_decay=f(ctx.decay(tau_adenosine_rise_ms)),
+        adenosine_fall_decay=f(ctx.decay(tau_adenosine_fall_ms)),
     )
 
 
@@ -153,6 +167,7 @@ class NeuromodulatorState(eqx.Module):
     td_abs_ema: Array
     acc_pe_trace: Array
     pe_long: Array             # slow-EMA PE (τ ≈ 10 s) — boredom baseline
+    adenosine: Array           # Process-S sleep pressure ∈ [0, 1]
 
 
 def init_neuromodulator_state(
@@ -171,6 +186,7 @@ def init_neuromodulator_state(
         td_abs_ema=z,
         acc_pe_trace=z,
         pe_long=z,
+        adenosine=z,
     )
 
 
@@ -286,7 +302,42 @@ def neuromodulator_step(
         td_abs_ema=td_abs_ema,
         acc_pe_trace=clamp(acc),
         pe_long=pe_long,
+        adenosine=state.adenosine,
     )
+
+
+@eqx.filter_jit
+def adenosine_update(
+    state: NeuromodulatorState,
+    params: NeuromodulatorParams,
+    *,
+    is_awake: Array | bool,
+) -> NeuromodulatorState:
+    """Process-S integrator: exponential approach to 1 during wake, 0 during sleep.
+
+    Porkka-Heiskanen (1997) — extracellular adenosine accumulates during
+    sustained wakefulness in basal-forebrain cholinergic terminals and
+    clears during SWS via adenosine-deaminase uptake.  Achermann &
+    Borbély (1992) formalised this as the two-process model's process S,
+    parameterised by ``τ_rise`` (wake accumulation) and ``τ_fall``
+    (sleep clearance).  A single scalar call per decision cycle
+    advances the pressure by one cycle's worth of dt.
+
+    Note: the decay *factor* ``exp(-dt/τ)`` already carries the
+    integration timescale, so this function does not itself accept
+    ``ctx`` — the dt-dependence is baked into the params at
+    construction time via ``init_neuromodulator_params``.
+    """
+    awake = jnp.asarray(is_awake, dtype=jnp.bool_)
+    # Wake: target = 1, decay = rise_decay ⇒ S ← rise·S + (1-rise)·1
+    # Sleep: target = 0, decay = fall_decay ⇒ S ← fall·S
+    rise = params.adenosine_rise_decay
+    fall = params.adenosine_fall_decay
+    new_wake = state.adenosine * rise + (1.0 - rise)
+    new_sleep = state.adenosine * fall
+    new_aden = jnp.where(awake, new_wake, new_sleep)
+    new_aden = jnp.clip(new_aden, 0.0, 1.0)
+    return eqx.tree_at(lambda s: s.adenosine, state, new_aden.astype(DTYPE))
 
 
 # =====================================================================

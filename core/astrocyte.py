@@ -90,6 +90,17 @@ def init_astrocyte_params(
     # whole-brain timescale mismatch.
     atp_regen_rate: float = 5e-4,
     atp_spike_cost: float = 9e-3,
+    # ATP-depletion modulation of AdEx threshold and leak.
+    # Grounding (Attwell & Laughlin 2001; Cisternas et al. 2014):
+    #   Na\u207a/K\u207a-ATPase consumes ~70% of neuronal ATP; complete
+    #   depletion raises [Na\u207a]\u1d62 by ~20 mM, which shifts V_rest by
+    #   ~+10 mV via the Nernst equation.  Because V_thresh is set in
+    #   the AdEx params, shifting V_rest upward is mathematically
+    #   equivalent to shifting V_thresh by the same amount, hence
+    #   ``atp_threshold_shift = 10 mV`` at zero ATP.
+    #   Leak conductance: Cisternas 2014 reports ~40\u201360% g_L
+    #   increase at 80\u2013100% ATP depletion (inward Na leak no longer
+    #   counteracted by the pump), hence ``atp_leak_gain = 0.5``.
     atp_threshold_shift: float = 10.0,
     atp_leak_gain: float = 0.5,
     gain_baseline: float = 1.0,
@@ -221,12 +232,6 @@ def precision(state: AstrocyteState) -> Array:
     return (1.0 / (1.0 + state.calcium)).astype(DTYPE)
 
 
-def synaptic_gain(state: AstrocyteState, params: AstrocyteParams) -> Array:
-    """NMDA gain from D-Serine, linear in [gain_baseline, gain_max]."""
-    span = params.gain_max - params.gain_baseline
-    return (params.gain_baseline + span * state.d_serine).astype(DTYPE)
-
-
 def threshold_shift(state: AstrocyteState, params: AstrocyteParams) -> Array:
     """Per-zone V_T shift (mV) from ATP depletion."""
     return (params.atp_threshold_shift * (1.0 - state.atp)).astype(DTYPE)
@@ -237,6 +242,4 @@ def leak_gain(state: AstrocyteState, params: AstrocyteParams) -> Array:
     return (1.0 + params.atp_leak_gain * (1.0 - state.atp)).astype(DTYPE)
 
 
-def metabolic_lr(state: AstrocyteState, params: AstrocyteParams) -> Array:
-    """Learning-rate multiplier ∝ Ca²⁺ (high error ⇒ learn faster)."""
-    return (1.0 + params.metabolic_scale * state.calcium).astype(DTYPE)
+

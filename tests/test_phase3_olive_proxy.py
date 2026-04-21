@@ -25,7 +25,8 @@ import pytest
 
 from core.backend import BackendContext
 from core.brain_graph import (
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from embodiment.gridworld import GridWorldBody
 
@@ -42,25 +43,26 @@ def _rollout_mse(n_cycles: int, seed: int):
     body = _make_body()
     params = init_action_brain_params(
         ctx, sensory_size=body.sensory_size,
-        n_body_actions=body.n_actions, n_saccade_actions=2,
+        n_body_actions=body.n_actions, n_saccade_actions=2, substeps=4,
     )
     state = init_action_brain_state(jax.random.PRNGKey(seed), params)
     body, sample0 = body.reset(jax.random.PRNGKey(seed + 1))
 
-    def step(carry, k):
-        b, st, prev_r, prev_d = carry
-        k_step, k_act = jax.random.split(k)
-        out = action_brain_step(
+    b, st = body, state
+    prev_r, prev_d = sample0.reward, sample0.done
+    mse_list = []
+    keys = jax.random.split(jax.random.PRNGKey(seed + 2), n_cycles)
+    for i in range(n_cycles):
+        k_step, k_act = jax.random.split(keys[i])
+        out = action_brain_cognitive_step(
             st, params, ctx, b._encode(b.pos), prev_r, prev_d, k_step,
         )
         new_b, smp = b.act(k_act, out.body_action, jnp.int32(0))
-        mse = jnp.mean(out.state.world_model.prediction_error ** 2)
-        return (new_b, out.state, smp.reward, smp.done), mse
+        mse_list.append(float(jnp.mean(out.state.world_model.prediction_error ** 2)))
+        b, st = new_b, out.state
+        prev_r, prev_d = smp.reward, smp.done
 
-    keys = jax.random.split(jax.random.PRNGKey(seed + 2), n_cycles)
-    init = (body, state, sample0.reward, sample0.done)
-    _, mse = jax.lax.scan(step, init, keys)
-    return jax.device_get(mse)
+    return jnp.array(mse_list)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])

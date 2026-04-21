@@ -192,6 +192,7 @@ class VisualGridBody(eqx.Module, BodyInterface):
     max_steps: int = eqx.field(static=True)
     sensory_size: int = eqx.field(static=True, default=0)
     n_actions: int = eqx.field(static=True, default=4)
+    skip_retina: bool = eqx.field(static=True, default=False)
 
     # ----------------------------------------------------------------
 
@@ -256,6 +257,11 @@ class VisualGridBody(eqx.Module, BodyInterface):
         re-process pixels through its own retina/V1 path.
         """
         img = self._current_image(pos)              # (tex, tex)
+        if self.skip_retina:
+            # Brain-side sensory_stack will run retina/V1 itself;
+            # return zeros for the afferent to avoid double processing.
+            aff = jnp.zeros(self.sensory_size, DTYPE)
+            return retina_state, aff, img
         new_state, sample = retina_step(
             retina_state, self.retina_cfg, img, fixation_xy,
         )

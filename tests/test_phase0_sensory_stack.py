@@ -56,7 +56,7 @@ def test_sensory_stack_uniform_vs_structured():
         total = 0.0
         for _ in range(100):
             o = sensory_stack_step(
-                state, params, ctx, img, fix, apply_stdp=False,
+                state, params, ctx, img, fix, apply_ipool_stdp=False,
             )
             state = o.state
             total += float(o.belief.sum())
@@ -114,7 +114,7 @@ def test_sensory_stack_stdp_stable():
     for _ in range(50):
         key, k = jax.random.split(key)
         img = jax.random.uniform(k, (32, 32), jnp.float32)
-        o = sensory_stack_step(state, params, ctx, img, fix, apply_stdp=True)
+        o = sensory_stack_step(state, params, ctx, img, fix, apply_ipool_stdp=True)
         state = o.state
 
     assert jnp.isfinite(state.v1.w_l4_in).all()

@@ -289,6 +289,7 @@ class ThalamicOutput(NamedTuple):
     trn_rate: Array            # (n_trn,) EMA
 
 
+@eqx.filter_jit
 def thalamic_step(
     relay: RelayState, relay_params: RelayParams,
     trn: TRNState, trn_params: TRNParams,

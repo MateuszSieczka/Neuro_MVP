@@ -95,6 +95,7 @@ class PFCOutput(NamedTuple):
     content_rate: Array  # (n_content,) — projected to BG striatum
 
 
+@eqx.filter_jit
 def pfc_step(
     state: PFCState,
     params: PFCParams,

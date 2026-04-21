@@ -123,6 +123,7 @@ def init_sensory_stack_state(
 # =====================================================================
 
 
+@eqx.filter_jit
 def sensory_stack_step(
     state: SensoryStackState,
     params: SensoryStackParams,
@@ -135,7 +136,7 @@ def sensory_stack_step(
     ne: Array | float = 0.5,
     receptor_gain: Array | float = 1.0,
     excitability_mod: Array | float = 1.0,
-    apply_stdp: bool = True,
+    apply_ipool_stdp: bool = True,
 ) -> SensoryStackOutput:
     """Run one dt of the retina → LGN → V1 chain.
 
@@ -165,7 +166,7 @@ def sensory_stack_step(
         excitability_mod=excitability_mod,
     )
     v1_out = cortical_area_step(
-        state.v1, params.v1, ctx, v1_inputs, apply_stdp=apply_stdp,
+        state.v1, params.v1, ctx, v1_inputs, apply_ipool_stdp=apply_ipool_stdp,
     )
 
     new_state = SensoryStackState(retina=new_retina, v1=v1_out.state)

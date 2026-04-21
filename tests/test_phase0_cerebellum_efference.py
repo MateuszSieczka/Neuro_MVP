@@ -24,7 +24,8 @@ import equinox as eqx
 
 from core.backend import BackendContext
 from core.brain_graph import (
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from embodiment.bandit import GaussianBanditBody
 
@@ -34,7 +35,7 @@ def _run_one_step(body_onehot, saccade_onehot):
     body = GaussianBanditBody.create(jax.random.PRNGKey(0), n_actions=3)
     params = init_action_brain_params(
         ctx, sensory_size=body.sensory_size,
-        n_body_actions=3, n_saccade_actions=2,
+        n_body_actions=3, n_saccade_actions=2, substeps=4,
     )
     state = init_action_brain_state(jax.random.PRNGKey(1), params)
 
@@ -46,7 +47,7 @@ def _run_one_step(body_onehot, saccade_onehot):
          jnp.asarray(saccade_onehot, jnp.float32)),
     )
     _, sample = body.reset(jax.random.PRNGKey(2))
-    out = action_brain_step(
+    out = action_brain_cognitive_step(
         state, params, ctx, sample.sensory,
         jnp.asarray(0.0, jnp.float32),
         jnp.asarray(0.0, jnp.float32),

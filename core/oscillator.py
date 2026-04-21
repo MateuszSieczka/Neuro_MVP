@@ -102,6 +102,7 @@ class OscillatorOutput(eqx.Module):
     encoding_phase: Array   # bool scalar — θ < π (Hasselmo 2005 encoding window)
 
 
+@eqx.filter_jit
 def oscillator_step(
     state: OscillatorState,
     params: OscillatorParams,

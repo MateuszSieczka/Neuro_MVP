@@ -67,6 +67,7 @@ def lgn_normalize(
     target_mean: float = 0.25,
     baseline: float = 0.15,
     semi_saturation: float = 0.05,
+    max_gain: float = 4.0,
 ) -> Array:
     """Contrast-normalised afferent with tonic baseline, in ``[0, 1]``.
 
@@ -88,6 +89,13 @@ def lgn_normalize(
         Additive constant in the gain denominator (Heeger 1992). Caps
         the amplification on very dim scenes so that noise is not
         boosted to signal level.
+    max_gain:
+        Asymptotic maximum contrast gain (Mante, Bonin & Carandini
+        2005 Fig. 3: LGN contrast gain spans ~4× around the adaptation
+        mean). This replaces a previous hard ``[0.5, 10]`` clip with a
+        *soft* Naka-Rushton / Weber-Fechner saturation so that the
+        derivative is continuous everywhere (important for gradient-
+        free but still well-posed behaviour at the clip boundary).
 
     Returns
     -------
@@ -105,11 +113,14 @@ def lgn_normalize(
     # tonic baseline the overall mean sits at target_mean.
     target = jnp.asarray(target_mean, DTYPE)
     base = jnp.asarray(baseline, DTYPE)
-    gain = (target - base) / (mu + jnp.asarray(semi_saturation, DTYPE))
-    # Clamp gain to a physiologically plausible range: below 1 would
-    # correspond to attenuating already-bright afferents, above ~20 to
-    # cranking dark noise to signal levels. Mante 2005 Fig. 3 shows
-    # contrast gain varying ~4x around baseline.
-    gain = jnp.clip(gain, 0.5, 10.0)
+    gain_raw = (target - base) / (mu + jnp.asarray(semi_saturation, DTYPE))
+    # Weber-Fechner / Naka-Rushton soft-saturation. ``tanh(g/g_max)``
+    # is asymptotically bounded by ±g_max with smooth derivatives
+    # everywhere; equivalent to the compressive nonlinearity that
+    # retinal / LGN contrast-response curves show in Mante 2005.
+    # Replaces the previous hard ``clip(0.5, 10)`` whose 10 was
+    # ad hoc and whose 0.5 floor over-boosted dim scenes.
+    g_max = jnp.asarray(max_gain, DTYPE)
+    gain = g_max * jnp.tanh(gain_raw / g_max)
     out = base + gain * a
     return jnp.clip(out, 0.0, 1.0).astype(DTYPE)

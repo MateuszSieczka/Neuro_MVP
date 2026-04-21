@@ -34,7 +34,7 @@ from sensory.sensory_stack import init_sensory_stack_params
 from embodiment.visual_grid import VisualGridBody
 
 
-def _build(seed: int = 0, *, n_l23_state: int = 32):
+def _build(seed: int = 0, *, n_l23_state: int = 16):
     ctx = BackendContext(dt=1.0)
     cfg = RetinaConfig(fovea_size=8, n_pyramid=2, periphery_tile=4)
     body = VisualGridBody.create(
@@ -44,13 +44,18 @@ def _build(seed: int = 0, *, n_l23_state: int = 32):
     )
     ss_params = init_sensory_stack_params(
         ctx, retina_cfg=cfg,
-        n_l4=64, n_l23_state=n_l23_state, n_l23_error=16, n_l5=16,
+        n_l4=32, n_l23_state=n_l23_state, n_l23_error=8, n_l5=8,
     )
     params = init_action_brain_params(
         ctx,
-        sensory_size=0,                  # overridden by sensory_stack
+        sensory_size=0,
         n_body_actions=4,
         sensory_stack_params=ss_params,
+        substeps=4,
+        n_tc=32, n_ct=16, n_trn=16,
+        cortex_n_l4=32, cortex_n_l23_state=32,
+        cortex_n_l23_error=32, cortex_n_l5=16,
+        critic_hidden=32, wm_hidden=32, wm_n_error=32,
     )
     state = init_action_brain_state(jax.random.PRNGKey(seed + 100), params)
     return ctx, body, params, state
@@ -60,7 +65,7 @@ def test_action_brain_accepts_sensory_stack_params():
     ctx, body, params, state = _build()
     # Effective sensory_size must equal V1 L4 population (the
     # corticostriatal afferent emitted by SensoryStack — Smith 2004).
-    assert params.sensory_size == 64
+    assert params.sensory_size == 32
     assert params.sensory_stack is not None
     assert state.sensory_stack is not None
     # prev_pe_rate is a scalar tracked across cycles.

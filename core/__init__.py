@@ -42,9 +42,13 @@ from .plasticity import (
 )
 
 # -- Free energy / precision --
-from .free_energy import (
-    variational_free_energy, expected_free_energy,
-    precision_weighted_update, broadcast_precision,
+# NOTE: free_energy.py kept on disk for Phase 9 (EFE); not re-exported yet.
+from .precision_bus import (
+    PrecisionChannel,
+    init_precision_channel,
+    precision_update, precision_value, precision_mean,
+    precision_standardize,
+    precision_compose, precision_weight,
 )
 
 # -- Receptor pharmacology --
@@ -83,23 +87,13 @@ from .vta import (
     vta_store_prediction, vta_compute_rpe, vta_update, vta_reset_transient,
 )
 
-# -- Working / sequence / episodic memory --
+# -- Working memory --
 from .working_memory import (
     WMParams, WMState, WMOutput,
     init_wm_params, init_wm_state,
     wm_step, wm_update_ff, wm_update_lateral, wm_reset_transient,
 )
-from .sequence_memory import (
-    SeqMemParams, SeqMemState, SeqMemOutput,
-    init_seqmem_params, init_seqmem_state,
-    seqmem_step, seqmem_novelty, seqmem_reset_transient,
-)
-from .episodic_memory import (
-    EpisodicParams, EpisodicState, StoreOutput, RecallOutput,
-    init_episodic_params, init_episodic_state,
-    dg_encode, try_store, recall, mark_replayed,
-    episodic_size, episodic_clear,
-)
+# NOTE: sequence_memory.py, episodic_memory.py kept on disk for Phase 5+; not re-exported yet.
 
 # -- Inhibitory pool / error neuron / world model / replay --
 from .interneuron import (
@@ -110,7 +104,7 @@ from .interneuron import (
 from .error_neuron import (
     ErrorNeuronParams, ErrorNeuronState, ErrorNeuronOutput,
     init_error_neuron_params, init_error_neuron_state,
-    en_step, en_update_weights, en_generate_prediction,
+    en_step, en_update_weights,
     en_receive_prediction, en_belief, en_prediction_error_rate,
     en_reset_transient,
 )
@@ -118,26 +112,23 @@ from .world_model import (
     WorldModelParams, WorldModelState, WorldModelOutput, RehearsalResult,
     init_world_model_params, init_world_model_state,
     wm_predict, wm_update, wm_mental_rehearsal,
-    wm_curiosity_signal, wm_rehearsal_depth_from_serotonin,
+    wm_curiosity_signal, wm_boredom_signal, wm_learning_progress,
+    wm_rehearsal_depth_from_serotonin,
     wm_reset_transient,
 )
-from .replay_buffer import (
-    ReplayParams, ReplayState, Experience,
-    init_replay_params, init_replay_state,
-    replay_store, replay_sample_indices, replay_gather,
-    replay_mark_replayed, replay_size, replay_recent_indices,
-    replay_clear,
-)
+# NOTE: replay_buffer.py kept on disk for Phase 5 (sleep); not re-exported yet.
 
 # -- Basal ganglia (critic + D1/D2 actor) --
 from .basal_ganglia import (
     CriticParams, CriticState, CriticOutput,
     init_critic_params, init_critic_state,
-    critic_step, critic_update, critic_reset_transient,
+    critic_step, critic_update, critic_commit_eligibility,
+    critic_reset_transient,
     ActorParams, ActorState, ActorOutput, ActorInputs,
     init_actor_params, init_actor_state,
     actor_step, actor_select_action, actor_update,
-    actor_reset_evidence, actor_reset_transient, action_entropy,
+    actor_commit_eligibility,
+    actor_reset_evidence, actor_reset_transient,
 )
 
 # -- Cortical microcircuit (L4 / L2-3 / L5) --
@@ -162,14 +153,11 @@ from .thalamus import (
     thalamic_step, relay_reset_transient, trn_reset_transient,
 )
 
-# -- Brain graph (wiring primitives + reference MinimalBrain) --
+# -- Brain graph (wiring primitives + ActionBrain) --
 from .brain_graph import (
     DelayBuffer, init_delay_buffer, delay_push_pop,
-    MinimalBrainParams, MinimalBrainState, MinimalBrainOutput,
-    init_minimal_brain_params, init_minimal_brain_state,
-    minimal_brain_step, region_phase,
     ActionBrainParams, ActionBrainState, ActionBrainOutput,
     init_action_brain_params, init_action_brain_state,
-    action_brain_step,
+    action_brain_step, action_brain_cognitive_step,
     SACCADE_ACTION_DIM,
 )

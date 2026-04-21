@@ -39,7 +39,8 @@ import jax.numpy as jnp
 
 from core.backend import BackendContext
 from core.brain_graph import (
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from embodiment.gridworld import GridWorldBody
 
@@ -59,34 +60,33 @@ def _rollout(n_cycles: int, seed: int = 0):
     body = _make_body()
     params = init_action_brain_params(
         ctx, sensory_size=body.sensory_size,
-        n_body_actions=body.n_actions, n_saccade_actions=2,
+        n_body_actions=body.n_actions, n_saccade_actions=2, substeps=4,
     )
     state = init_action_brain_state(jax.random.PRNGKey(seed), params)
     body, sample0 = body.reset(jax.random.PRNGKey(seed + 1))
 
-    def step(carry, k):
-        b, st, prev_r, prev_d = carry
-        k_step, k_act = jax.random.split(k)
+    cur_list, l5_list, belief_list, wm_pe_list = [], [], [], []
+    st = state
+    prev_r, prev_d = sample0.reward, sample0.done
+    b = body
+    keys = jax.random.split(jax.random.PRNGKey(seed + 2), n_cycles)
+    for i in range(n_cycles):
+        k_step, k_act = jax.random.split(keys[i])
         sensory = b._encode(b.pos)
-        out = action_brain_step(
+        out = action_brain_cognitive_step(
             st, params, ctx, sensory, prev_r, prev_d, k_step,
         )
         new_b, smp = b.act(k_act, out.body_action, jnp.int32(0))
-        return (
-            (new_b, out.state, smp.reward, smp.done),
-            (
-                out.curiosity,
-                jnp.mean(out.cortex_l5_rate),
-                jnp.mean(jnp.abs(out.cortex_belief)),
-                jnp.mean(out.state.world_model.prediction_error ** 2),
-            ),
-        )
+        cur_list.append(float(out.curiosity))
+        l5_list.append(float(jnp.mean(out.cortex_l5_rate)))
+        belief_list.append(float(jnp.mean(jnp.abs(out.cortex_belief))))
+        wm_pe_list.append(float(jnp.mean(out.state.world_model.prediction_error ** 2)))
+        st = out.state
+        prev_r, prev_d = smp.reward, smp.done
+        b = new_b
 
-    keys = jax.random.split(jax.random.PRNGKey(seed + 2), n_cycles)
-    init = (body, state, sample0.reward, sample0.done)
-    _, traj = jax.lax.scan(step, init, keys)
-    cur, l5, belief, wm_pe = jax.device_get(traj)
-    return cur, l5, belief, wm_pe
+    return (jnp.array(cur_list), jnp.array(l5_list),
+            jnp.array(belief_list), jnp.array(wm_pe_list))
 
 
 def test_curiosity_positive():

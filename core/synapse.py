@@ -94,7 +94,7 @@ def init_synaptic_params(
 # ======================================================================
 
 
-def nmda_mg_block(v: Array, mg_concentration: Array) -> Array:
+def nmda_mg_block(v: Array, mg_concentration: Array | float = 1.0) -> Array:
     """Voltage-dependent Mg²⁺ block factor (Jahr & Stevens 1990).
 
     B(V) = 1 / (1 + [Mg]/3.57 · exp(-0.062·V))

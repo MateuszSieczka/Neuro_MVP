@@ -31,7 +31,7 @@ def _run(drive: float, n_steps: int, seed: int = 0):
     inputs = CorticalInputs(ff_input=inp)
 
     def scan_fn(s, _):
-        out = cortical_area_step(s, params, ctx, inputs, apply_stdp=False)
+        out = cortical_area_step(s, params, ctx, inputs, apply_ipool_stdp=False)
         astro = out.state.astrocyte
         return out.state, (astro.calcium.mean(), astro.atp.mean())
 

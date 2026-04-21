@@ -25,9 +25,7 @@ from core.cortex import (
     CorticalInputs, init_cortical_area_params, init_cortical_area_state,
     cortical_area_step,
 )
-from core.brain_graph import (
-    init_minimal_brain_params, init_minimal_brain_state, minimal_brain_step,
-)
+
 
 
 def _cortex_rate_with_mod(mod_value: float, n_steps: int = 100) -> float:
@@ -40,7 +38,7 @@ def _cortex_rate_with_mod(mod_value: float, n_steps: int = 100) -> float:
     )
 
     def scan_fn(s, _):
-        out = cortical_area_step(s, params, ctx, inputs, apply_stdp=False)
+        out = cortical_area_step(s, params, ctx, inputs, apply_ipool_stdp=False)
         return out.state, out.state.rate_l4.mean()
 
     _, hist = jax.lax.scan(scan_fn, state, None, length=n_steps)
@@ -66,29 +64,34 @@ def test_excitability_down_decreases_firing():
     )
 
 
-def test_theta_cycle_in_minimal_brain_modulates_activity():
-    """Bez ingerencji — czy brain_step faktycznie liczy theta i podaje?
-
-    Sprawdzamy: oscillator.theta_phase zmienia się w czasie (nie jest
+def test_theta_cycle_in_action_brain_modulates_activity():
+    """Sprawdzamy: oscillator.theta_phase zmienia się w czasie (nie jest
     zamrożony) i cortex rate ma non-zero variance (nie stałe constans).
     """
+    from core.brain_graph import (
+        init_action_brain_params, init_action_brain_state,
+        action_brain_cognitive_step,
+    )
     ctx = BackendContext(dt=1.0)
-    params = init_minimal_brain_params(ctx, sensory_size=16)
-    state = init_minimal_brain_state(jax.random.PRNGKey(0), params)
+    params = init_action_brain_params(
+        ctx, sensory_size=16, n_body_actions=2, substeps=4,
+    )
+    state = init_action_brain_state(jax.random.PRNGKey(0), params)
     sensory = jnp.ones((16,), jnp.float32) * 0.15
 
-    def scan_fn(s, _):
-        out = minimal_brain_step(s, params, ctx, sensory)
-        return out.state, (
-            out.state.oscillator.theta_phase,
-            out.state.cortex.rate_l4.mean(),
-        )
+    phases = []
+    rates = []
+    key = jax.random.PRNGKey(42)
+    for _ in range(50):
+        key, k = jax.random.split(key)
+        out = action_brain_cognitive_step(state, params, ctx, sensory, key=k)
+        state = out.state
+        phases.append(float(state.oscillator.theta_phase))
+        rates.append(float(state.cortex.rate_l4.mean()))
 
-    _, (phases, rates) = jax.lax.scan(scan_fn, state, None, length=500)
-    # Theta phase must advance (not frozen, not constant).
+    phases = jnp.array(phases)
+    rates = jnp.array(rates)
     phase_range = float(jnp.max(phases) - jnp.min(phases))
     assert phase_range > 3.0, f"Theta phase stuck: range {phase_range:.3f}"
-    # Rates have some variance (consistent with phase-dependent modulation
-    # + noise). Over 500 ms with 6 Hz theta we expect ~3 cycles.
-    rate_std = float(jnp.std(rates[100:]))
+    rate_std = float(jnp.std(rates[10:]))
     assert rate_std > 0.0, "cortex rate perfectly constant — theta gate not wired"

@@ -36,11 +36,6 @@ class ReceptorType(Enum):
     # Serotonin
     HT1A = auto()
     HT2A = auto()
-    # GABA / Glutamate (kept for completeness, unused in modulation vector)
-    GABA_A = auto()
-    GABA_B = auto()
-    AMPA = auto()
-    NMDA = auto()
 
 
 RECEPTOR_ORDER: tuple[ReceptorType, ...] = (

@@ -81,7 +81,9 @@ def run_episode(
         k, k_sel, k_act = split_key(k, 3)
         out = action_brain_step(
             brain_state, brain_params, ctx,
-            sample.sensory, prev_reward, prev_done, k_sel,
+            sample.info["image"],
+            sample.info["fixation_xy"],
+            prev_reward, prev_done, k_sel,
         )
         brain_state = out.state
 

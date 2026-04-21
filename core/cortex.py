@@ -47,6 +47,7 @@ import jax
 import jax.numpy as jnp
 
 from .backend import DTYPE, Array, PRNGKey, BackendContext, split_key
+from .synapse import nmda_mg_block
 from .state import NeuronParams, NeuronState, init_neuron_state, AstrocyteState
 from .neuron import init_neuron_params, neuron_step, AstroMod
 from .astrocyte import (
@@ -221,9 +222,6 @@ def _rheobase_cond_scale(
     return headroom * i_rheo / max(denom, 1e-6)
 
 
-def _nmda_mg_block(v: Array) -> Array:
-    return 1.0 / (1.0 + 0.28 * jnp.exp(-0.062 * v))
-
 
 # =====================================================================
 # Init
@@ -374,7 +372,7 @@ def _pop_step(
     ipool_params: IPoolParams, ctx: BackendContext,
     pre: Array, w_in: Array, g_nmda: Array,
     *, cond_scale: Array, ampa_frac: Array, nmda_decay: Array,
-    e_exc: Array, receptor_gain: Array, apply_stdp_ipool: bool,
+    e_exc: Array, receptor_gain: Array, apply_ipool_stdp: bool,
     astro: AstroMod | None = None,
 ):
     """Shared AdEx+IPool block used by L4 and L5.
@@ -385,7 +383,7 @@ def _pop_step(
     g_total = (pre @ w_in) * receptor_gain * cond_scale
     # NMDA slow EMA
     g_nmda_new = g_nmda * nmda_decay + (1.0 - nmda_decay) * g_total
-    mg = _nmda_mg_block(nstate.v)
+    mg = nmda_mg_block(nstate.v)
     g_syn = ampa_frac * g_total + (1.0 - ampa_frac) * g_nmda_new * mg
     i_syn = g_syn * (e_exc - nstate.v)
 
@@ -394,7 +392,7 @@ def _pop_step(
     )
     ip_out = ipool_step(
         ipool_state, ipool_params, ctx, spikes, new_n.v,
-        apply_stdp=apply_stdp_ipool,
+        apply_stdp=apply_ipool_stdp,
     )
     v_corr = ip_out.i_inh / ncfg.g_L
     v_new = jnp.clip(new_n.v - v_corr, -90.0, None)
@@ -402,13 +400,14 @@ def _pop_step(
     return new_n, spikes, ip_out.state, g_nmda_new
 
 
+@eqx.filter_jit
 def cortical_area_step(
     state: CorticalAreaState,
     params: CorticalAreaParams,
     ctx: BackendContext,
     inputs: CorticalInputs,
     *,
-    apply_stdp: bool = True,
+    apply_ipool_stdp: bool = True,
 ) -> CorticalOutput:
     """One ``dt`` of canonical microcircuit dynamics.
 
@@ -455,7 +454,7 @@ def cortical_area_step(
         pre=ff, w_in=state.w_l4_in, g_nmda=state.g_nmda_l4,
         cond_scale=params.l4_cond_scale, ampa_frac=params.ampa_frac,
         nmda_decay=params.nmda_decay, e_exc=params.e_exc,
-        receptor_gain=rg_eff, apply_stdp_ipool=apply_stdp, astro=l4_astro,
+        receptor_gain=rg_eff, apply_ipool_stdp=apply_ipool_stdp, astro=l4_astro,
     )
 
     # -- (2) L2/3 PC --
@@ -472,7 +471,7 @@ def cortical_area_step(
         pre=l23_state_drive, w_in=state.w_l23_l5, g_nmda=state.g_nmda_l5,
         cond_scale=params.l5_cond_scale, ampa_frac=params.ampa_frac,
         nmda_decay=params.nmda_decay, e_exc=params.e_exc,
-        receptor_gain=rg_eff, apply_stdp_ipool=apply_stdp, astro=l5_astro,
+        receptor_gain=rg_eff, apply_ipool_stdp=apply_ipool_stdp, astro=l5_astro,
     )
 
     # -- (4) Rate EMAs --

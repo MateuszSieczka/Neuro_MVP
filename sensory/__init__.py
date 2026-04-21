@@ -49,6 +49,11 @@ from .auditory import (
     CochleaConfig, Cochleogram, cochlea_step,
     mgn_normalize, init_a1_params, init_a1_state,
 )
+from .sensory_stack import (
+    SensoryStackParams, SensoryStackState, SensoryStackOutput,
+    init_sensory_stack_params, init_sensory_stack_state,
+    sensory_stack_step,
+)
 
 __all__ = [
     "RetinaConfig", "RetinalSample", "RetinaState",
@@ -59,4 +64,7 @@ __all__ = [
     "init_v4it_params", "init_v4it_state",
     "CochleaConfig", "Cochleogram", "cochlea_step",
     "mgn_normalize", "init_a1_params", "init_a1_state",
+    "SensoryStackParams", "SensoryStackState", "SensoryStackOutput",
+    "init_sensory_stack_params", "init_sensory_stack_state",
+    "sensory_stack_step",
 ]

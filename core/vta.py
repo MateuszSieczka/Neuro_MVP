@@ -81,11 +81,21 @@ def init_vta_params(
     # appetitive-baseline timescale (Bayer & Glimcher 2005;
     # Padoa-Schioppa & Cai 2011).
     tau_reward_baseline: float = 30_000.0,
-    min_gain: float = 0.01,
+    # Baseline DA firing rate (Grace 1991: tonic VTA DA neurons fire
+    # 3-8 Hz at rest). The D2 autoreceptor RMS normaliser must not
+    # divide by zero when actual rewards are absent; the biophysical
+    # floor is the tonic DA variance, which for an independent-spike
+    # process at rate f with gain g over dt is f · g · dt. At 3 Hz,
+    # gain 1.0, dt = 1 ms this gives 3e-3 — the minimum reward-signal
+    # amplitude the circuit *can* resolve. Previously an empirical
+    # 0.01; now derived.
+    baseline_da_rate_hz: float = 3.0,
     readout_decay: float = 2e-5,
     dtype=DTYPE,
 ) -> VTAParams:
     f = lambda x: jnp.asarray(x, dtype)
+    # SNR floor: tonic DA rate × reward_gain × dt (dt in ms → /1000).
+    min_gain = baseline_da_rate_hz * reward_gain * (float(ctx.dt) / 1000.0)
     return VTAParams(
         tau_ppTg=f(tau_ppTg),
         reward_gain=f(reward_gain),

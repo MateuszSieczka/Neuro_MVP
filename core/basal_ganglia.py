@@ -51,6 +51,7 @@ from .interneuron import (
     ipool_step, ipool_reset_transient,
 )
 from .receptor import hill_response
+from .synapse import nmda_mg_block as _nmda_mg_block
 
 
 # =====================================================================
@@ -162,7 +163,8 @@ class CriticState(eqx.Module):
     w_h: Array              # (state_size, hidden_size)
     g_nmda: Array           # (hidden_size,)
     activation: Array       # (hidden_size,) rate EMA
-    e_h: Array              # (state_size, hidden_size) eligibility
+    e_h: Array              # (state_size, hidden_size) live eligibility
+    e_h_committed: Array    # (state_size, hidden_size) frozen at cycle end
     x_pre: Array            # (state_size,)
     x_post: Array           # (hidden_size,)
 
@@ -191,14 +193,10 @@ def init_critic_state(
         g_nmda=jnp.zeros(params.hidden_size, dtype),
         activation=jnp.zeros(params.hidden_size, dtype),
         e_h=jnp.zeros((params.state_size, params.hidden_size), dtype),
+        e_h_committed=jnp.zeros((params.state_size, params.hidden_size), dtype),
         x_pre=jnp.zeros(params.state_size, dtype),
         x_post=jnp.zeros(params.hidden_size, dtype),
     )
-
-
-def _nmda_mg_block(v: Array) -> Array:
-    """Jahr & Stevens 1990 voltage-dep Mg²⁺ block."""
-    return 1.0 / (1.0 + 0.28 * jnp.exp(-0.062 * v))
 
 
 class CriticOutput(NamedTuple):
@@ -207,6 +205,7 @@ class CriticOutput(NamedTuple):
     activation: Array       # rate EMA (readout for V(s))
 
 
+@eqx.filter_jit
 def critic_step(
     state: CriticState, params: CriticParams, ctx: BackendContext,
     state_spikes: Array,
@@ -263,7 +262,8 @@ def critic_step(
     new_s = CriticState(
         nstate=new_n, ipool=ipool_out.state, w_h=state.w_h,
         g_nmda=g_nmda, activation=activation,
-        e_h=e_h, x_pre=x_pre, x_post=x_post,
+        e_h=e_h, e_h_committed=state.e_h_committed,
+        x_pre=x_pre, x_post=x_post,
     )
     return CriticOutput(state=new_s, spikes=spikes, activation=activation)
 
@@ -273,11 +273,30 @@ def critic_update(
     td_error: float | Array,
     *, receptor_lr: float | Array = 1.0,
 ) -> CriticState:
-    """Three-factor STDP: Δw_h = critic_lr · td · e_h."""
+    """Three-factor STDP: Δw_h = critic_lr · td · e_h_committed.
+
+    Uses the eligibility trace committed at the end of the previous
+    cycle (reflecting ``pre(s_{t-1}) × post(s_{t-1})``) so that the TD
+    error for the ``(s_{t-1} → s_t)`` transition credits the weights
+    that produced ``V(s_{t-1})`` — standard TD(0) semantics
+    (Sutton & Barto 2018 §6.1).
+    """
     td = jnp.asarray(td_error, DTYPE)
     rlr = jnp.asarray(receptor_lr, DTYPE)
-    dw = params.critic_lr * rlr * td * state.e_h
+    dw = params.critic_lr * rlr * td * state.e_h_committed
     return eqx.tree_at(lambda s: s.w_h, state, state.w_h + dw)
+
+
+def critic_commit_eligibility(state: CriticState) -> CriticState:
+    """Freeze the current live trace as ``e_h_committed``.
+
+    Called at the end of each decision cycle, after the critic has
+    perceived ``s_t`` for the full substep window. The committed
+    trace represents the correlation ``pre(s_t) × post(s_t)`` and
+    will be used by ``critic_update`` in the next cycle to apply the
+    ``(s_t → s_{t+1})`` TD error to ``w_h``.
+    """
+    return eqx.tree_at(lambda s: s.e_h_committed, state, state.e_h)
 
 
 def critic_reset_transient(
@@ -290,6 +309,7 @@ def critic_reset_transient(
         g_nmda=jnp.zeros_like(state.g_nmda),
         activation=jnp.zeros_like(state.activation),
         e_h=jnp.zeros_like(state.e_h),
+        e_h_committed=jnp.zeros_like(state.e_h_committed),
         x_pre=jnp.zeros_like(state.x_pre),
         x_post=jnp.zeros_like(state.x_post),
     )
@@ -327,8 +347,7 @@ class ActorParams(eqx.Module):
     nmda_decay: Array
     ampa_frac: Array
     cond_scale: Array         # forward-time conductance boost
-    voltage_floor: Array
-    down_state_factor: Array
+
     # Lateral (Taverna 2008): g_lat = p_conn · iPSP / driving_force
     g_lat_d1: Array
     g_lat_d2: Array
@@ -370,8 +389,6 @@ def init_actor_params(
     v_thresh: float = -55.0,
     v_reset: float = -75.0,
     C_m: float = 281.0,
-    voltage_floor: float = 0.07,
-    down_state_factor: float = 0.1,
 ) -> ActorParams:
     n_per_action = max(1, n_per_action)
     total_motor = motor_dim * n_per_action
@@ -422,8 +439,6 @@ def init_actor_params(
         nmda_decay=f(ctx.decay(tau_nmda)),
         ampa_frac=f(ampa_frac),
         cond_scale=f(cond_scale),
-        voltage_floor=f(voltage_floor),
-        down_state_factor=f(down_state_factor),
         g_lat_d1=f(g_lat_d1), g_lat_d2=f(g_lat_d2), g_lat_x=f(g_lat_x),
         state_size=state_size,
         motor_dim=motor_dim, n_per_action=n_per_action,
@@ -442,8 +457,11 @@ class ActorState(eqx.Module):
     g_nmda_d2: Array
     rate_d1: Array
     rate_d2: Array
-    e_d1: Array
+    e_d1: Array             # live eligibility (updated per substep)
     e_d2: Array
+    e_d1_committed: Array   # frozen at end of cycle after action selection
+    e_d2_committed: Array
+    action_mask_committed: Array  # (action_dim,) one-hot of committed action
     x_pre: Array
     x_post_d1: Array
     x_post_d2: Array
@@ -481,6 +499,9 @@ def init_actor_state(
         rate_d1=z(ad), rate_d2=z(ad),
         e_d1=z((params.state_size, ad)),
         e_d2=z((params.state_size, ad)),
+        e_d1_committed=z((params.state_size, ad)),
+        e_d2_committed=z((params.state_size, ad)),
+        action_mask_committed=z(ad),
         x_pre=z(params.state_size),
         x_post_d1=z(ad), x_post_d2=z(ad),
         spike_count_d1=z(ad), spike_count_d2=z(ad),
@@ -502,6 +523,14 @@ class ActorInputs(NamedTuple):
     epistemic_drive: Array | float = 0.0
     efe_g: Array | None = None
     receptor_gain: Array | float = 1.0
+    # Cortical γ amplitude (30–90 Hz) synchronises striatal fast-spiking
+    # interneurons and potentiates MSN excitability during action
+    # initiation windows (Berke 2009; van der Meer & Redish 2009).
+    # Baseline 0.5 ⇒ zero net effect; deviations ±0.5 produce ±2.5 %
+    # multiplicative gain on the D1+D2 synaptic drive. Small gain keeps
+    # MSN response staying within the AdEx stability envelope while
+    # still letting cortical rhythms bias action selection.
+    gamma_amp: Array | float = 0.5
 
 
 def _hill(x: Array, ec50: Array, n: Array) -> Array:
@@ -518,6 +547,7 @@ class ActorOutput(NamedTuple):
     net_evidence: Array     # (motor_dim,) spike-count D1 - D2 aggregated
 
 
+@eqx.filter_jit
 def actor_step(
     state: ActorState, params: ActorParams, ctx: BackendContext,
     state_spikes: Array,
@@ -529,6 +559,11 @@ def actor_step(
     tonic = jnp.clip(jnp.asarray(inputs.tonic_da, DTYPE), 0.0, 1.0)
     eps = jnp.clip(jnp.asarray(inputs.epistemic_drive, DTYPE), 0.0, 1.0)
     rg = jnp.asarray(inputs.receptor_gain, DTYPE)
+    # γ amplitude → striatal FSI-mediated excitability gain, centred on
+    # 0.5 so the baseline rhythm produces unit gain (Berke 2009).
+    gamma = jnp.asarray(inputs.gamma_amp, DTYPE)
+    gamma_gain = 1.0 + 0.05 * (gamma - 0.5)
+    rg = rg * gamma_gain
     # EFE input: (motor_dim,) per-action conductance \u2192 expand to (total_motor,)
     # via ``repeat`` across the ``n_per_action`` MSN subpopulation.
     if inputs.efe_g is None:
@@ -567,7 +602,7 @@ def actor_step(
     i_d1 = i_d1 * d1_mod
     i_d2 = i_d2 * d2_mod * d2_tonic
 
-    # STN-GPe gate (HACK A): only suppress when DA below baseline
+    # STN-GPe gate: only suppress when DA below baseline
     da_deficit = jnp.maximum(params.baseline_da - da, 0.0)
     stn_factor = jnp.maximum(1.0 - params.stn_strength * da_deficit, 0.0)
     i_d1 = i_d1 * stn_factor
@@ -632,20 +667,16 @@ def actor_step(
     x_post_d1 = state.x_post_d1 * params.post_decay + spk_d1
     x_post_d2 = state.x_post_d2 * params.post_decay + spk_d2
 
-    # Hybrid eligibility (HACK B): spike trace + voltage floor (Clopath)
-    v_d1_norm = jnp.clip(
-        (v_d1 - params.ncfg.v_rest) / (params.ncfg.v_thresh - params.ncfg.v_rest),
-        0.0, 1.0,
-    )
-    v_d2_norm = jnp.clip(
-        (v_d2 - params.ncfg.v_rest) / (params.ncfg.v_thresh - params.ncfg.v_rest),
-        0.0, 1.0,
-    )
-    post_d1 = jnp.maximum(x_post_d1, params.voltage_floor * v_d1_norm)
-    post_d2 = jnp.maximum(x_post_d2, params.voltage_floor * v_d2_norm)
+    # Spike-triggered eligibility (Shen, Flajolet, Greengard & Surmeier
+    # 2008).  Corticostriatal STDP at MSNs strictly requires an EPSP
+    # paired with a post-synaptic spike; the post-side trace is the
+    # exponentially-decaying spike train itself.  No subthreshold
+    # "voltage floor" is introduced: MSNs in the down-state have zero
+    # plasticity (Wilson & Kawaguchi 1996; Gertler 2008), which is
+    # already enforced globally by ``action_mask_committed``.
     e_compl = 1.0 - params.trace_decay
-    e_d1 = state.e_d1 * params.trace_decay + e_compl * inp[:, None] * post_d1[None, :]
-    e_d2 = state.e_d2 * params.trace_decay + e_compl * inp[:, None] * post_d2[None, :]
+    e_d1 = state.e_d1 * params.trace_decay + e_compl * inp[:, None] * x_post_d1[None, :]
+    e_d2 = state.e_d2 * params.trace_decay + e_compl * inp[:, None] * x_post_d2[None, :]
 
     # Evidence accumulator
     sc_d1 = state.spike_count_d1 + spk_d1
@@ -663,6 +694,9 @@ def actor_step(
         g_nmda_d1=g_nmda_d1, g_nmda_d2=g_nmda_d2,
         rate_d1=rate_d1, rate_d2=rate_d2,
         e_d1=e_d1, e_d2=e_d2,
+        e_d1_committed=state.e_d1_committed,
+        e_d2_committed=state.e_d2_committed,
+        action_mask_committed=state.action_mask_committed,
         x_pre=x_pre, x_post_d1=x_post_d1, x_post_d2=x_post_d2,
         spike_count_d1=sc_d1, spike_count_d2=sc_d2,
         efe_g=efe_g,
@@ -709,52 +743,75 @@ def actor_reset_evidence(state: ActorState) -> ActorState:
 # ---------------------- Learning -----------------------------------
 
 
-def _gate_eligibility_to_action(
-    e: Array, action: Array, params: ActorParams,
-) -> Array:
-    """Multiply eligibility for non-chosen actions by ``down_state_factor``.
+def _action_mask(action: Array, params: ActorParams) -> Array:
+    """One-hot gating vector across the full ``action_dim``.
 
-    Preserves full credit for the chosen action's MSN population;
-    DOWN-state action channels keep only residual plasticity.
+    Motor channels of the chosen action get 1.0; all other motor
+    channels get 0.0 (MSN down-state → blocked plasticity,
+    Gertler et al. 2008; Shen et al. 2008). Internal (non-motor)
+    slots always get 1.0 — they are not contested by action selection.
     """
     npa = params.n_per_action
-    M = params.motor_dim
     tm = params.total_motor
-    # Build (action_dim,) gating vector: 1.0 for chosen action block,
-    # down_state_factor for other motor slots, 1.0 for internal slots
     idx = jnp.arange(tm)
     action_block = idx // npa
-    motor_gate = jnp.where(
-        action_block == action, 1.0, params.down_state_factor,
-    ).astype(DTYPE)
+    motor_gate = (action_block == action).astype(DTYPE)
     internal_gate = jnp.ones(params.action_dim - tm, DTYPE)
-    gate = jnp.concatenate([motor_gate, internal_gate])
-    return e * gate[None, :]
+    return jnp.concatenate([motor_gate, internal_gate])
+
+
+def actor_commit_eligibility(
+    state: ActorState, params: ActorParams, action: int | Array,
+) -> ActorState:
+    """Freeze live traces + record action one-hot at cycle end.
+
+    Called after ``actor_select_action``. The committed trace
+    ``(e_d1, e_d2)`` represents the correlation ``pre(s_t) × post(s_t)``
+    built during perception of ``s_t``; in the NEXT cycle it will be
+    multiplied by the RPE ``δ_{t+1} = r_{t+1} + γV(s_{t+1}) − V(s_t)``
+    and the stored ``action_mask`` to credit only the MSN population
+    of the selected action (Sutton & Barto 2018 §12 eligibility traces;
+    Gertler et al. 2008 MSN up/down-state gating).
+    """
+    act = jnp.asarray(action, jnp.int32)
+    mask = _action_mask(act, params)
+    return eqx.tree_at(
+        lambda s: (s.e_d1_committed, s.e_d2_committed,
+                   s.action_mask_committed),
+        state,
+        (state.e_d1, state.e_d2, mask),
+    )
 
 
 def actor_update(
     state: ActorState, params: ActorParams,
-    td_error: float | Array, action: int | Array,
+    td_error: float | Array,
     *, receptor_lr: float | Array = 1.0,
 ) -> ActorState:
     """Collins & Frank asymmetric DA-modulated STDP (Shen 2008).
 
     TD > 0  (DA burst):  D1 LTP
     TD < 0  (DA dip):    D2 LTP + D1 LTD
-    Non-chosen action eligibilities are down-weighted before applying.
+
+    Uses the eligibility traces + action mask committed at the end of
+    the PREVIOUS cycle (representing the chosen action's correlations
+    with ``s_{t-1}``). This is standard TD(0) + eligibility with an
+    explicit commit point: the live trace is reserved for building up
+    correlations during perception of the next state.
     """
     td = jnp.asarray(td_error, DTYPE)
     rlr = jnp.asarray(receptor_lr, DTYPE)
-    act = jnp.asarray(action, jnp.int32)
     base_lr = params.actor_lr * rlr
 
     da = jnp.clip(state.da_level, 0.0, 1.0)
     d1_r = _hill(da, params.d1_ec50, params.d1_hill_n)
     d2_r = _hill(da, params.d2_ec50, params.d2_hill_n)
 
-    # Action-gate eligibility
-    e_d1_g = _gate_eligibility_to_action(state.e_d1, act, params)
-    e_d2_g = _gate_eligibility_to_action(state.e_d2, act, params)
+    # Apply action one-hot to committed traces (hard gating per Dale +
+    # MSN up/down-state; non-chosen channels receive zero plasticity).
+    mask = state.action_mask_committed[None, :]
+    e_d1_g = state.e_d1_committed * mask
+    e_d2_g = state.e_d2_committed * mask
 
     # D1 LTP for TD>0, LTD (· ltd_ratio) for TD<0 — signed TD handles
     # direction automatically; JIT-safe via jnp.where masks.
@@ -792,6 +849,9 @@ def actor_reset_transient(
         rate_d1=z(ad), rate_d2=z(ad),
         e_d1=z((params.state_size, ad)),
         e_d2=z((params.state_size, ad)),
+        e_d1_committed=z((params.state_size, ad)),
+        e_d2_committed=z((params.state_size, ad)),
+        action_mask_committed=z(ad),
         x_pre=z(params.state_size),
         x_post_d1=z(ad), x_post_d2=z(ad),
         spike_count_d1=z(ad), spike_count_d2=z(ad),
@@ -800,20 +860,3 @@ def actor_reset_transient(
         da_level=jnp.asarray(0.5, DTYPE),
         tonic_da=jnp.asarray(float(params.baseline_da), DTYPE),
     )
-
-
-def action_entropy(state: ActorState, params: ActorParams) -> Array:
-    """Decision uncertainty in [0, 1] from winner – runner-up margin."""
-    tm = params.total_motor
-    ev_d1 = state.spike_count_d1[:tm].reshape(
-        params.motor_dim, params.n_per_action).sum(axis=1)
-    ev_d2 = state.spike_count_d2[:tm].reshape(
-        params.motor_dim, params.n_per_action).sum(axis=1)
-    net = ev_d1 - ev_d2
-    sorted_ev = jnp.sort(net)[::-1]
-    margin = sorted_ev[0] - sorted_ev[1]
-    ev_range = sorted_ev[0] - sorted_ev[-1]
-    uncertainty = jnp.where(
-        ev_range > 1e-8, 1.0 - margin / (ev_range + 1e-8), 1.0,
-    )
-    return jnp.clip(uncertainty, 0.0, 1.0)

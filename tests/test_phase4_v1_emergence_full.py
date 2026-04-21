@@ -102,7 +102,7 @@ def _drive_random_gratings(state, params, ctx, key, *, n_steps: int):
         img = _grating(theta, sf, phase)
         fix = jax.random.uniform(k_fix, (2,), jnp.float32, 0.3, 0.7)
         out = sensory_stack_step(
-            st, params, ctx, img, fix, apply_stdp=True,
+            st, params, ctx, img, fix, apply_ipool_stdp=True,
         )
         return out.state, None
 
@@ -131,7 +131,7 @@ def _probe_orientation_responses(state, params, ctx, *, n_settle: int = 60):
 
         def step(st, _):
             o = sensory_stack_step(
-                st, params, ctx, img, fix, apply_stdp=False,
+                st, params, ctx, img, fix, apply_ipool_stdp=False,
             )
             return o.state, o.belief
 

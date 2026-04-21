@@ -204,6 +204,7 @@ def _kwta(pre_act: Array, k: int) -> Array:
     return jnp.where(active, jnp.maximum(pre_act, 0.0), 0.0)
 
 
+@eqx.filter_jit
 def cerebellum_step(
     state: CerebellumState,
     params: CerebellumParams,

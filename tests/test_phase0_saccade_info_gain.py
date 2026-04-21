@@ -2,9 +2,13 @@
 
 Weryfikuje że:
   1. `action_brain_step` akceptuje kwarg `info_gain` i ustawia state.last_info_gain.
-  2. Z info_gain=0 → stare zachowanie; z info_gain>0 → saccade actor uczy się inaczej niż body.
+  2. Z info_gain=0 → stare zachowanie; z info_gain>0 → saccade actor
+     uczy się inaczej niż body.
   3. Body actor nie jest modyfikowany przez info_gain (routing).
-  4. beta_saccade skaluje wpływ (większe beta → większy wpływ).
+
+Info-gain wchodzi do saccade RPE **addytywnie** na jednostkowej
+precyzji (Friston 2017 active inference, Eq. 2.9) — żadnych
+tuning-scalarów typu ``beta_saccade``.
 """
 
 from __future__ import annotations
@@ -14,18 +18,18 @@ import jax.numpy as jnp
 
 from core.backend import BackendContext
 from core.brain_graph import (
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from embodiment.bandit import GaussianBanditBody
 
 
-def _run_brain(info_gain: float, steps: int, beta_saccade: float = 0.05):
+def _run_brain(info_gain: float, steps: int):
     ctx = BackendContext(dt=1.0)
     body = GaussianBanditBody.create(jax.random.PRNGKey(0), n_actions=3)
     params = init_action_brain_params(
         ctx, sensory_size=body.sensory_size,
         n_body_actions=3, n_saccade_actions=2,
-        beta_saccade=beta_saccade,
     )
     state = init_action_brain_state(jax.random.PRNGKey(1), params)
     key = jax.random.PRNGKey(2)
@@ -34,7 +38,7 @@ def _run_brain(info_gain: float, steps: int, beta_saccade: float = 0.05):
     prev_d = jnp.asarray(0.0, jnp.float32)
     for _ in range(steps):
         key, k_step = jax.random.split(key)
-        out = action_brain_step(
+        out = action_brain_cognitive_step(
             state, params, ctx, sample.sensory, prev_r, prev_d, k_step,
             info_gain=jnp.asarray(info_gain, jnp.float32),
         )
@@ -72,22 +76,4 @@ def test_info_gain_changes_saccade_weights_not_body():
     # Saccade actor should diverge.
     assert saccade_diff > 1e-4, (
         f"saccade actor should diverge: {saccade_diff:.2e}"
-    )
-
-
-def test_beta_saccade_scales_effect():
-    """Bigger beta_saccade → bigger effect on saccade weights."""
-    s_low = _run_brain(info_gain=0.5, steps=10, beta_saccade=0.01)
-    s_high = _run_brain(info_gain=0.5, steps=10, beta_saccade=0.5)
-    s_base = _run_brain(info_gain=0.0, steps=10, beta_saccade=0.01)
-
-    diff_low = float(
-        jnp.abs(s_low.actor_saccade.w_d1 - s_base.actor_saccade.w_d1).sum()
-    )
-    diff_high = float(
-        jnp.abs(s_high.actor_saccade.w_d1 - s_base.actor_saccade.w_d1).sum()
-    )
-    assert diff_high > diff_low, (
-        f"high β should drive bigger divergence: low={diff_low:.2e}, "
-        f"high={diff_high:.2e}"
     )

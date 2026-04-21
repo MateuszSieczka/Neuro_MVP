@@ -19,7 +19,8 @@ from core.pfc import (
     pfc_select_reset,
 )
 from core.brain_graph import (
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from embodiment.bandit import GaussianBanditBody
 
@@ -118,7 +119,7 @@ def test_action_brain_includes_pfc_in_striatal_drive():
     prev_d = jnp.asarray(0.0, jnp.float32)
     for i in range(3):
         key, k_step = jax.random.split(key)
-        out = action_brain_step(
+        out = action_brain_cognitive_step(
             state, params, ctx, sample.sensory, prev_r, prev_d, k_step,
         )
         state = out.state
@@ -147,7 +148,7 @@ def test_action_brain_pfc_resets_on_done():
     # Drive a few steps so PFC picks up *some* rate.
     for i in range(5):
         key, k_step = jax.random.split(key)
-        out = action_brain_step(
+        out = action_brain_cognitive_step(
             state, params, ctx, sample.sensory,
             jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32),
             k_step,
@@ -160,7 +161,7 @@ def test_action_brain_pfc_resets_on_done():
     # of action_brain_step — so call it with done=1 and observe that
     # the returned state's pfc is the one that ran with a reset PFC.
     key, k_step = jax.random.split(key)
-    out_done = action_brain_step(
+    out_done = action_brain_cognitive_step(
         state, params, ctx, sample.sensory,
         jnp.asarray(0.0, jnp.float32), jnp.asarray(1.0, jnp.float32),
         k_step,

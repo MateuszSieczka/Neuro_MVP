@@ -44,12 +44,16 @@ def _build(seed: int):
     )
     ss_params = init_sensory_stack_params(
         ctx, retina_cfg=cfg,
-        n_l4=64, n_l23_state=32, n_l23_error=16, n_l5=16,
+        n_l4=32, n_l23_state=16, n_l23_error=8, n_l5=8,
     )
     params = init_action_brain_params(
         ctx, sensory_size=0, n_body_actions=4,
         sensory_stack_params=ss_params,
-        beta_saccade=0.2,            # Itti & Baldi weight (P0.8 default 0.05)
+        substeps=4,
+        n_tc=32, n_ct=16, n_trn=16,
+        cortex_n_l4=32, cortex_n_l23_state=32,
+        cortex_n_l23_error=32, cortex_n_l5=16,
+        critic_hidden=32, wm_hidden=32, wm_n_error=32,
     )
     state = init_action_brain_state(jax.random.PRNGKey(seed + 100), params)
     return ctx, body, params, state

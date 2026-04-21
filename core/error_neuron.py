@@ -362,11 +362,6 @@ def en_update_weights(
     )
 
 
-def en_generate_prediction(state: ErrorNeuronState) -> Array:
-    """Top-down prediction this area emits (``state_rate @ w_td``)."""
-    return state.state_rate @ state.w_td
-
-
 def en_receive_prediction(
     state: ErrorNeuronState, prediction: Array,
 ) -> ErrorNeuronState:

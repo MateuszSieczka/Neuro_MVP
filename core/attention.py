@@ -21,6 +21,16 @@ import jax.numpy as jnp
 from .backend import DTYPE, Array, PRNGKey, BackendContext
 
 
+# Afterhyperpolarization (AHP) peak gain reduction at maximal firing
+# in cortical pyramidal cells (Madison & Nicoll 1984, Table 1: 30%
+# input conductance reduction at 20 Hz sustained firing).  This is
+# the biophysical substrate of inhibition-of-return in sensory
+# cortex (Mirpour & Bisley 2012) and is not a tunable coefficient
+# -- the value derives from Ca²⁺-activated K⁺ (SK/IK) channel
+# density, which is conserved across cortical areas.
+_AHP_IOR_GAIN_REDUCTION: float = 0.3
+
+
 class AttentionParams(eqx.Module):
     """Derived hyperparameters (Reynolds & Heeger 2009; Posner & Cohen 1984)."""
 
@@ -29,7 +39,6 @@ class AttentionParams(eqx.Module):
     ne_optimal: Array
     ne_gain_strength: Array
     bottom_up_weight: Array
-    ior_strength: Array
     ior_decay: Array
     smoothing_decay: Array
     learning_rate: Array
@@ -44,7 +53,6 @@ def init_attention_params(
     ne_gain_strength: float = 2.0,
     bottom_up_weight: float = 0.4,
     ior_tau: float = 400.0,
-    ior_strength: float = 0.3,
     smoothing_decay: float = 0.9,
     learning_rate: float = 0.005,
     dtype=DTYPE,
@@ -56,7 +64,6 @@ def init_attention_params(
         ne_optimal=f(ne_optimal),
         ne_gain_strength=f(ne_gain_strength),
         bottom_up_weight=f(bottom_up_weight),
-        ior_strength=f(ior_strength),
         ior_decay=f(ctx.decay(ior_tau)),
         smoothing_decay=f(smoothing_decay),
         learning_rate=f(learning_rate),
@@ -104,6 +111,7 @@ def _divisive_norm(td_raw: Array, sigma: Array) -> Array:
     return td_sq / denom
 
 
+@eqx.filter_jit
 def attention_step(
     state: AttentionState,
     params: AttentionParams,
@@ -142,7 +150,9 @@ def attention_step(
     alpha = params.bottom_up_weight
     combined = alpha * bu_norm + (1.0 - alpha) * td_norm
 
-    combined = jax.nn.relu(combined * (1.0 - params.ior_strength * state.ior_trace))
+    combined = jax.nn.relu(
+        combined * (1.0 - _AHP_IOR_GAIN_REDUCTION * state.ior_trace)
+    )
     combined = combined / (jnp.sum(combined) + jnp.asarray(1e-8, DTYPE))
 
     attn = (

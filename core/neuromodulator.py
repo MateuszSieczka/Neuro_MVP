@@ -183,6 +183,7 @@ def _ema(prev: Array, x: Array, decay: Array) -> Array:
     return prev * decay + x * (1.0 - decay)
 
 
+@eqx.filter_jit
 def neuromodulator_step(
     state: NeuromodulatorState,
     params: NeuromodulatorParams,

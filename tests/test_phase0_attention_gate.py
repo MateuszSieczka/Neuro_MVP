@@ -15,8 +15,8 @@ import jax.numpy as jnp
 
 from core.backend import BackendContext
 from core.brain_graph import (
-    init_minimal_brain_params, init_minimal_brain_state, minimal_brain_step,
-    init_action_brain_params, init_action_brain_state, action_brain_step,
+    init_action_brain_params, init_action_brain_state,
+    action_brain_cognitive_step,
 )
 from core.thalamus import (
     init_relay_params, init_relay_state, init_trn_params, init_trn_state,
@@ -59,21 +59,23 @@ def test_thalamus_afferent_gain_boosts_rate():
     assert r_high > r_base, f"gain 2.0 should boost rate: base={r_base:.1f}, high={r_high:.1f}"
 
 
-def test_attention_state_evolves_in_minimal_brain():
+def test_attention_state_evolves_in_action_brain():
     ctx = BackendContext(dt=1.0)
-    params = init_minimal_brain_params(ctx, sensory_size=16)
-    state = init_minimal_brain_state(jax.random.PRNGKey(0), params)
+    params = init_action_brain_params(
+        ctx, sensory_size=16, n_body_actions=2, substeps=4,
+    )
+    state = init_action_brain_state(jax.random.PRNGKey(0), params)
     initial_attn = state.attention.attn_weights
 
     sensory = jnp.ones((16,), jnp.float32) * 0.3
-    for _ in range(200):
-        out = minimal_brain_step(state, params, ctx, sensory)
+    key = jax.random.PRNGKey(42)
+    for _ in range(30):
+        key, k = jax.random.split(key)
+        out = action_brain_cognitive_step(state, params, ctx, sensory, key=k)
         state = out.state
 
-    # attention distribution evolved away from uniform.
     diff = float(jnp.abs(state.attention.attn_weights - initial_attn).sum())
     assert diff > 1e-4, f"attn_weights didn't change (diff={diff:.2e})"
-    # Distribution is normalised (~1).
     s = float(state.attention.attn_weights.sum())
     assert 0.9 < s < 1.1
 
@@ -89,7 +91,7 @@ def test_action_brain_with_attention_stable():
     key = jax.random.PRNGKey(2)
     for _ in range(5):
         key, k = jax.random.split(key)
-        out = action_brain_step(
+        out = action_brain_cognitive_step(
             state, params, ctx, sensory,
             jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32),
             k,
@@ -98,5 +100,4 @@ def test_action_brain_with_attention_stable():
 
     assert jnp.isfinite(out.rpe)
     assert jnp.isfinite(state.attention.attn_weights).all()
-    # Gains are derived via ACh modulation; ensure they're sane.
     assert float(state.attention.attn_weights.min()) >= 0.0

@@ -62,7 +62,15 @@ from .spike_encoder import (
 
 
 class WorldModelParams(eqx.Module):
-    """Static params composing encoder + astrocyte + decoder."""
+    """Static params composing encoder + astrocyte + decoder.
+
+    ``pe_short_decay`` / ``pe_long_decay`` are the per-step EMA decays
+    for the short- and long-timescale absolute prediction-error
+    traces used to compute learning-progress curiosity (Oudeyer 2007
+    IAC; Schmidhuber 1991). Defaults are 100 ms (short) and 10 s
+    (long); long/short ratio > 10 ensures the difference is dominated
+    by trend, not by individual-trial noise.
+    """
 
     encoder: ErrorNeuronParams
     astro: AstrocyteParams
@@ -70,6 +78,8 @@ class WorldModelParams(eqx.Module):
     decode_lr: Array
     vesicle_p: Array
     zone_idx: Array                           # (n_error,) int32, error neuron \u2192 zone
+    pe_short_decay: Array                     # EMA decay for short-τ |PE|
+    pe_long_decay: Array                      # EMA decay for long-τ |PE|
     n_zones: int = eqx.field(static=True)
     max_rehearsal_depth: int = eqx.field(static=True)
     state_size: int = eqx.field(static=True)
@@ -86,13 +96,21 @@ def init_world_model_params(
     hidden_size: int = 64,
     n_error: int = 64,
     n_neurons_per_dim: int = 8,
-    encoder_lr: float = 5e-4,
-    decode_lr: float = 1e-3,
+    # Unified LR for encoder + decoder (Phase 0.5). Both pathways run
+    # at the same plasticity timescale — differential LRs were
+    # empirical with no biophysical basis, and modern STDP data
+    # (Bi & Poo 1998; Sjöström 2001) show cortical excitatory
+    # synapses share a τ_plasticity ≈ 60 s early-LTP time course
+    # regardless of afferent type.
+    wm_lr: float = 1e-3,
     vesicle_p: float = 0.8,
     max_rehearsal_depth: int = 5,
     astro_n_zones: int | None = None,
     state_min: float = -1.0,
     state_max: float = 1.0,
+    # Learning-progress timescales (Oudeyer 2007; Schmidhuber 1991).
+    tau_pe_short_ms: float = 100.0,
+    tau_pe_long_ms: float = 10_000.0,
 ) -> WorldModelParams:
     """Build world-model params for ``state_dim`` continuous states + discrete actions."""
     pop_enc = init_population_encoder(
@@ -105,7 +123,7 @@ def init_world_model_params(
     encoder = init_error_neuron_params(
         ctx, input_size,
         n_state=hidden_size, n_error=min(input_size, n_error),
-        w_bu_lr=encoder_lr, w_td_lr=encoder_lr,
+        w_bu_lr=wm_lr, w_td_lr=wm_lr,
     )
     n_zones = astro_n_zones if astro_n_zones is not None else max(4, hidden_size // 16)
     astro = init_astrocyte_params(ctx, ca_accumulation=0.15)
@@ -114,8 +132,10 @@ def init_world_model_params(
     f = lambda x: jnp.asarray(x, DTYPE)
     return WorldModelParams(
         encoder=encoder, astro=astro, pop_enc=pop_enc,
-        decode_lr=f(decode_lr), vesicle_p=f(vesicle_p),
+        decode_lr=f(wm_lr), vesicle_p=f(vesicle_p),
         zone_idx=zone_idx, n_zones=n_zones,
+        pe_short_decay=f(ctx.decay(tau_pe_short_ms)),
+        pe_long_decay=f(ctx.decay(tau_pe_long_ms)),
         max_rehearsal_depth=max_rehearsal_depth,
         state_size=state_size, action_size=action_size,
         hidden_size=hidden_size, input_size=input_size,
@@ -123,13 +143,27 @@ def init_world_model_params(
 
 
 class WorldModelState(eqx.Module):
-    """Dynamic state for the world model."""
+    """Dynamic state for the world model.
+
+    ``pe_short_abs`` / ``pe_long_abs`` are running EMAs of
+    ``mean(|prediction_error|)``, with short and long timescales from
+    ``WorldModelParams.pe_short_decay/pe_long_decay``. Their
+    difference implements learning-progress curiosity
+    (Oudeyer 2007 IAC): if PE is decreasing, the model is *still
+    learning* this region, so ``curiosity = relu(pe_long − pe_short) > 0``.
+    If PE is *increasing* (task drift / novelty), the long trace lags
+    below the short one, so ``boredom = relu(pe_short − pe_long) > 0``
+    drives arousal instead. Magnitude is self-calibrating: no magic
+    normalisation constant.
+    """
 
     encoder: ErrorNeuronState
     astro: AstrocyteState
     w_decode: Array          # (hidden_size, state_size)
     last_prediction: Array   # (state_size,)
     prediction_error: Array  # (state_size,)
+    pe_short_abs: Array      # scalar, short-τ EMA of mean(|PE|)
+    pe_long_abs: Array       # scalar, long-τ EMA of mean(|PE|)
 
 
 def init_world_model_state(
@@ -146,10 +180,12 @@ def init_world_model_state(
     w_decode = (jax.random.normal(
         k_dec, (params.hidden_size, params.state_size), dtype=dtype,
     ) * decode_init_std).astype(dtype)
+    z = jnp.asarray(0.0, dtype)
     return WorldModelState(
         encoder=encoder, astro=astro, w_decode=w_decode,
         last_prediction=jnp.zeros(params.state_size, dtype),
         prediction_error=jnp.zeros(params.state_size, dtype),
+        pe_short_abs=z, pe_long_abs=z,
     )
 
 
@@ -207,6 +243,7 @@ class WorldModelOutput(NamedTuple):
     prediction_error: Array        # (state_size,) actual − predicted
 
 
+@eqx.filter_jit
 def wm_predict(
     state: WorldModelState, params: WorldModelParams, ctx: BackendContext,
     state_spikes: Array, action_onehot: Array,
@@ -233,6 +270,7 @@ def wm_predict(
     )
 
 
+@eqx.filter_jit
 def wm_update(
     state: WorldModelState, params: WorldModelParams, ctx: BackendContext,
     state_spikes: Array, action_onehot: Array, actual_next: Array,
@@ -255,6 +293,22 @@ def wm_update(
     )
     actual = actual_next.astype(DTYPE)
     pe = actual - pred
+
+    # Learning-progress traces: EMA of mean(|PE|) at two timescales.
+    # Oudeyer (2007) IAC; Schmidhuber (1991) formal curiosity. A
+    # simple difference ``pe_long − pe_short`` is positive iff the
+    # model is improving (PE is decreasing) and negative iff the
+    # environment has changed (PE is rising), giving both curiosity
+    # and boredom signals from one pair of EMAs.
+    pe_abs = jnp.mean(jnp.abs(pe))
+    pe_short_abs = (
+        params.pe_short_decay * state.pe_short_abs
+        + (1.0 - params.pe_short_decay) * pe_abs
+    )
+    pe_long_abs = (
+        params.pe_long_decay * state.pe_long_abs
+        + (1.0 - params.pe_long_decay) * pe_abs
+    )
 
     # Astrocyte tracks encoder spike activity (error rate as rate proxy)
     zone_rates = aggregate_to_zones(
@@ -283,6 +337,7 @@ def wm_update(
     new_state = WorldModelState(
         encoder=enc_state, astro=astro, w_decode=w_decode,
         last_prediction=pred, prediction_error=pe,
+        pe_short_abs=pe_short_abs, pe_long_abs=pe_long_abs,
     )
     return WorldModelOutput(
         state=new_state, predicted_state=pred, belief=belief,
@@ -363,23 +418,51 @@ def wm_mental_rehearsal(
 def wm_curiosity_signal(
     state: WorldModelState, params: WorldModelParams,
 ) -> Array:
-    """Precision-weighted curiosity ∈ [0, 1], mapping to ACh drive.
+    """Smoothed mean-|PE| intrinsic drive (Pathak 2017 ICM; Friston 2010).
 
-    Normalises decoder MSE and encoder PE rate via ``x / (1 + x)``,
-    then combines with precisions from astrocyte (decoder side) and
-    inverse encoder error (encoder side).
+    Returns ``pe_short_abs``: a short-timescale EMA of mean(|PE|) in
+    the *natural* units of the prediction error — no magic
+    ``x / (1 + x)`` normalisation, which previously introduced an
+    arbitrary saturation point unrelated to the signal's physical
+    scale. Temporal smoothing (τ ≈ 100 ms) takes out single-dt spikes
+    so the drive represents "how hard the world is to predict *right
+    now*", not one transient. This is the intrinsic-reward curiosity
+    used by the body actor.
+
+    For the *sign* of learning (is PE going up or down?) see
+    :func:`wm_learning_progress` and :func:`wm_boredom_signal`.
     """
-    decoder_mse = jnp.mean(state.prediction_error ** 2)
-    encoder_mse = jnp.mean(en_prediction_error_rate(state.encoder) ** 2)
+    return state.pe_short_abs
 
-    dec_norm = decoder_mse / (1.0 + decoder_mse)
-    enc_norm = encoder_mse / (1.0 + encoder_mse)
 
-    dec_prec = jnp.mean(astrocyte_precision(state.astro))
-    enc_prec = 1.0 / (1.0 + encoder_mse)
-    total_prec = dec_prec + enc_prec + 1e-8
-    raw = (dec_prec * dec_norm + enc_prec * enc_norm) / total_prec
-    return jnp.clip(raw, 0.0, 1.0)
+def wm_boredom_signal(
+    state: WorldModelState, params: WorldModelParams,
+) -> Array:
+    """Task-drift alarm: ``relu(pe_short − pe_long)``.
+
+    Positive iff the short-term PE exceeds the long-term baseline →
+    the environment has changed (new task, new contingency, or the
+    current model has become wrong). Drives NE (arousal) rather than
+    ACh (curiosity), per Yu & Dayan (2005) uncertainty dissociation.
+    """
+    lp = state.pe_short_abs - state.pe_long_abs
+    return jnp.clip(lp, 0.0, jnp.inf)
+
+
+def wm_learning_progress(
+    state: WorldModelState, params: WorldModelParams,
+) -> Array:
+    """Signed learning progress ``pe_long − pe_short`` (Oudeyer 2007).
+
+    Positive iff the model's PE is *decreasing* (actively learning
+    this region). Use as a modulatory gate on exploration priority:
+    regions with positive LP are being mastered and should be
+    re-visited; regions with LP ≈ 0 and high PE are noise (the
+    classic "noisy-TV" failure mode of pure-PE curiosity); regions
+    with negative LP have *drifted* and should trigger boredom /
+    arousal via :func:`wm_boredom_signal`.
+    """
+    return state.pe_long_abs - state.pe_short_abs
 
 
 def wm_rehearsal_depth_from_serotonin(
@@ -393,11 +476,20 @@ def wm_rehearsal_depth_from_serotonin(
 def wm_reset_transient(
     state: WorldModelState, params: WorldModelParams,
 ) -> WorldModelState:
-    """Clear encoder + astrocyte + prediction transients; keep ``w_decode``."""
+    """Clear encoder + astrocyte + prediction transients; keep ``w_decode``.
+
+    Preserves ``pe_short_abs`` and ``pe_long_abs``: learning-progress
+    estimates are *cross-episode* by design (continual learning must
+    know whether a region is mastered regardless of episode
+    boundaries; resetting them would make every new episode look like
+    initial task drift and drive spurious exploration).
+    """
     enc = en_reset_transient(state.encoder, params.encoder)
     astro = init_astrocyte_state(params.n_zones)
     return WorldModelState(
         encoder=enc, astro=astro, w_decode=state.w_decode,
         last_prediction=jnp.zeros(params.state_size, DTYPE),
         prediction_error=jnp.zeros(params.state_size, DTYPE),
+        pe_short_abs=state.pe_short_abs,
+        pe_long_abs=state.pe_long_abs,
     )

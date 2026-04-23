@@ -41,7 +41,7 @@ coordination. Phase 2 advances the oscillator and exposes phases; Phase
 
 from __future__ import annotations
 
-from typing import NamedTuple, TYPE_CHECKING
+from typing import NamedTuple, TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
@@ -1109,6 +1109,75 @@ def _perceive_substep(
     ), (cx_out.belief, cx_out.l5_rate, thal.relay_spikes, attn_out.gains)
 
 
+@eqx.filter_jit
+def _perceive_scan_block(
+    state: ActionBrainState,
+    params: ActionBrainParams,
+    ctx: BackendContext,
+    sensory: Array,
+    prev_rpe: Array,
+    prev_curiosity: Array,
+    sws_flag: Array,
+    substep_keys: Array,
+) -> tuple[ActionBrainState, tuple[Array, Array, Array, Array]]:
+    """Run ``params.substeps`` perception substeps via ``jax.lax.scan``.
+
+    Factored out of ``action_brain_cognitive_step`` so that the scan
+    body is compiled ONCE (cached by ``@eqx.filter_jit``) and reused
+    across subsequent calls — critical when callers dispatch the
+    cognitive step from a Python loop (e.g. bandit rollouts,
+    gridworld episodes).  Without this helper, every call to the
+    surrounding ``action_brain_cognitive_step`` (which is itself NOT
+    jitted) would re-trace and re-compile the whole scan program,
+    producing 10-to-100× compile overhead.
+    """
+    def _scan_body(carry_state, k_sub):
+        new_state, readouts = _perceive_substep(
+            carry_state, params, ctx, sensory,
+            td_error=prev_rpe, novelty=prev_curiosity,
+            key=k_sub, sws_mode=sws_flag,
+        )
+        return new_state, readouts
+
+    state, readouts_stacked = jax.lax.scan(
+        _scan_body, state, substep_keys,
+    )
+    last_readouts = jax.tree_util.tree_map(
+        lambda x: x[-1], readouts_stacked,
+    )
+    return state, last_readouts
+
+
+@eqx.filter_jit
+def _sensory_scan_block(
+    ss_state,
+    ss_params,
+    ctx: BackendContext,
+    image: Array,
+    fixation_xy: Array,
+    ach: Array,
+    da: Array,
+    ne: Array,
+    length: int,
+) -> tuple[Any, tuple[Array, Array]]:
+    """Run ``length`` sensory-stack substeps via ``jax.lax.scan``.
+
+    Same rationale as ``_perceive_scan_block``: cache the compiled
+    scan across Python-loop callers.
+    """
+    from sensory.sensory_stack import sensory_stack_step
+
+    def _scan_body(carry_ss, _):
+        o = sensory_stack_step(
+            carry_ss, ss_params, ctx,
+            image, fixation_xy,
+            ach=ach, da=da, ne=ne, apply_ipool_stdp=True,
+        )
+        return o.state, (o.l4_rate, o.pe_rate)
+
+    return jax.lax.scan(_scan_body, ss_state, None, length=length)
+
+
 # ---------------------------------------------------------------------
 # Top-level: perceive→learn→perceive cycle (one body decision)
 # ---------------------------------------------------------------------
@@ -1205,17 +1274,26 @@ def action_brain_cognitive_step(
     k_scan, k_body, k_saccade = split_key(key, 3)
     substep_keys = jax.random.split(k_scan, params.substeps)
 
-    # Python loop: each call to _perceive_substep compiles once (JIT'd)
-    # and is cached, keeping XLA graph size bounded.
-    last_readouts = None
-    for i in range(params.substeps):
-        state, readouts = _perceive_substep(
-            state, params, ctx, sensory,
+    # ``jax.lax.scan`` over substeps: the body function is traced ONCE
+    # and iterated ``substeps`` times inside XLA.  A prior Python
+    # ``for`` loop unrolled the entire perceive graph (cortex 6L +
+    # thalamus + BG×2 + PFC + WM + neuromod + ACh + attention) by
+    # ``substeps`` copies, which blew up XLA compile time on GPU.
+    def _scan_perceive(carry_state, k_sub):
+        new_state, readouts = _perceive_substep(
+            carry_state, params, ctx, sensory,
             td_error=prev_rpe, novelty=prev_curiosity,
-            key=substep_keys[i],
+            key=k_sub,
             sws_mode=sws_flag,
         )
-        last_readouts = readouts
+        return new_state, readouts
+
+    state, readouts_stacked = jax.lax.scan(
+        _scan_perceive, state, substep_keys,
+    )
+    last_readouts = jax.tree_util.tree_map(
+        lambda x: x[-1], readouts_stacked,
+    )
 
     cortex_belief, cortex_l5_rate, relay_spikes, last_attn_gains = last_readouts
 
@@ -1631,19 +1709,22 @@ def action_brain_step(
     ne = state.neuromodulator.noradrenaline
 
     ss_state = state.sensory_stack
-    l4_rates = []
-    pe_rates = []
-    for _ in range(params.substeps):
+
+    # ``jax.lax.scan`` over the sensory-stack substeps.  The body is
+    # traced once; outputs ``l4_rate`` and ``pe_rate`` are stacked
+    # along axis 0 by ``scan`` with shape ``(substeps, …)``.
+    def _scan_sensory(carry_ss, _):
         o = sensory_stack_step(
-            ss_state, params.sensory_stack, ctx,
+            carry_ss, params.sensory_stack, ctx,
             image, fixation_xy,
             ach=ach, da=da, ne=ne, apply_ipool_stdp=True,
         )
-        ss_state = o.state
-        l4_rates.append(o.l4_rate)
-        pe_rates.append(o.pe_rate)
+        return o.state, (o.l4_rate, o.pe_rate)
 
-    l4_stack = jnp.stack(l4_rates)
+    ss_state, (l4_stack, pe_stack) = jax.lax.scan(
+        _scan_sensory, ss_state, None, length=params.substeps,
+    )
+
     l4_window = jnp.mean(l4_stack, axis=0)
     l4_peak = jnp.max(l4_window)
     sensory = jnp.where(
@@ -1651,7 +1732,6 @@ def action_brain_step(
         l4_window / (l4_peak + jnp.asarray(1e-6, DTYPE)),
         l4_window,
     )
-    pe_stack = jnp.stack(pe_rates)
     new_pe_rate = jnp.mean(pe_stack)
     computed_ig = jax.nn.relu(state.prev_pe_rate - new_pe_rate)
     if info_gain is None:

@@ -112,7 +112,7 @@ def default_arm_config(
     include_target: bool = True,
     n_cells_per_joint: int = 16,
     n_target_cells: int = 16,
-    frame_skip: int = 5,
+    frame_skip: int = 1,
     max_steps: int = 500,
 ) -> ArmConfig:
     """Default 2-DOF planar reacher configuration."""
@@ -151,13 +151,18 @@ class MjxArmBody(eqx.Module, BodyInterface):
     """
 
     # Dynamic pytree leaves (traced under JIT):
-    mjx_data: Any                           # mujoco.mjx.Data
+    mjx_data: Any                           # mujoco.mjx.Data — changes every step
     target_xy: Array                        # (2,) float32, arm plane target
     step_idx: Array                         # scalar int32
-    # Static leaves:
-    mjx_model: Any = eqx.field(static=True)
-    mj_model: Any = eqx.field(static=True)  # CPU handle (rendering)
-    proprio: ProprioceptionParams = eqx.field(static=True)
+    # JAX-array pytree leaves — constant across a run but NOT static:
+    # marking eqx.Module / mjx.Model as static=True causes equinox to
+    # hash the full array contents as a Python object on every call,
+    # producing a cache-miss and full XLA recompile each step.
+    # Leaving them as regular leaves lets XLA constant-fold them once.
+    mjx_model: Any                          # mujoco.mjx.Model (JAX pytree)
+    proprio: ProprioceptionParams           # Gaussian-tuning params (JAX arrays)
+    # Pure-Python / C-object static leaves — no JAX arrays here:
+    mj_model: Any = eqx.field(static=True)  # CPU mujoco.MjModel (rendering only)
     cfg: ArmConfig = eqx.field(static=True)
     sensory_size: int = eqx.field(static=True)
     n_actions: int = eqx.field(static=True)
@@ -306,10 +311,20 @@ class MjxArmBody(eqx.Module, BodyInterface):
         # it into torques).
         data = self.mjx_data
         data = data.replace(ctrl=jc)
-        # Scan physics sub-steps.  Explicit Python loop keeps JIT
-        # compile time bounded (frame_skip is small; unrolled OK).
-        for _ in range(int(self.cfg.frame_skip)):
-            data = mjx.step(self.mjx_model, data)
+        # Advance ``frame_skip`` physics steps using ``jax.lax.fori_loop``.
+        # Earlier versions used a Python ``for`` loop which, under an
+        # outer ``jit``/``scan``, unrolled into ``frame_skip`` full
+        # copies of ``mjx.step`` and inflated XLA compile time by
+        # ``frame_skip×``.  ``fori_loop`` keeps a single compiled copy.
+        mjx_model = self.mjx_model
+
+        def _phys_step(_i, d):
+            return mjx.step(mjx_model, d)
+
+        data = jax.lax.fori_loop(
+            0, jnp.asarray(int(self.cfg.frame_skip), jnp.int32),
+            _phys_step, data,
+        )
 
         new_step = self.step_idx + jnp.asarray(1, jnp.int32)
         body = eqx.tree_at(

@@ -1,24 +1,27 @@
 """Phase 6B — reaching-task run-loop + sleep-aware episode driver.
 
-This module plumbs ``ActionBrain`` into :class:`MjxArmBody` using the
-continuous-command path (``act_continuous``).  It is the Phase 6B
-analogue of :func:`embodiment.run_episode`, specialised for the
-continuous motor substrate and with optional babbling pre-training.
+**Performance critical (Phase 6B).**
+The earlier version dispatched one brain+MJX cycle per Python
+iteration and relied on ``@eqx.filter_jit`` caching.  Measurement on
+Colab T4 showed ~16.5 s/cycle regardless of n_cycles — the static
+hash of ``MjxArmBody`` (which carries ``mjx_model`` as ``static=True``,
+a PyTree of hundreds of MuJoCo arrays) was not cache-stable across
+the freshly-returned body objects, so every step re-traced the whole
+graph.  That, combined with the Python-side dispatch cost for a very
+large cognitive graph, destroyed throughput.
 
-The driver never modifies the brain internals; it simply:
- 1. pulls the last ``joint_command`` from ``state.m1`` each cycle;
- 2. hands it to the body's ``act_continuous``;
- 3. feeds the new sensory sample back into the brain.
-
-Video rendering is **out of band**: :func:`collect_render_frames`
-extracts frames from the ``mj_model`` via a CPU-only ``mujoco.Renderer``
-after the trajectory has been simulated.  This means the inner loop
-stays JIT-able while the Colab notebook can still produce an mp4.
+The fix here runs **many cycles inside a single ``jax.lax.scan``**
+wrapped in one ``@eqx.filter_jit``.  One XLA compilation, one host
+→ device handover, N cycles on the device — Python cost drops to
+amortised zero.  Target refresh (a rare event) still happens in
+Python between scan chunks, so it does not interfere with the inner
+graph.
 """
 from __future__ import annotations
 
 from typing import Any, NamedTuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 
@@ -28,19 +31,126 @@ from core.brain_graph import (
 )
 
 from .body_interface import SensorySample
-from .mjx_arm_body import MjxArmBody
+from .mjx_arm_body import MjxArmBody, _sample_target
 from .babbling_env import ou_babble_step
 
 
+# ---------------------------------------------------------------------
+# Scan bodies — each is a pure functional one-step transition.
+# Kept at module level so filter_jit's cache keys are stable.
+# ---------------------------------------------------------------------
+
+
+def _one_babble_cycle(
+    carry: tuple, inp: tuple,
+    *, brain_params, ctx, ou_tau, ou_sigma,
+) -> tuple[tuple, tuple]:
+    """Single babbling cycle used as the scan body.
+
+    Carry: ``(brain_state, body, sensory, reward, done, prev_jc)``.
+    Input: per-step PRNG key.
+    Output (stacked): ``(jc, tip_xy)``.
+    """
+    brain_state, body, sensory, prev_r, prev_d, prev_jc = carry
+    key = inp
+
+    k_brain, k_body, k_noise = jax.random.split(key, 3)
+    out = action_brain_cognitive_step(
+        brain_state, brain_params, ctx,
+        sensory,
+        prev_reward=prev_r, prev_done=prev_d, key=k_brain,
+    )
+    brain_state = out.state
+    jc = ou_babble_step(prev_jc, k_noise, tau=ou_tau, sigma=ou_sigma)
+    brain_state = eqx.tree_at(
+        lambda s: s.m1.last_joint_command, brain_state, jc,
+    )
+    body, sample = body.act_continuous(k_body, jc)
+    new_carry = (
+        brain_state, body,
+        sample.sensory,
+        jnp.asarray(0.0, DTYPE),   # no extrinsic reward in babbling
+        sample.done,
+        jc,
+    )
+    return new_carry, (jc, body.tip_xy())
+
+
+def _one_reach_cycle(
+    carry: tuple, inp: tuple,
+    *, brain_params, ctx,
+) -> tuple[tuple, tuple]:
+    """Single reaching cycle used as the scan body.
+
+    Carry: ``(brain_state, body, sensory, reward, done)``.
+    Input: per-step PRNG key.
+    Output (stacked): ``(reward, dist, tip_xy, target_xy, qpos)``.
+    """
+    brain_state, body, sensory, prev_r, prev_d = carry
+    key = inp
+
+    k_brain, k_body = jax.random.split(key, 2)
+    out = action_brain_cognitive_step(
+        brain_state, brain_params, ctx,
+        sensory,
+        prev_reward=prev_r, prev_done=prev_d, key=k_brain,
+    )
+    brain_state = out.state
+    jc = brain_state.m1.last_joint_command
+    body, sample = body.act_continuous(k_body, jc)
+    tip = body.tip_xy()
+    tgt = body.target_xy
+    d = jnp.linalg.norm(tip - tgt)
+    new_carry = (
+        brain_state, body, sample.sensory, sample.reward, sample.done,
+    )
+    return new_carry, (sample.reward, d, tip, tgt, body.qpos())
+
+
+@eqx.filter_jit
+def _babble_chunk(
+    brain_state, body, sensory, prev_r, prev_d, prev_jc,
+    brain_params, ctx, keys, ou_tau, ou_sigma,
+):
+    """Run ``keys.shape[0]`` babbling cycles under one XLA graph."""
+    def step_fn(c, k):
+        return _one_babble_cycle(
+            c, k,
+            brain_params=brain_params, ctx=ctx,
+            ou_tau=ou_tau, ou_sigma=ou_sigma,
+        )
+    init = (brain_state, body, sensory, prev_r, prev_d, prev_jc)
+    final, outputs = jax.lax.scan(step_fn, init, keys)
+    return final, outputs
+
+
+@eqx.filter_jit
+def _reach_chunk(
+    brain_state, body, sensory, prev_r, prev_d,
+    brain_params, ctx, keys,
+):
+    """Run ``keys.shape[0]`` reach cycles under one XLA graph."""
+    def step_fn(c, k):
+        return _one_reach_cycle(c, k, brain_params=brain_params, ctx=ctx)
+    init = (brain_state, body, sensory, prev_r, prev_d)
+    final, outputs = jax.lax.scan(step_fn, init, keys)
+    return final, outputs
+
+
+# ---------------------------------------------------------------------
+# Episode / session drivers
+# ---------------------------------------------------------------------
+
+
 class ReachResult(NamedTuple):
-    rewards: Array           # (T,) float32 — extrinsic reward per cycle
-    dists: Array             # (T,) float32 — tip→target distance
-    tip_traj: Array          # (T, 2) tip positions
-    target_traj: Array       # (T, 2) target positions
-    success: Array           # scalar bool — reached within threshold
+    rewards: Array
+    dists: Array
+    tip_traj: Array
+    target_traj: Array
+    success: Array
     brain_state: ActionBrainState
     body: MjxArmBody
-    qpos_traj: Array         # (T, n_joints) — empty if record_qpos=False
+    qpos_traj: Array
 
 
 def run_reach_episode(
@@ -53,77 +163,51 @@ def run_reach_episode(
     max_steps: int = 500,
     success_dist: float = 0.05,
     reset_body: bool = True,
-    record_qpos: bool = False,
+    record_qpos: bool = False,   # qpos is always recorded now; kwarg kept for API compat
 ) -> ReachResult:
-    """Run one reaching episode; return per-step diagnostics.
+    """Run one reaching episode via a single ``lax.scan``.
 
-    Set ``record_qpos=True`` to also retain the joint-position trajectory
-    for offline video rendering via :func:`collect_render_frames`.
+    The inner ``_reach_chunk`` compiles once per distinct
+    ``max_steps`` value; subsequent calls are device-resident loops.
+    Early termination is not supported inside scan, but the returned
+    ``success`` flag indicates whether the tip ever crossed
+    ``success_dist`` during the episode.
     """
+    del record_qpos  # always recorded; `qpos_traj` is part of the result
     k = key
     if reset_body:
         k, k_reset = split_key(k, 2)
         body, sample = body.reset(k_reset)
+        sensory = sample.sensory
+        prev_r = sample.reward
+        prev_d = sample.done
     else:
-        sample = SensorySample(
-            sensory=jnp.zeros(body.sensory_size, DTYPE),
-            reward=jnp.asarray(0.0, DTYPE),
-            done=jnp.asarray(0.0, DTYPE),
-            info={},
+        sensory = jnp.zeros(body.sensory_size, DTYPE)
+        prev_r = jnp.asarray(0.0, DTYPE)
+        prev_d = jnp.asarray(0.0, DTYPE)
+
+    k, k_steps = split_key(k, 2)
+    keys = jax.random.split(k_steps, int(max_steps))
+
+    (brain_state, body, _, _, _), (rewards, dists, tips, tgts, qposes) = (
+        _reach_chunk(
+            brain_state, body, sensory, prev_r, prev_d,
+            brain_params, ctx, keys,
         )
-
-    rewards, dists, tips, tgts = [], [], [], []
-    qposes: list[Array] = []
-    prev_reward = jnp.asarray(0.0, DTYPE)
-    prev_done = jnp.asarray(0.0, DTYPE)
-    reached = False
-
-    for t in range(max_steps):
-        k, k_brain, k_body = split_key(k, 3)
-        out = action_brain_cognitive_step(
-            brain_state, brain_params, ctx,
-            sample.sensory,
-            prev_reward=prev_reward, prev_done=prev_done, key=k_brain,
-        )
-        brain_state = out.state
-        jc = brain_state.m1.last_joint_command
-        body, sample = body.act_continuous(k_body, jc)
-
-        tip = body.tip_xy()
-        tgt = body.target_xy
-        d = jnp.linalg.norm(tip - tgt)
-        dists.append(d)
-        rewards.append(sample.reward)
-        tips.append(tip)
-        tgts.append(tgt)
-        if record_qpos:
-            qposes.append(body.qpos())
-        prev_reward = sample.reward
-        prev_done = sample.done
-        if bool(d < success_dist):
-            reached = True
-            break
-        if bool(sample.done):
-            break
-
+    )
+    success = jnp.any(dists < jnp.asarray(success_dist, DTYPE))
     return ReachResult(
-        rewards=jnp.asarray(rewards, DTYPE),
-        dists=jnp.asarray(dists, DTYPE),
-        tip_traj=jnp.stack(tips) if tips else jnp.zeros((0, 2), DTYPE),
-        target_traj=jnp.stack(tgts) if tgts else jnp.zeros((0, 2), DTYPE),
-        success=jnp.asarray(reached),
-        brain_state=brain_state,
-        body=body,
-        qpos_traj=(
-            jnp.stack(qposes) if qposes
-            else jnp.zeros((0, body.cfg.n_joints), DTYPE)
-        ),
+        rewards=rewards, dists=dists,
+        tip_traj=tips, target_traj=tgts,
+        success=success,
+        brain_state=brain_state, body=body,
+        qpos_traj=qposes,
     )
 
 
 class BabbleResult(NamedTuple):
-    tip_traj: Array          # (T, 2)
-    jc_traj: Array           # (T, motor_dim)
+    tip_traj: Array
+    jc_traj: Array
     brain_state: ActionBrainState
     body: MjxArmBody
 
@@ -140,61 +224,70 @@ def run_babbling(
     ou_sigma: float = 0.4,
     target_refresh: int = 400,
 ) -> BabbleResult:
-    """OU-process motor babbling.
+    """OU-process motor babbling driven by one ``lax.scan`` per chunk.
 
-    The brain is driven normally (so cerebellum still sees motor PE),
-    but we **override** the M1 joint command with fresh OU noise every
-    cycle so the body explores broadly.  The override is stored back
-    into ``state.m1.last_joint_command`` so the next cerebellum
-    prediction uses it as the action context.
+    The run is split into chunks of ``target_refresh`` cycles.  Each
+    chunk is a single XLA kernel launch; the mocap target is rotated
+    between chunks in Python (negligible cost).  If ``n_cycles`` is
+    not an exact multiple of ``target_refresh`` the last chunk is
+    shorter and triggers a *one-time* extra compilation.
     """
-    import equinox as eqx
     k = key
     k, k_reset = split_key(k, 2)
     body, sample = body.reset(k_reset)
-    prev_reward = jnp.asarray(0.0, DTYPE)
-    prev_done = jnp.asarray(0.0, DTYPE)
 
+    sensory = sample.sensory
+    prev_r = jnp.asarray(0.0, DTYPE)
+    prev_d = sample.done
     motor_dim = brain_params.m1.motor_dim
-    jc = jnp.zeros(motor_dim, DTYPE)
-    tips, jcs = [], []
+    prev_jc = jnp.zeros(motor_dim, DTYPE)
 
-    for t in range(n_cycles):
-        k, k_brain, k_body, k_noise, k_tgt = split_key(k, 5)
-        out = action_brain_cognitive_step(
-            brain_state, brain_params, ctx,
-            sample.sensory,
-            prev_reward=prev_reward, prev_done=prev_done, key=k_brain,
+    tau_a = jnp.asarray(ou_tau, DTYPE)
+    sigma_a = jnp.asarray(ou_sigma, DTYPE)
+
+    tips_chunks: list[Array] = []
+    jcs_chunks: list[Array] = []
+
+    remaining = int(n_cycles)
+    chunk_size = int(target_refresh)
+
+    while remaining > 0:
+        this_chunk = min(chunk_size, remaining)
+        k, k_chunk, k_tgt = split_key(k, 3)
+        keys = jax.random.split(k_chunk, this_chunk)
+
+        (brain_state, body, sensory, prev_r, prev_d, prev_jc), (jcs, tips) = (
+            _babble_chunk(
+                brain_state, body, sensory, prev_r, prev_d, prev_jc,
+                brain_params, ctx, keys, tau_a, sigma_a,
+            )
         )
-        brain_state = out.state
-        # OU noise override.
-        jc = ou_babble_step(jc, k_noise, tau=ou_tau, sigma=ou_sigma)
-        brain_state = eqx.tree_at(
-            lambda s: s.m1.last_joint_command, brain_state, jc,
-        )
-        body, sample = body.act_continuous(k_body, jc)
-        # Ignore extrinsic reward during babbling — curiosity drives BG.
-        prev_reward = jnp.asarray(0.0, DTYPE)
-        prev_done = sample.done
+        tips_chunks.append(tips)
+        jcs_chunks.append(jcs)
 
-        if (t + 1) % target_refresh == 0:
-            from .mjx_arm_body import _sample_target
-            new_tgt = _sample_target(k_tgt, body.cfg.workspace_half)
-            body = body._set_target(new_tgt)
+        # Refresh target for the next chunk.
+        new_tgt = _sample_target(k_tgt, body.cfg.workspace_half)
+        body = body._set_target(new_tgt)
+        remaining -= this_chunk
 
-        tips.append(body.tip_xy())
-        jcs.append(jc)
-
+    tip_traj = (
+        jnp.concatenate(tips_chunks, axis=0)
+        if tips_chunks else jnp.zeros((0, 2), DTYPE)
+    )
+    jc_traj = (
+        jnp.concatenate(jcs_chunks, axis=0)
+        if jcs_chunks else jnp.zeros((0, motor_dim), DTYPE)
+    )
     return BabbleResult(
-        tip_traj=jnp.stack(tips) if tips else jnp.zeros((0, 2), DTYPE),
-        jc_traj=jnp.stack(jcs) if jcs else jnp.zeros((0, motor_dim), DTYPE),
+        tip_traj=tip_traj,
+        jc_traj=jc_traj,
         brain_state=brain_state,
         body=body,
     )
 
 
 # ---------------------------------------------------------------------
-# Rendering — CPU only, not JIT-ed
+# Rendering — CPU only, not JIT-ed.
 # ---------------------------------------------------------------------
 
 
@@ -206,12 +299,7 @@ def collect_render_frames(
     width: int = 320, height: int = 240,
     camera: str = "topdown",
 ) -> Any:
-    """Render a trajectory to a list of RGB frames using mujoco.Renderer.
-
-    ``qpos_traj`` is ``(T, n_joints)``; ``target_traj`` is ``(T, 2)``.
-    Returns a list of ``(H, W, 3)`` uint8 numpy arrays (one per cycle),
-    suitable for ``imageio.mimsave(..., format='FFMPEG', fps=30)``.
-    """
+    """Render a trajectory to RGB frames via ``mujoco.Renderer``."""
     import numpy as np
     import mujoco
 

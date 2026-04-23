@@ -29,11 +29,23 @@ def ou_babble_step(
     """One step of an OU process bounded to ``[-1, 1]``.
 
     ``tau`` is in brain cycles (≈ 200 ms at 10 ms timestep; matches
-    Schaal & Sternad 2001 primitive timescale).
+    Schaal & Sternad 2001 primitive timescale).  ``sigma`` is the
+    steady-state standard deviation of the *unclipped* process.
+
+    Discretisation: the canonical exact-sampling update for a
+    continuous-time OU process is ``x_{t+1} = α·x_t + σ·√(1-α²)·ε``
+    with α = exp(-Δt/τ) and ε ~ N(0, 1).  That gives SS variance
+    exactly σ².  An earlier version used ``(1-α)·σ`` as the noise
+    gain, which yielded SS std σ·√((1-α)/(1+α)) ≈ 0.16·σ for τ=20
+    — motor commands collapsed to ±0.06 and the arm never left its
+    rest configuration during babbling.
     """
     alpha = jnp.exp(-1.0 / jnp.asarray(tau, DTYPE))
-    noise = jax.random.normal(key, prev.shape, DTYPE) * sigma
-    return jnp.clip(alpha * prev + (1.0 - alpha) * noise, -1.0, 1.0)
+    gain = jnp.asarray(sigma, DTYPE) * jnp.sqrt(
+        jnp.asarray(1.0, DTYPE) - alpha * alpha
+    )
+    noise = jax.random.normal(key, prev.shape, DTYPE) * gain
+    return jnp.clip(alpha * prev + noise, -1.0, 1.0)
 
 
 def reset_target_every(

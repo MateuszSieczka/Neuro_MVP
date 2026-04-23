@@ -62,10 +62,43 @@ from .body_interface import BodyInterface, SensorySample, gauss_pop_encode
 # reaching does not fight gravity and babbling coverage is 2-D.
 _ARM_XML = """<mujoco model="planar_reacher">
   <compiler angle="radian" autolimits="true"/>
-  <option timestep="0.01" gravity="0 0 -9.81"/>
+  <!--
+    MJX/T4 performance-critical option block.
+
+    * ``integrator="implicitfast"`` — MJX-recommended integrator for
+      stiff position-servo actuators + linear damping; stable at 10 ms
+      and ~5–20× cheaper per ``mjx.step`` than the CPU default
+      (semi-implicit Euler).  Matches the guidance in the
+      mujoco-mjx/benchmarks docs.
+    * ``solver="CG"`` with ``iterations="2"`` / ``ls_iterations="4"``
+      replaces the CPU default Newton-CG (100 iters, 1e-8 tol) which
+      compiles a very large per-step graph on MJX.  The 2-link arm
+      has no contacts and only damping/servo torques → 2 iterations
+      converge.
+    * ``<flag contact="disable" equality="disable"
+            frictionloss="disable"/>`` kills the entire contact /
+      equality pipeline.  Floor + target are already ``contype=0``
+      and the two arm capsules are not intended to self-collide, so
+      this is physically equivalent — it just stops MJX from tracing
+      an empty collision kernel on every step.
+  -->
+  <option timestep="0.01" gravity="0 0 -9.81"
+          integrator="implicitfast"
+          solver="CG" iterations="2" ls_iterations="4">
+    <flag contact="disable" equality="disable" frictionloss="disable"/>
+  </option>
   <default>
     <joint damping="0.2" armature="0.01"/>
-    <position ctrlrange="-1 1" kp="40" kv="4"/>
+    <!--
+      ``ctrlrange`` matches ``ArmConfig.joint_range=±2.0 rad`` so the
+      brain's tanh output (rescaled by ``joint_range`` inside
+      ``act_continuous``) can command the full anatomical joint
+      range.  An earlier ``ctrlrange="-1 1"`` silently truncated
+      every command to ±57°, so the elbow could never fold enough to
+      reach negative-x or deep-y targets — tip bbox collapsed to a
+      ~2 cm band during babbling.
+    -->
+    <position ctrlrange="-2.0 2.0" kp="20" kv="4"/>
     <geom rgba="0.7 0.7 0.9 1"/>
   </default>
   <worldbody>
@@ -112,7 +145,7 @@ def default_arm_config(
     include_target: bool = True,
     n_cells_per_joint: int = 16,
     n_target_cells: int = 16,
-    frame_skip: int = 1,
+    frame_skip: int = 3,
     max_steps: int = 500,
 ) -> ArmConfig:
     """Default 2-DOF planar reacher configuration."""
@@ -305,12 +338,15 @@ class MjxArmBody(eqx.Module, BodyInterface):
             jnp.asarray(joint_command, DTYPE),
             -1.0, 1.0,
         )[: self.cfg.motor_dim]
-        # The actuator ctrlrange in the XML is [-1, 1] because `position`
-        # actuators treat ctrl as the desired joint setpoint directly;
-        # we therefore hand jc straight to ctrl (the XML's kp/kv turn
-        # it into torques).
+        # ``position`` actuators treat ``ctrl`` as the desired joint
+        # *setpoint in radians*.  The brain-side contract is that
+        # ``joint_command`` is tanh-bounded in [-1, 1]; we rescale it
+        # here to the anatomical range ±``cfg.joint_range`` before
+        # writing ``data.ctrl``.  The XML ctrlrange is widened to
+        # match (see ``_ARM_XML``).
+        ctrl = jc * jnp.asarray(self.cfg.joint_range, DTYPE)
         data = self.mjx_data
-        data = data.replace(ctrl=jc)
+        data = data.replace(ctrl=ctrl)
         # Advance ``frame_skip`` physics steps using ``jax.lax.fori_loop``.
         # Earlier versions used a Python ``for`` loop which, under an
         # outer ``jit``/``scan``, unrolled into ``frame_skip`` full

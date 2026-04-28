@@ -40,6 +40,7 @@ def build_reacher(
         n_cells_per_joint=cfg.n_cells_per_joint,
         m1_readout_lr=m1_readout_lr,
         bypass_m1=False,                         # Phase 6B: M1 drives body
+        use_real_proprio=True,                   # Phase 6B: MJX qpos/qvel
     )
     state = init_action_brain_state(k_brain, params)
     return params, state, body

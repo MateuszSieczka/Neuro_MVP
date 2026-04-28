@@ -470,6 +470,15 @@ class ActionBrainParams(eqx.Module):
     delay_ct_steps: int = eqx.field(static=True)
     delay_mossy_steps: int = eqx.field(static=True)
     bypass_m1: bool = eqx.field(static=True, default=True)
+    # Phase 6B: when True, the motor-PE block treats
+    # ``state.last_joint_angles`` / ``last_joint_velocities`` as the
+    # real (driver-supplied) proprioceptive state rather than applying
+    # a synthetic ±0.1 rad delta derived from the discrete action id
+    # (Phase 6A placeholder).  The MJX driver is expected to overwrite
+    # those two fields with normalised real ``qpos`` / ``qvel`` after
+    # each ``body.act_continuous``; for discrete-action envs the flag
+    # stays False and behaviour is bit-identical to Phase 6A.
+    use_real_proprio: bool = eqx.field(static=True, default=False)
 
 
 class ActionBrainState(eqx.Module):
@@ -622,6 +631,10 @@ def init_action_brain_params(
     m1_readout_lr: float = 1e-3,
     m1_cb_alpha: float = 0.2,
     bypass_m1: bool = True,
+    # Phase 6B: real-proprioception wiring (see ``use_real_proprio``
+    # docstring on ``ActionBrainParams``).  Default False keeps every
+    # discrete-action env / existing test bit-identical.
+    use_real_proprio: bool = False,
 ) -> ActionBrainParams:
     """Build an ActionBrain params pytree.
 
@@ -823,6 +836,7 @@ def init_action_brain_params(
         substeps=int(substeps),
         delay_ct_steps=d_ct, delay_mossy_steps=d_mossy,
         bypass_m1=bool(bypass_m1),
+        use_real_proprio=bool(use_real_proprio),
     )
 
 
@@ -1367,30 +1381,42 @@ def action_brain_cognitive_step(
     # committed body action (one-hot → signed direction per joint) so
     # the downstream M1 / cerebellum forward-model loop has an
     # exercised data path even while the current bodies remain
-    # discrete (plan 6A.4).  Phase 6B swaps this for real MJX joint
-    # sensors without changing consumer wiring.
+    # discrete (plan 6A.4).  Phase 6B (``use_real_proprio=True``)
+    # swaps this for the driver-supplied real MJX joint sensors
+    # already stored in ``state.last_joint_angles`` /
+    # ``state.last_joint_velocities`` without changing consumer
+    # wiring.
     prev_body_id = state.last_body_action_id
     proprio_p = params.proprio
     n_joints_int = int(proprio_p.n_joints)
-    # Map action id 0..2*n_joints into per-joint signed direction
-    # (sign-split, the inverse of ``discretise_joint_command``).
-    joint_idx = jnp.mod(prev_body_id, jnp.asarray(n_joints_int, jnp.int32))
-    sign_bit = jnp.where(
-        prev_body_id >= jnp.asarray(n_joints_int, jnp.int32),
-        jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
-    )
-    one_hot_joint = (
-        jnp.arange(n_joints_int) == joint_idx
-    ).astype(DTYPE)
-    joint_direction = one_hot_joint * sign_bit           # (n_joints,)
-    # Simple first-order kinematics: angles integrate direction,
-    # velocities = direction scaled by dt-proxy.
-    delta_angle = jnp.asarray(0.1, DTYPE) * joint_direction
-    new_angles = jnp.clip(
-        state.last_joint_angles + delta_angle,
-        jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
-    )
-    new_velocities = delta_angle
+    if params.use_real_proprio:
+        # Phase 6B: the MJX driver wrote the normalised real qpos /
+        # qvel from the previous cycle into these two fields right
+        # after ``body.act_continuous``.  Use them directly as the
+        # ``actual'' of motor PE (Wolpert 1998 forward-model error =
+        # real − predicted).  No synthetic delta is added.
+        new_angles = state.last_joint_angles
+        new_velocities = state.last_joint_velocities
+    else:
+        # Map action id 0..2*n_joints into per-joint signed direction
+        # (sign-split, the inverse of ``discretise_joint_command``).
+        joint_idx = jnp.mod(prev_body_id, jnp.asarray(n_joints_int, jnp.int32))
+        sign_bit = jnp.where(
+            prev_body_id >= jnp.asarray(n_joints_int, jnp.int32),
+            jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
+        )
+        one_hot_joint = (
+            jnp.arange(n_joints_int) == joint_idx
+        ).astype(DTYPE)
+        joint_direction = one_hot_joint * sign_bit           # (n_joints,)
+        # Simple first-order kinematics: angles integrate direction,
+        # velocities = direction scaled by dt-proxy.
+        delta_angle = jnp.asarray(0.1, DTYPE) * joint_direction
+        new_angles = jnp.clip(
+            state.last_joint_angles + delta_angle,
+            jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
+        )
+        new_velocities = delta_angle
     from sensory.proprioception import proprio_encode as _proprio_encode
     proprio_actual_enc = _proprio_encode(
         proprio_p, new_angles, new_velocities,

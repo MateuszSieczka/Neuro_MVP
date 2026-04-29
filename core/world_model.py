@@ -279,8 +279,22 @@ def wm_update(
     ach: float | Array = 0.5,
     receptor_gain: float | Array = 1.0,
     receptor_lr: float | Array = 1.0,
+    n_substeps: int | Array = 1,
 ) -> WorldModelOutput:
-    """Observe the real transition and update encoder + decoder + astrocyte."""
+    """Observe the real transition and update encoder + decoder + astrocyte.
+
+    Phase 6B fix: ``pe_short_decay`` / ``pe_long_decay`` are stored as
+    *per-substep* values (``exp(-dt/τ)``) by ``init_world_model_params``
+    via ``ctx.decay``.  ``wm_update`` is invoked once per cognitive
+    cycle, which spans ``n_substeps`` substeps; the mathematically
+    correct per-cycle decay is therefore the per-substep decay raised
+    to the ``n_substeps`` power, equivalent to ``exp(-n_substeps·dt/τ)``.
+    Without this correction the effective τ for the curiosity signal
+    (``pe_short``) and the boredom reference (``pe_long``) was
+    ``n_substeps`` times longer than designed (e.g. tau_pe_short_ms
+    100 → 2000 ms with default 20 substeps), so curiosity smoothed
+    over many trials and never reflected per-cycle novelty.
+    """
     inp = _build_input(params, state_spikes, action_onehot)
     enc_out = en_step(
         state.encoder, params.encoder, ctx, inp,
@@ -301,13 +315,16 @@ def wm_update(
     # environment has changed (PE is rising), giving both curiosity
     # and boredom signals from one pair of EMAs.
     pe_abs = jnp.mean(jnp.abs(pe))
+    n_sub = jnp.asarray(n_substeps, DTYPE)
+    pe_short_decay_cycle = jnp.power(params.pe_short_decay, n_sub)
+    pe_long_decay_cycle = jnp.power(params.pe_long_decay, n_sub)
     pe_short_abs = (
-        params.pe_short_decay * state.pe_short_abs
-        + (1.0 - params.pe_short_decay) * pe_abs
+        pe_short_decay_cycle * state.pe_short_abs
+        + (1.0 - pe_short_decay_cycle) * pe_abs
     )
     pe_long_abs = (
-        params.pe_long_decay * state.pe_long_abs
-        + (1.0 - params.pe_long_decay) * pe_abs
+        pe_long_decay_cycle * state.pe_long_abs
+        + (1.0 - pe_long_decay_cycle) * pe_abs
     )
 
     # Astrocyte tracks encoder spike activity (error rate as rate proxy)

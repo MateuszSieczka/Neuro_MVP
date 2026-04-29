@@ -202,17 +202,38 @@ def vta_compute_rpe(
     # the centering is causal; the baseline is then advanced.
     r_centered = r - state.reward_baseline
     I_reward = params.reward_gain * r_centered
+    # Phase 6B fix: per-cycle decay (see comment near auto_decay below
+    # for the unit-mismatch derivation).  ``baseline_decay`` is the
+    # per-substep value; the cognitive-cycle decay is its
+    # ``n_substeps`` power.
+    baseline_decay_cycle_pre = jnp.power(params.baseline_decay, n_sub)
     reward_baseline = (
-        params.baseline_decay * state.reward_baseline
-        + (1.0 - params.baseline_decay) * r
+        baseline_decay_cycle_pre * state.reward_baseline
+        + (1.0 - baseline_decay_cycle_pre) * r
     )
 
     rpe_raw = I_reward + I_ppTg - I_vp
 
+    # Phase 6B fix: per-cycle scaling of the slow EMAs.  ``auto_decay``
+    # and ``baseline_decay`` are stored as the per-SIMULATION-STEP
+    # values ``exp(-dt/τ)`` (BackendContext.decay), but
+    # ``vta_compute_rpe`` is invoked once per *cognitive cycle*, which
+    # spans ``n_substeps`` simulation steps (default 20).  The
+    # mathematically correct per-cycle decay is therefore the
+    # per-step decay raised to the ``n_substeps`` power, equivalent
+    # to ``exp(-n_substeps·dt/τ)`` — which restores the designed
+    # biological time constants (D2 autoreceptor 10 s; OFC reward
+    # baseline 30 s; Bayer & Glimcher 2005; Tobler 2005).  Without
+    # this, the effective time constants were ``n_substeps`` times
+    # longer than designed (10 min and 30 min), so the baseline
+    # never tracked E[r] within an experiment and the autoreceptor
+    # gain saturated to its floor.
+    auto_decay_cycle = jnp.power(params.auto_decay, n_sub)
+
     # D2 autoreceptor RMS adaptation (Tobler 2005).
     auto_rms2 = (
-        params.auto_decay * state.auto_rms ** 2
-        + (1.0 - params.auto_decay) * rpe_raw ** 2
+        auto_decay_cycle * state.auto_rms ** 2
+        + (1.0 - auto_decay_cycle) * rpe_raw ** 2
     )
     auto_rms = jnp.sqrt(auto_rms2)
     auto_gain = jnp.maximum(auto_rms, params.min_gain)

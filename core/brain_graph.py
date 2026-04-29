@@ -1284,8 +1284,10 @@ def action_brain_cognitive_step(
     prev_curiosity = wm_curiosity_signal(state.world_model, params.world_model)
 
     # Split keys: one per perception substep (PFC gate needs membrane
-    # noise each dt), plus two for action selection at the end.
-    k_scan, k_body, k_saccade = split_key(key, 3)
+    # noise each dt), plus two for action selection at the end and
+    # one for M1 exploration noise (Phase 6B node-perturbation
+    # REINFORCE; Williams 1992 / Tumer & Brainard 2007).
+    k_scan, k_body, k_saccade, k_m1 = split_key(key, 4)
     substep_keys = jax.random.split(k_scan, params.substeps)
 
     # ``jax.lax.scan`` over substeps: the body function is traced ONCE
@@ -1372,6 +1374,7 @@ def action_brain_cognitive_step(
         state.last_sensory, joint_last_action, sensory,
         m_t=1.0,
         ach=state.neuromodulator.acetylcholine,
+        n_substeps=params.substeps,
     )
     sensory_pe = wm_out.prediction_error                 # (sensory_size,)
     climbing_sensory = sensory_pe @ params.w_io_pc       # (n_purkinje,)
@@ -1576,6 +1579,12 @@ def action_brain_cognitive_step(
     saccade_action_id = actor_select_action(
         actor_saccade_state, params.actor_saccade, k_saccade,
     )
+    # Phase 6B credit-assignment fix: keep the actor's OWN selection
+    # for eligibility commit even when M1 overrides the executed
+    # action below.  Pre-fix bug: the body actor's eligibility was
+    # committed for M1's discretised choice, so the BG actor was
+    # being credited for actions it did not select → noise gradient.
+    actor_body_action_id = body_action_id
     body_action_oh = (
         jnp.arange(params.n_body_actions) == body_action_id
     ).astype(DTYPE)
@@ -1587,9 +1596,11 @@ def action_brain_cognitive_step(
     # Bypass path (default, regression-safe): skip M1 entirely and
     # keep the discrete BG body action unchanged.  Active path: run
     # M1 on cortex L5 rate with cerebellar motor correction from the
-    # deep nuclei (Wolpert 1998), learn the readout via three-factor
-    # Hebbian gated by VTA RPE (Doya 2000), and override body_action_id
-    # with the sign-split argmax of the joint command (plan 6A.3).
+    # deep nuclei (Wolpert 1998), learn the readout via
+    # node-perturbation REINFORCE gated by VTA RPE (Williams 1992;
+    # Fiete & Seung 2006), and override the EXECUTED body_action_id
+    # with the sign-split argmax of the joint command (the BG actor
+    # still trains on its own selection — see actor_body_action_id).
     if params.bypass_m1:
         m1_new_state = state.m1
         jc_out = state.m1.last_joint_command
@@ -1598,11 +1609,15 @@ def action_brain_cognitive_step(
         cb_correction = cb_state.dn_rate @ params.w_dn_motor    # (motor_dim,)
         m1_out = m1_step(
             state.m1, params.m1, cortex_l5_rate,
+            key=k_m1,
+            ne_level=state.neuromodulator.noradrenaline,
             cb_motor_correction=cb_correction,
         )
         jc_out = m1_out.joint_command
         # Override the BG-selected body action with the discretised
-        # M1 command so the env still receives an int.
+        # M1 command so the env still receives an int.  This is the
+        # EXECUTED action; the BG actor's eligibility credit stays on
+        # its own selection (actor_body_action_id, captured above).
         from embodiment.body_interface import (
             discretise_joint_command as _disc,
         )
@@ -1610,18 +1625,61 @@ def action_brain_cognitive_step(
         body_action_oh = (
             jnp.arange(params.n_body_actions) == body_action_id
         ).astype(DTYPE)
-        # Three-factor Hebbian update on motor_readout.
+        # Node-perturbation REINFORCE update on motor_readout: dw
+        # correlates the injected exploration noise ξ with the RPE
+        # produced by the action that committed to that ξ.  RPE here
+        # is the CURRENT cycle's RPE (the action being trained was
+        # committed by state.m1 last cycle; the noise / l5 cached on
+        # state.m1 carry that information forward through the
+        # one-cycle delay).
         m1_new_state = m1_learn_readout(
-            m1_out.state, params.m1,
+            state.m1, params.m1,
             rpe=rpe,
-            l5_rate_normalised=m1_out.l5_rate_normalised,
-            joint_command=jc_out,
+            l5_rate_normalised=None,        # use state.m1.last_l5_rate
+            exploration_noise=None,         # use state.m1.last_exploration_noise
             cb_motor_err=None,
         )
-        # Forward-model prediction of joint angles for next-cycle motor
-        # PE — use the tanh-saturated joint command as the expected
-        # next-step angle (position-servo analogue).
-        predicted_angles_next = jc_out
+        # Stash THIS cycle's exploration noise + L5 rate onto the
+        # learned-state object so next cycle's update can reach them.
+        m1_new_state = eqx.tree_at(
+            lambda s: (
+                s.last_joint_command,
+                s.last_exploration_noise,
+                s.last_l5_rate,
+            ),
+            m1_new_state,
+            (jc_out, m1_out.exploration_noise, m1_out.l5_rate_normalised),
+        )
+        # Forward-model prediction of joint angles for next-cycle
+        # motor PE.  Phase 6B architectural fix (post-D8 audit):
+        #
+        # The body (``MjxArmBody.act_continuous``) treats ``jc`` as
+        # a *normalised qpos setpoint* — ``ctrl = jc * joint_range``
+        # is fed to a MuJoCo position actuator with PD servo.  Under
+        # perfect tracking the next normalised qpos equals ``jc``;
+        # the steady-state contract of the body interface is
+        # ``q_norm → jc``.  The previous formulation
+        # ``q + 0.1·jc`` treated ``jc`` as a *velocity* command
+        # (matching the Phase-6A synthetic-proprio fallback at line
+        # ~1417) — a structural type error against the real body.
+        #
+        # Empirical evidence (D8 in colab/phase6b_diag.ipynb): the
+        # measured slope of real Δq on jc is 0.019 / 0.031 (R²≈0.04),
+        # i.e. the velocity-proxy gain is wrong by ~5×; cerebellum
+        # cannot learn its way around a constant ~80 % motor-PE bias
+        # so dn_rate saturates and dominates ``jc_out`` via
+        # ``α·tanh(cb)``.  By predicting ``jc_out`` directly we adopt
+        # the steady-state body contract as the architectural prior;
+        # the cerebellum forward model then learns the *deviation*
+        # from perfect tracking — i.e. the servo-lag transient —
+        # which is the canonical Wolpert (1998) forward-model error
+        # signal carried by climbing fibres in the inferior olive.
+        # No magic constants remain; the prediction has the same
+        # units as the proprio encoder input (normalised qpos).
+        predicted_angles_next = jnp.clip(
+            jc_out,
+            jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
+        )
 
     # --- 4b. Freeze eligibility traces + action one-hot at cycle end.
     # The live traces at this point represent the correlation
@@ -1630,8 +1688,11 @@ def action_brain_cognitive_step(
     # actor_update / critic_update to apply the RPE for the
     # (s_t → s_{t+1}) transition to the weights that produced the
     # value/policy evaluation of s_t (Sutton & Barto 2018 §6.1, §12).
+    # Use the BG actor's OWN selected action id (not M1's override)
+    # so the eligibility × RPE update credits the action the actor
+    # actually chose — Phase 6B credit-assignment fix.
     actor_body_state = actor_commit_eligibility(
-        actor_body_state, params.actor_body, body_action_id,
+        actor_body_state, params.actor_body, actor_body_action_id,
     )
     actor_saccade_state = actor_commit_eligibility(
         actor_saccade_state, params.actor_saccade, saccade_action_id,

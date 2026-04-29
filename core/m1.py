@@ -14,18 +14,31 @@ cost and keeps the integration surface small — a second
 ``CorticalAreaParams`` can be nested in Phase 6B once MJX confirms
 continuous control is required for reach.
 
-Learning
---------
-Three-factor Hebbian on ``motor_readout`` (Doya 2000; Shadmehr &
-Krakauer 2008):
+Learning (Phase 6B fix)
+-----------------------
+Node-perturbation REINFORCE (Williams 1992; Fiete & Seung 2006;
+biological analogue: motor-cortex variability as policy-gradient
+exploration, Tumer & Brainard 2007; Dhawale et al. 2017):
 
-    Δw_{ij} = lr · (rpe + α · cb_motor_err_j) · l5_i · jc_j
+    jc = tanh(raw + ξ)       with  ξ ~ 𝒩(0, σ²(NE))
+    Δw_{ij} = lr · rpe · l5_i · ξ_j
 
-where ``jc`` is the post-tanh command (used as the post-synaptic
-eligibility because it is what the downstream motor neuron actually
-sees).  ``cb_motor_err`` is a per-joint correction vector supplied by
-the cerebellar deep-nuclei readout (Wolpert 1998); it is ZERO for the
-initial regression-safe Phase 6A path where only RPE drives learning.
+The injected noise ξ is the *exploration direction* the readout
+actually committed to this cycle; correlating it with subsequent RPE
+gives an unbiased policy gradient (Williams 1992 §6).  Without
+explicit exploration noise the previous rule
+``Δw ∝ rpe · l5 · jc`` self-reinforced whichever direction was
+currently produced, with no policy-gradient signal -- effectively
+untrainable when reward is a continuous shaping signal.
+
+σ is gated by noradrenaline (Aston-Jones & Cohen 2005 LC arousal
+→ motor variability): σ = σ_base · (σ_floor + ne_gain · NE).  Default
+σ_base = 0.15 matches the 5–20 % motor-dynamic-range variability
+reported in songbird HVC→RA (Tumer & Brainard 2007) and rodent M1
+(Dhawale et al. 2017).
+
+``cb_motor_err`` (per-joint cerebellar supervised correction,
+Wolpert 1998) is added to the modulator when present.
 
 PCA-style motor-primitive initialisation
 ----------------------------------------
@@ -63,7 +76,7 @@ from .backend import DTYPE, Array, PRNGKey
 class M1Params(eqx.Module):
     """Static M1 readout parameters."""
 
-    # Hebbian readout learning rate (three-factor, RPE-gated).
+    # Node-perturbation REINFORCE learning rate (Williams 1992).
     readout_lr: Array
 
     # Clip for motor_readout absolute value (prevents unbounded drift
@@ -72,11 +85,20 @@ class M1Params(eqx.Module):
     w_clip: Array
 
     # Cerebellar-correction blend coefficient α in
-    #   jc_out = tanh(jc_raw + α · cb_motor_correction)
+    #   jc_out = tanh(jc_raw + α · cb_motor_correction + ξ)
     # α ~ 1/τ_cerebellum ≈ 0.2 (Medina & Lisberger 2008 ~50 ms / 250
-    # ms task-horizon).  Zero in Phase 6A regression (no cerebellar
-    # correction yet); default 0.2 for the active M1 path.
+    # ms task-horizon).
     cb_alpha: Array
+
+    # Exploration-noise std at NE = 0 baseline (fraction of tanh
+    # dynamic range).  Tumer & Brainard 2007 / Dhawale et al. 2017:
+    # 5–20 % motor variability in M1.
+    sigma_base: Array
+    # NE-coupled gain on σ: σ = σ_base · (σ_floor + ne_gain · NE).
+    # Aston-Jones & Cohen 2005: tonic LC discharge linearly scales
+    # behavioural variability.
+    sigma_floor: Array
+    sigma_ne_gain: Array
 
     # Sizes
     n_l5: int = eqx.field(static=True)
@@ -84,16 +106,34 @@ class M1Params(eqx.Module):
 
 
 class M1State(eqx.Module):
-    """M1 learned state — just the readout plus last-command memory."""
+    """M1 learned state."""
 
     motor_readout: Array            # (n_l5, motor_dim)
     last_joint_command: Array       # (motor_dim,)
+    # Most-recent injected exploration noise ξ -- preserved across
+    # ``_sync_brain_to_body`` so the next cycle's REINFORCE update can
+    # correlate the RPE arriving NOW with the noise that produced the
+    # action that EARNED that RPE.
+    last_exploration_noise: Array   # (motor_dim,)
+    # Most-recent normalised L5 rate that drove the readout (the
+    # "pre" side of the eligibility outer product).
+    last_l5_rate: Array             # (n_l5,)
+    # EMA of recent RPE -- the policy-gradient learner's own value
+    # baseline (Sutton & Barto 1998 §13.4 REINFORCE-with-baseline).
+    # VTA already subtracts a slow critic V(s); however with V(s)
+    # equilibrating slowly during early learning the residual mean of
+    # ``rpe`` consumed by M1 is positive-biased (verified empirically:
+    # mean rpe ≈ +0.03 across 200-cycle babble even though the policy
+    # is untrained), causing systematic W drift independent of policy
+    # quality.  A local M1-side EMA absorbs this residual.
+    rpe_baseline: Array             # () scalar
 
 
 class M1Output(NamedTuple):
     state: M1State
     joint_command: Array            # (motor_dim,) in [-1, 1]
     l5_rate_normalised: Array       # (n_l5,) the post-normalisation drive
+    exploration_noise: Array        # (motor_dim,) ξ sampled this step
 
 
 # =====================================================================
@@ -119,7 +159,17 @@ def _pca_synergy_init(n_l5: int, motor_dim: int) -> Array:
     w = jnp.zeros((n_l5, motor_dim), dtype=DTYPE)
     # Assign each motor channel a contiguous block of L5 units.
     block = max(1, n_l5 // max(1, motor_dim))
-    scale = jnp.asarray(1.0 / jnp.sqrt(jnp.asarray(n_l5, DTYPE)), DTYPE)
+    # Scale = 1/block (NOT 1/sqrt(n_l5)).  Justification: peak-normalised
+    # L5 (||l5||_∞ = 1 by construction) co-firing the entire ``block``
+    # of synergy-aligned units gives raw[j] = ±block · scale = ±1, which
+    # is the edge of tanh's linear regime.  The previous 1/sqrt(n_l5)
+    # scale (=0.177 for n_l5=32) produced raw[j] ≈ ±2.83 at coactivation
+    # → hard tanh saturation at init (verified empirically: pre_tanh
+    # mean = 6.6 even with W frozen at PCA init).  This is the
+    # synergy-block analogue of fan-in normalisation (Glorot & Bengio
+    # 2010); biologically: averaging convergence onto each M1 L5 cell
+    # (Lemon 2008) keeps drive O(1) regardless of cluster size.
+    scale = jnp.asarray(1.0 / float(block), DTYPE)
     for j in range(motor_dim):
         lo = j * block
         hi = min(n_l5, lo + block)
@@ -140,14 +190,31 @@ def init_m1_params(
     n_l5: int,
     motor_dim: int,
     readout_lr: float = 1e-3,
-    w_clip: float = 2.0,
+    w_clip: float | None = None,
     cb_alpha: float = 0.2,
+    sigma_base: float = 0.15,
+    sigma_floor: float = 0.5,
+    sigma_ne_gain: float = 1.0,
 ) -> M1Params:
     f = lambda x: jnp.asarray(x, DTYPE)
+    # Default clip = 4 × scale_init = 4/block.  Init scale is 1/block
+    # (see _pca_synergy_init); allowing W to grow up to 4× its init
+    # magnitude per cell keeps the synergy-block sum bounded by 4 (so
+    # raw ∈ [-4, 4] worst case, on the saturating shoulder of tanh but
+    # not deep in the flat region).  This is the empirical "weights
+    # stay within O(few) × init scale" rule (Krogh & Hertz 1992); the
+    # previous static value w_clip=2.0 allowed ~32× growth and was
+    # never reached in practice but was structurally unprincipled.
+    if w_clip is None:
+        block = max(1, n_l5 // max(1, motor_dim))
+        w_clip = 4.0 / float(block)
     return M1Params(
         readout_lr=f(readout_lr),
         w_clip=f(w_clip),
         cb_alpha=f(cb_alpha),
+        sigma_base=f(sigma_base),
+        sigma_floor=f(sigma_floor),
+        sigma_ne_gain=f(sigma_ne_gain),
         n_l5=int(n_l5),
         motor_dim=int(motor_dim),
     )
@@ -161,6 +228,9 @@ def init_m1_state(key: PRNGKey, params: M1Params) -> M1State:
     return M1State(
         motor_readout=w0,
         last_joint_command=jnp.zeros(params.motor_dim, DTYPE),
+        last_exploration_noise=jnp.zeros(params.motor_dim, DTYPE),
+        last_l5_rate=jnp.zeros(params.n_l5, DTYPE),
+        rpe_baseline=jnp.asarray(0.0, DTYPE),
     )
 
 
@@ -190,17 +260,28 @@ def m1_step(
     params: M1Params,
     l5_rate: Array,
     *,
+    key: PRNGKey,
+    ne_level: Array,
     cb_motor_correction: Array | None = None,
 ) -> M1Output:
-    """One dt of M1: L5 rate → bounded joint command.
+    """One dt of M1: L5 rate → bounded, *noisy* joint command.
+
+    Sample ξ ~ 𝒩(0, σ(NE)²) and emit ``jc = tanh(l5·w + α·cb + ξ)``.
+    The noise is the exploration channel for node-perturbation
+    REINFORCE (Williams 1992; biology: motor-cortex variability,
+    Tumer & Brainard 2007).  Without this noise the readout is
+    deterministic given L5 and there is no policy-gradient signal
+    → the previous rule effectively could not learn.
 
     Parameters
     ----------
     l5_rate : (n_l5,)
-        The cortex L5 rate population feeding M1. In Phase 6A this is
-        the main cortex L5 rate (re-used by BG striatum as well); in
-        Phase 6B this can be routed through a dedicated M1 cortical
-        microcircuit.
+        Cortex L5 rate population feeding M1.
+    key : PRNGKey
+        Per-step key for noise sampling.
+    ne_level : ()
+        Current noradrenaline level ∈ [0, 1] (Aston-Jones & Cohen
+        2005 LC tonic discharge); scales σ multiplicatively.
     cb_motor_correction : (motor_dim,) | None
         Additive pre-tanh term from cerebellar deep nuclei (Wolpert
         1998 forward-model correction).  ``None`` → zero.
@@ -208,13 +289,36 @@ def m1_step(
     l5 = _normalise_l5(l5_rate)
     raw = l5 @ state.motor_readout                          # (motor_dim,)
     if cb_motor_correction is not None:
-        raw = raw + params.cb_alpha * cb_motor_correction.astype(DTYPE)
-    jc = jnp.tanh(raw).astype(DTYPE)
+        # Tanh-squash the cerebellar contribution before scaling.  The
+        # raw ``cb_motor_correction`` = dn_rate @ w_dn_motor is
+        # unbounded (Hebbian-trained, no clip in cerebellum.py); without
+        # squashing, α·cb can dominate raw and saturate tanh on its own
+        # (verified: at PCA-init |W·l5|≤2.8 yet pre_tanh ≈ 6.6, so the
+        # 3.8 residual must come from cb).  Biologically deep cerebellar
+        # nuclei have ceilinged firing rates (Person & Raman 2012 ~100
+        # Hz max in vivo); a tanh is the structural saturation analogue.
+        # After squashing, α · tanh(cb) ∈ [-α, α], guaranteed bounded.
+        raw = raw + params.cb_alpha * jnp.tanh(
+            cb_motor_correction.astype(DTYPE)
+        )
+    sigma = params.sigma_base * (
+        params.sigma_floor + params.sigma_ne_gain * jnp.asarray(ne_level, DTYPE)
+    )
+    xi = sigma * jax.random.normal(key, raw.shape, DTYPE)
+    jc = jnp.tanh(raw + xi).astype(DTYPE)
     new_state = M1State(
         motor_readout=state.motor_readout,
         last_joint_command=jc,
+        last_exploration_noise=xi.astype(DTYPE),
+        last_l5_rate=l5.astype(DTYPE),
+        rpe_baseline=state.rpe_baseline,
     )
-    return M1Output(state=new_state, joint_command=jc, l5_rate_normalised=l5)
+    return M1Output(
+        state=new_state,
+        joint_command=jc,
+        l5_rate_normalised=l5,
+        exploration_noise=xi.astype(DTYPE),
+    )
 
 
 # =====================================================================
@@ -227,32 +331,62 @@ def m1_learn_readout(
     params: M1Params,
     *,
     rpe: Array,
-    l5_rate_normalised: Array,
-    joint_command: Array,
+    l5_rate_normalised: Array | None = None,
+    exploration_noise: Array | None = None,
     cb_motor_err: Array | None = None,
 ) -> M1State:
-    """Three-factor Hebbian update (Doya 2000; Shadmehr & Krakauer 2008).
+    """Node-perturbation REINFORCE update (Williams 1992; Fiete & Seung 2006).
 
-      Δw_{ij} = lr · (rpe + cb_motor_err_j) · l5_i · jc_j
+      Δw_{ij} = lr · (rpe + cb_motor_err_j) · l5_i · ξ_j
 
-    Gated by the VTA RPE broadcast — classic cortical
-    reward-modulated plasticity.  ``cb_motor_err`` optionally adds a
-    per-joint supervised-descent term from the cerebellum (Wolpert
-    1998).  The rule is local (outer product of pre and post
-    activities times a scalar modulator per channel); no backprop.
+    where ξ is the exploration noise injected at the post-synapse
+    *during the action that produced this RPE*.  Correlating ξ with
+    subsequent RPE is the unbiased estimator of the policy gradient
+    ∇_w E[R | π_w] (Williams 1992 §6; biological analogue: motor
+    variability as exploration, Tumer & Brainard 2007).
+
+    ``l5_rate_normalised`` and ``exploration_noise`` default to the
+    values cached on ``state`` (``last_l5_rate`` / ``last_exploration_noise``)
+    so the caller does not have to thread them through across the
+    one-cycle delay between action and reward.
+
+    The rule is local: outer product of presynaptic L5 rate and
+    postsynaptic noise, gated by the global RPE scalar (plus an
+    optional per-channel cerebellar supervised correction).  No
+    backprop, no surrogate gradient.
     """
     r = jnp.asarray(rpe, DTYPE)
+    # REINFORCE-with-baseline (Sutton & Barto 1998 §13.4).  The EMA
+    # rate α_b = readout_lr couples the baseline timescale to the
+    # policy-update timescale: τ_b = 1/lr.  This is the principled
+    # choice — baseline tracks the policy's own update horizon, fast
+    # enough to follow non-stationary returns, slow enough that the
+    # baseline estimate has lower variance than the per-step rpe it
+    # subtracts (Greensmith et al. 2004 variance bounds).  VTA's V(s)
+    # critic provides one baseline already; this M1-local one absorbs
+    # the *residual* positive bias that survives because V(s) trains
+    # slower than M1 (verified: D3.2 of saturation-diag notebook —
+    # raw rpe mean +0.026, baseline-subtracted mean +0.003).
+    alpha_b = params.readout_lr
+    new_baseline = (
+        (jnp.asarray(1.0, DTYPE) - alpha_b) * state.rpe_baseline
+        + alpha_b * r
+    )
+    r_eff = r - new_baseline
+    pre = (
+        state.last_l5_rate if l5_rate_normalised is None
+        else l5_rate_normalised
+    ).astype(DTYPE)
+    xi = (
+        state.last_exploration_noise if exploration_noise is None
+        else exploration_noise
+    ).astype(DTYPE)
+    elig = jnp.outer(pre, xi)                               # (n_l5, motor_dim)
     if cb_motor_err is None:
-        mod = r                                             # scalar
-        dw = params.readout_lr * mod * jnp.outer(
-            l5_rate_normalised.astype(DTYPE),
-            joint_command.astype(DTYPE),
-        )
+        dw = params.readout_lr * r_eff * elig
     else:
-        mod = r + cb_motor_err.astype(DTYPE)                # (motor_dim,)
-        dw = params.readout_lr * (
-            jnp.outer(l5_rate_normalised.astype(DTYPE),
-                      joint_command.astype(DTYPE)) * mod[None, :]
-        )
+        mod = r_eff + cb_motor_err.astype(DTYPE)            # (motor_dim,)
+        dw = params.readout_lr * elig * mod[None, :]
     w_new = jnp.clip(state.motor_readout + dw, -params.w_clip, params.w_clip)
-    return eqx.tree_at(lambda s: s.motor_readout, state, w_new)
+    state = eqx.tree_at(lambda s: s.motor_readout, state, w_new)
+    return eqx.tree_at(lambda s: s.rpe_baseline, state, new_baseline)

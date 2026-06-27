@@ -117,56 +117,52 @@ def _one_babble_cycle(
 ) -> tuple[tuple, tuple]:
     """Single babbling cycle used as the scan body.
 
-    Phase 6B fix: babbling now drives the body with **M1's own
-    noisy joint command** rather than an external Ornstein-Uhlenbeck
-    process, and feeds back ``world_model.curiosity`` as the
-    intrinsic reward.  This means:
+    Motor babbling is the developmental stage that *precedes*
+    goal-directed reaching (Oller 1980 canonical babbling; von Hofsten
+    2004): it is self-supervised acquisition of the sensorimotor
+    forward model, not reward-driven policy learning.  Accordingly:
 
-    * Exploration comes from M1's NE-coupled exploration noise
-      (Aston-Jones & Cohen 2005; Tumer & Brainard 2007), so the
-      same node-perturbation REINFORCE rule that drives reach
-      learning is also active during babbling — weights are no
-      longer frozen at zero RPE for 30 k cycles.
-    * The cerebellum forward model and world model see the
-      (executed-action, real-sensory) pairs that *will* be used
-      during reach — distribution match instead of OU mismatch.
-    * Pre-fix bug: ``prev_reward = 0`` ⇒ RPE = 0 ⇒ ``m1_learn_readout``
-      dw = 0 for the entire 30 k babble; M1 entered reach with a
-      random PCA-synergy readout.
+    * Exploration comes from M1's NE-coupled exploration noise ξ
+      (motor-cortex variability; Tumer & Brainard 2007; Dhawale 2017),
+      sampled around the analytic PCA-synergy readout.  No external
+      Ornstein-Uhlenbeck process is needed — ξ *is* the babble.
+    * ``learn_motor_readout=False``: the reward-driven REINFORCE update
+      on M1's readout is OFF, so the readout does not chase the
+      intrinsic signal (which would teach "maximise surprise", not
+      "reach").  M1 enters reach near its analytic init, as intended.
+    * No extrinsic reward (``prev_reward = 0``): the cerebellum forward
+      model (climbing-fibre LTD) and the world model (its own
+      prediction error) are NOT reward-gated, so they learn the
+      (executed-action, real-sensory) statistics that reach will use.
+      The body-actor's learning-progress bonus still shapes exploration
+      internally, without an extrinsic-reward channel.
 
-    Carry: ``(brain_state, body, sensory, reward, done)``.
+    Carry: ``(brain_state, body, sensory, done)``.
     Input: per-step PRNG key.
     Output (stacked): ``(jc, tip_xy)``.
     """
-    brain_state, body, sensory, prev_r, prev_d = carry
+    brain_state, body, sensory, prev_d = carry
     key = inp
 
     k_brain, k_body = jax.random.split(key, 2)
     out = action_brain_cognitive_step(
         brain_state, brain_params, ctx,
         sensory,
-        prev_reward=prev_r, prev_done=prev_d, key=k_brain,
+        prev_reward=jnp.asarray(0.0, DTYPE), prev_done=prev_d, key=k_brain,
+        learn_motor_readout=False,
     )
     brain_state = out.state
     jc = brain_state.m1.last_joint_command
     body, sample = body.act_continuous(k_body, jc)
-    # Phase 6B: write the executed action + real qpos/qvel into the
-    # brain so next cycle's world-model, motor-PE, and efference-copy
-    # see the action that actually moved the arm.
+    # Write the executed action + real qpos/qvel into the brain so next
+    # cycle's world-model, motor-PE, and efference-copy see the action
+    # that actually moved the arm.
     brain_state = _sync_brain_to_body(
         brain_state, body, jc, brain_params.n_body_actions,
     )
-    # Intrinsic reward: world-model curiosity (transition surprise).
-    # Friston 2017 EFE epistemic value; bounded ∈ [0, 1].  This is
-    # the same signal the cognitive step already feeds into
-    # body-actor RPE as ``body_bonus``; using it as the extrinsic
-    # reward during babbling lets the VTA/critic drive M1 learning
-    # toward states the world model is still uncertain about.
-    intrinsic_r = out.curiosity
     new_carry = (
         brain_state, body,
         sample.sensory,
-        intrinsic_r.astype(DTYPE),
         sample.done,
     )
     return new_carry, (jc, body.tip_xy())
@@ -239,16 +235,21 @@ def _one_reach_cycle(
 
 @eqx.filter_jit
 def _babble_chunk(
-    brain_state, body, sensory, prev_r, prev_d,
+    brain_state, body, sensory, prev_d,
     brain_params, ctx, keys,
 ):
-    """Run ``keys.shape[0]`` babbling cycles under one XLA graph."""
+    """Run ``keys.shape[0]`` babbling cycles under one XLA graph.
+
+    Babbling carries no reward (it is self-supervised; see
+    ``_one_babble_cycle``), so the carry is
+    ``(brain_state, body, sensory, done)``.
+    """
     def step_fn(c, k):
         return _one_babble_cycle(
             c, k,
             brain_params=brain_params, ctx=ctx,
         )
-    init = (brain_state, body, sensory, prev_r, prev_d)
+    init = (brain_state, body, sensory, prev_d)
     final, outputs = jax.lax.scan(step_fn, init, keys)
     return final, outputs
 
@@ -363,33 +364,25 @@ def run_babbling(
     *,
     n_cycles: int = 30_000,
     target_refresh: int = 400,
-    ou_tau: float | None = None,    # deprecated; ignored (OU dropped Phase 6B)
-    ou_sigma: float | None = None,  # deprecated; ignored
 ) -> BabbleResult:
-    """M1-driven motor babbling under one ``lax.scan`` per chunk.
+    """Motor babbling under one ``lax.scan`` per chunk.
 
-    Phase 6B fix: babbling now drives the body with M1's own noisy
-    joint command (NE-coupled exploration noise; Aston-Jones &
-    Cohen 2005) instead of an external Ornstein-Uhlenbeck process.
-    The intrinsic reward signal is the world-model curiosity
-    (Friston 2017 EFE epistemic), so the same node-perturbation
-    REINFORCE rule that drives reach learning is also active during
-    babbling — weights are no longer frozen at zero RPE.
-
-    The ``ou_tau`` / ``ou_sigma`` kwargs are accepted for backward
-    compatibility and ignored.
+    Babbling drives the body with M1's own NE-coupled exploration noise
+    ξ (motor-cortex variability; Tumer & Brainard 2007) around the
+    analytic PCA-synergy readout.  It is self-supervised forward-model
+    acquisition: the reward-driven M1 readout update is OFF and there is
+    no extrinsic reward (see ``_one_babble_cycle``); the cerebellum and
+    world model learn from prediction error alone.
 
     The run is split into chunks of ``target_refresh`` cycles.  Each
     chunk is a single XLA kernel launch; the mocap target is rotated
     between chunks in Python.
     """
-    del ou_tau, ou_sigma
     k = key
     k, k_reset = split_key(k, 2)
     body, sample = body.reset(k_reset)
 
     sensory = sample.sensory
-    prev_r = jnp.asarray(0.0, DTYPE)
     prev_d = sample.done
     motor_dim = brain_params.m1.motor_dim
 
@@ -404,9 +397,9 @@ def run_babbling(
         k, k_chunk, k_tgt = split_key(k, 3)
         keys = jax.random.split(k_chunk, this_chunk)
 
-        (brain_state, body, sensory, prev_r, prev_d), (jcs, tips) = (
+        (brain_state, body, sensory, prev_d), (jcs, tips) = (
             _babble_chunk(
-                brain_state, body, sensory, prev_r, prev_d,
+                brain_state, body, sensory, prev_d,
                 brain_params, ctx, keys,
             )
         )

@@ -32,7 +32,7 @@ def test_phase6b_cerebellum_forward_mse() -> None:
 
     res = run_babbling(
         state, params, DEFAULT, body, make_key(1),
-        n_cycles=1500, ou_tau=20.0, ou_sigma=0.4,
+        n_cycles=1500,
         target_refresh=400,
     )
     post_state = res.brain_state

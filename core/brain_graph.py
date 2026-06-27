@@ -106,7 +106,8 @@ from .vta import (
 from .world_model import (
     WorldModelParams, WorldModelState,
     init_world_model_params, init_world_model_state,
-    wm_predict, wm_update, wm_curiosity_signal, wm_reset_transient,
+    wm_predict, wm_update, wm_curiosity_signal, wm_learning_progress,
+    wm_reset_transient,
 )
 from .precision_bus import (
     PrecisionChannel, init_precision_channel,
@@ -406,9 +407,6 @@ class ActionBrainParams(eqx.Module):
     # learning.  Shape ``(n_body + n_saccade, mossy_size)``.
     w_efference_mossy: Array
 
-    # Inferior-olive proxy: sensory PE → climbing fibres (Purkinje)
-    w_io_pc: Array              # (sensory_size, n_purkinje)
-
     # Receptor densities along RECEPTOR_ORDER
     cortex_receptor_density: Array
 
@@ -446,21 +444,32 @@ class ActionBrainParams(eqx.Module):
     # ActionBrainState's signature again.
     sleep: SleepParams
 
-    # Phase 6A: continuous motor substrate.
+    # Phase 6A/6B: continuous motor substrate.
     # M1 is a learned linear readout on cortex L5 producing a bounded
     # joint command (Lemon 2008; Doya 2000).  Proprioception encoder
-    # population-codes synthetic joint angles + velocities (Georgopoulos
-    # 1986; Pouget & Sejnowski 1997).  Cerebellar motor-PE is projected
-    # onto Purkinje cells via ``w_motor_pc`` (Wolpert 1998 internal
-    # forward model) and the deep-nuclei output is projected back onto
-    # the joint-command via ``w_dn_motor`` for additive M1 correction.
+    # population-codes joint angles + velocities (Georgopoulos 1986;
+    # Pouget & Sejnowski 1997).
+    #
+    # The cerebellum is the motor **forward model** (Wolpert 1998)
+    # implemented as an adaptive filter (Dean, Porrill, Ekerot & Jörntell
+    # 2010, Nat Rev Neurosci 11:30): granule→Purkinje weights (``w_gp``,
+    # in CerebellumState) learn by climbing-fibre LTD, while the
+    # microzone→output map ``w_dn_motor`` is a FIXED random projection
+    # (adaptive-filter output weights are fixed; plasticity is at the
+    # parallel-fibre/Purkinje synapse).  The decorrelation/covariance
+    # rule only reduces the *output* error if the climbing teaching
+    # signal reaches each Purkinje cell in that cell's output coordinate
+    # frame (Porrill, Dean & Stone 2004); we therefore derive the
+    # climbing projection as ``w_dn_motor.T`` rather than an independent
+    # random matrix.  The forward-model output predicts the joint-angle
+    # deviation from the commanded set-point and closes the
+    # motor-prediction loop in ``action_brain_cognitive_step``.
     # When ``bypass_m1`` is True (default, Phase 6A regression-safe),
     # the entire continuous path is skipped and the body receives the
     # BG discrete action unchanged — pre-6A bit-identical behaviour.
     m1: "M1Params"
     proprio: "ProprioceptionParams"
-    w_motor_pc: Array              # (n_proprio_enc, n_purkinje)
-    w_dn_motor: Array              # (n_dn, motor_dim)
+    w_dn_motor: Array              # (n_dn, motor_dim) FIXED microzone→output
 
     # Static
     n_body_actions: int = eqx.field(static=True)
@@ -615,7 +624,6 @@ def init_action_brain_params(
     # inter-region weights
     w_l5_ct_mean: float = 0.5,
     w_l5_mossy_mean: float = 0.5,
-    w_io_pc_sigma: float = 0.3,
     # decision cycle
     substeps: int = 20,
     seed: int = 0,
@@ -629,7 +637,6 @@ def init_action_brain_params(
     n_joints: int = 2,
     n_cells_per_joint: int = 16,
     m1_readout_lr: float = 1e-3,
-    m1_cb_alpha: float = 0.2,
     bypass_m1: bool = True,
     # Phase 6B: real-proprioception wiring (see ``use_real_proprio``
     # docstring on ``ActionBrainParams``).  Default False keeps every
@@ -711,23 +718,20 @@ def init_action_brain_params(
     )
 
     master = jax.random.PRNGKey(seed)
-    k1, k2, k3, k4 = split_key(master, 4)
+    k1, k2, k3 = split_key(master, 3)
     w_l5_ct = jnp.abs(
         jax.random.normal(k1, (cortex_n_l5, n_ct), dtype=DTYPE)
     ) * jnp.asarray(w_l5_ct_mean, DTYPE)
     w_l5_mossy = jnp.abs(
         jax.random.normal(k2, (cortex_n_l5, mossy_size), dtype=DTYPE)
     ) * jnp.asarray(w_l5_mossy_mean, DTYPE)
-    w_io_pc = jax.random.normal(
-        k3, (sensory_size, cerebellum_n_purkinje), dtype=DTYPE,
-    ) * jnp.asarray(w_io_pc_sigma, DTYPE)
     # Wolpert 1998: efference copy projection onto mossy fibres.
     # Sparse-positive random (same scale as L5\u2192mossy) so that one-hot
     # motor commands inject a bounded afferent pulse without dominating
     # the cortical drive.  Shape: (body + saccade, mossy_size).
     n_efference = int(n_body_actions + n_saccade_actions)
     w_efference_mossy = jnp.abs(
-        jax.random.normal(k4, (n_efference, mossy_size), dtype=DTYPE)
+        jax.random.normal(k3, (n_efference, mossy_size), dtype=DTYPE)
     ) * jnp.asarray(w_l5_mossy_mean, DTYPE)
 
     d_ct = max(1, int(round(delay_ct_ms / ctx.dt)))
@@ -770,38 +774,34 @@ def init_action_brain_params(
     )
     hc_p = init_hippocampus_params(input_dim=int(ec_p.output_dim))
 
-    # Phase 6A: continuous motor substrate (M1 + proprio + cerebellar
-    # motor-PE projections).  M1 readout head drives motor_dim =
-    # n_joints channels into [-1, 1]; proprioception encoder Gaussian-
-    # codes angles+velocities; fixed random projections w_motor_pc /
-    # w_dn_motor close the efference-copy loop through cerebellum.
-    from sensory.proprioception import (
-        init_proprioception_params, proprio_output_dim,
-    )
+    # Phase 6A/6B: continuous motor substrate (M1 + proprio + cerebellar
+    # forward model).  M1 readout head drives motor_dim = n_joints
+    # channels into [-1, 1]; proprioception encoder Gaussian-codes
+    # angles+velocities for the body's sensory afferent.
+    from sensory.proprioception import init_proprioception_params
     motor_dim = int(n_joints)
     m1_p = init_m1_params(
         n_l5=int(cortex_n_l5), motor_dim=motor_dim,
         readout_lr=float(m1_readout_lr),
-        cb_alpha=float(m1_cb_alpha),
     )
     proprio_p = init_proprioception_params(
         n_joints=int(n_joints),
         n_cells_per_joint=int(n_cells_per_joint),
     )
-    n_proprio_enc = proprio_output_dim(proprio_p)
-    k_motor_pc, k_dn_motor = split_key(jax.random.PRNGKey(seed + 1), 2)
-    # Proprioception PE → Purkinje climbing (inferior-olive motor
-    # channel; Wolpert 1998).  Same scale as ``w_io_pc`` for matched
-    # climbing-fibre magnitudes.
-    w_motor_pc = jax.random.normal(
-        k_motor_pc, (n_proprio_enc, cerebellum_n_purkinje), dtype=DTYPE,
-    ) * jnp.asarray(w_io_pc_sigma, DTYPE)
-    # Deep nuclei → motor correction vector (half-normal positive; DN
-    # output is disinhibition-driven excitatory on motor structures).
-    w_dn_motor = jnp.abs(
-        jax.random.normal(
-            k_dn_motor, (cb_p.n_dn, motor_dim), dtype=DTYPE,
-        )
+    # Cerebellar microzone (deep-nuclei) → joint-command map.  FIXED
+    # random output weights of the adaptive-filter cerebellum (Dean,
+    # Porrill, Ekerot & Jörntell 2010): plasticity lives at the
+    # granule→Purkinje synapse (``w_gp``), not here.  Signed (not
+    # half-normal) so corrections are bidirectional, and fan-in scaled
+    # by 1/√n_dn (LeCun 1998) so the summed output is O(1) regardless of
+    # the microzone count.  The climbing teaching signal is derived as
+    # ``w_dn_motor.T`` in the cognitive step so each Purkinje cell is
+    # taught in its own output coordinate frame (Porrill, Dean & Stone
+    # 2004 decorrelation control) — the necessary and sufficient
+    # condition for the covariance LTD rule to descend the output error.
+    k_dn_motor = jax.random.PRNGKey(seed + 1)
+    w_dn_motor = jax.random.normal(
+        k_dn_motor, (cb_p.n_dn, motor_dim), dtype=DTYPE,
     ) / jnp.sqrt(jnp.asarray(cb_p.n_dn, DTYPE))
     return ActionBrainParams(
         sensory_stack=sensory_stack_params,
@@ -815,7 +815,7 @@ def init_action_brain_params(
         vta=vta_p, world_model=wm_p,
         pfc=pfc_p,
         ec=ec_p, hippocampus=hc_p,
-        w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy, w_io_pc=w_io_pc,
+        w_l5_ct=w_l5_ct, w_l5_mossy=w_l5_mossy,
         w_efference_mossy=w_efference_mossy,
         cortex_receptor_density=cortex_density,
         phase_offset_thalamus=f(phase_offsets_rad[0]),
@@ -828,7 +828,6 @@ def init_action_brain_params(
         sleep=sleep_p,
         m1=m1_p,
         proprio=proprio_p,
-        w_motor_pc=w_motor_pc,
         w_dn_motor=w_dn_motor,
         n_body_actions=int(n_body_actions),
         n_saccade_actions=int(n_saccade_actions),
@@ -1207,6 +1206,7 @@ def action_brain_cognitive_step(
     key: PRNGKey | None = None,
     *,
     info_gain: float | Array | None = None,
+    learn_motor_readout: bool = True,
 ) -> ActionBrainOutput:
     """One decision cycle using a pre-computed sensory representation.
 
@@ -1219,6 +1219,13 @@ def action_brain_cognitive_step(
     Each ``@eqx.filter_jit``-decorated leaf function compiles once and
     is cached; the Python loop dispatches individual calls, keeping
     each XLA compilation bounded by one subsystem's graph size.
+
+    ``learn_motor_readout`` gates the M1 node-perturbation REINFORCE
+    update only.  It is ``True`` for goal-directed control (reach) and
+    ``False`` during motor babbling, where the readout must not chase
+    the intrinsic reward (Oller 1980; von Hofsten 2004): babbling is
+    for self-supervised forward-model acquisition (cerebellum + world
+    model), whose plasticity is not reward-gated and stays active.
     """
     if key is None:
         raise ValueError(
@@ -1363,9 +1370,12 @@ def action_brain_cognitive_step(
     )
 
     # --- 2. Close the loop on the PREVIOUS transition --------------
-    # 2a. World-model learning on (s_t, a_t, s_{t+1}) — sensory PE
-    #     serves as the cerebellar climbing signal. Action is the
-    #     joint body+saccade one-hot committed on the previous cycle.
+    # 2a. World-model learning on (s_t, a_t, s_{t+1}).  The world model
+    #     owns *sensory* prediction (Friston 2010); the cerebellum owns
+    #     *motor* prediction (Wolpert 1998) — a clean division of labour,
+    #     so the world-model PE no longer drives the cerebellar climbing
+    #     fibres.  Action is the joint body+saccade one-hot committed on
+    #     the previous cycle.
     joint_last_action = jnp.concatenate(
         [state.last_body_action, state.last_saccade_action], axis=0,
     )
@@ -1376,28 +1386,21 @@ def action_brain_cognitive_step(
         ach=state.neuromodulator.acetylcholine,
         n_substeps=params.substeps,
     )
-    sensory_pe = wm_out.prediction_error                 # (sensory_size,)
-    climbing_sensory = sensory_pe @ params.w_io_pc       # (n_purkinje,)
 
-    # --- 2a.2 Phase 6A: synthetic proprioception + motor PE --------
-    # Derive a pseudo-joint kinematics signal from the previously
-    # committed body action (one-hot → signed direction per joint) so
-    # the downstream M1 / cerebellum forward-model loop has an
-    # exercised data path even while the current bodies remain
-    # discrete (plan 6A.4).  Phase 6B (``use_real_proprio=True``)
-    # swaps this for the driver-supplied real MJX joint sensors
-    # already stored in ``state.last_joint_angles`` /
-    # ``state.last_joint_velocities`` without changing consumer
-    # wiring.
+    # --- 2a.2 Cerebellar forward-model error (Wolpert 1998) ---------
+    # The cerebellum predicts the next normalised joint angle; its
+    # climbing-fibre teaching signal is the forward-model error in
+    # joint coordinates,  e = q_actual − q_predicted.  ``q_predicted``
+    # was emitted last cycle (``last_predicted_joint_angles`` =
+    # commanded set-point + cerebellar deviation; see step 4a).  For
+    # the discrete-action bodies (``use_real_proprio=False``) a
+    # first-order kinematic proxy supplies ``q_actual``; for MJX
+    # (``use_real_proprio=True``) the driver wrote the real normalised
+    # qpos/qvel into ``last_joint_angles`` / ``last_joint_velocities``.
     prev_body_id = state.last_body_action_id
     proprio_p = params.proprio
     n_joints_int = int(proprio_p.n_joints)
     if params.use_real_proprio:
-        # Phase 6B: the MJX driver wrote the normalised real qpos /
-        # qvel from the previous cycle into these two fields right
-        # after ``body.act_continuous``.  Use them directly as the
-        # ``actual'' of motor PE (Wolpert 1998 forward-model error =
-        # real − predicted).  No synthetic delta is added.
         new_angles = state.last_joint_angles
         new_velocities = state.last_joint_velocities
     else:
@@ -1420,18 +1423,15 @@ def action_brain_cognitive_step(
             jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
         )
         new_velocities = delta_angle
-    from sensory.proprioception import proprio_encode as _proprio_encode
-    proprio_actual_enc = _proprio_encode(
-        proprio_p, new_angles, new_velocities,
-    )
-    # Predicted proprio comes from the cerebellar/M1 forward estimate
-    # stored at the previous cycle (``last_predicted_joint_angles``).
-    proprio_pred_enc = _proprio_encode(
-        proprio_p, state.last_predicted_joint_angles, new_velocities,
-    )
-    motor_pe_vec = proprio_actual_enc - proprio_pred_enc
-    climbing_motor = motor_pe_vec @ params.w_motor_pc    # (n_purkinje,)
-    climbing = climbing_sensory + climbing_motor
+    # Forward-model error in joint space, (motor_dim,).
+    motor_error_joint = new_angles - state.last_predicted_joint_angles
+    # Climbing fibres carry the error in each Purkinje cell's OWN output
+    # coordinate frame: the teaching projection is the transpose of the
+    # fixed microzone→output map (Porrill, Dean & Stone 2004 decorrelation
+    # control).  This transpose-coupling is what makes the covariance LTD
+    # rule in ``cerebellum_update`` descend the forward-model output
+    # error rather than an unrelated random projection of it.
+    climbing = motor_error_joint @ params.w_dn_motor.T   # (n_purkinje,)
     cb_state = cerebellum_update(
         state.cerebellum, params.cerebellum, climbing, modulator=1.0,
     )
@@ -1467,6 +1467,17 @@ def action_brain_cognitive_step(
     #     double-count the metabolic constraint already enforced by
     #     the AdEx dynamics.
     curiosity = wm_curiosity_signal(wm_out.state, params.world_model)
+    # Learning progress = pe_long − pe_short (Oudeyer & Kaplan 2007 IAC;
+    # Schmidhuber 1991).  Positive iff the world model's prediction error
+    # is *decreasing* — i.e. the region is being mastered.  This, not the
+    # raw |PE| ``curiosity``, is the correct intrinsic *reward* for the
+    # exploration policy: it rewards the learning frontier and is immune
+    # to the noisy-TV failure mode (irreducible-error regions have high
+    # |PE| but ≈0 learning progress, so they earn no bonus), and it does
+    # not vanish merely because the world is locally predictable — it
+    # vanishes only where there is nothing left to learn, which is the
+    # intended "boredom" that pushes the agent elsewhere.
+    learning_progress = wm_learning_progress(wm_out.state, params.world_model)
     r_total = r_ext
 
     # 2b-bis. Precision-weighted additive composition of multi-source
@@ -1492,9 +1503,13 @@ def action_brain_cognitive_step(
     #   (precision_bus.precision_compose).
     ig = jnp.asarray(info_gain, DTYPE)
     pc_r_ext_new = precision_update(state.precision_r_ext, r_ext)
-    pc_curiosity_new = precision_update(state.precision_curiosity, curiosity)
+    # The body-actor epistemic channel carries *learning progress*
+    # (Oudeyer 2007), standardised to unit variance like the other bonuses.
+    pc_curiosity_new = precision_update(
+        state.precision_curiosity, learning_progress)
     pc_info_gain_new = precision_update(state.precision_info_gain, ig)
-    curiosity_z = precision_standardize(pc_curiosity_new, curiosity)
+    learning_progress_z = precision_standardize(
+        pc_curiosity_new, learning_progress)
     info_gain_z = precision_standardize(pc_info_gain_new, ig)
 
     # 2c. TD(0) RPE: V(s_t)=state.vta.stored_v, V(s_{t+1})=critic.activation
@@ -1517,17 +1532,17 @@ def action_brain_cognitive_step(
     # Actor RPE receives a modality-specific epistemic bonus (the
     # critic RPE does NOT -- V(s) approximates pure expected
     # extrinsic return; Dayan & Yu 2003 dual-process decomposition):
-    #   body actor    : + curiosity (transition surprise over the
-    #                   world-model posterior, Friston 2017 EFE
-    #                   epistemic component; z-scored so it is
-    #                   unit-variance independent of raw scale).
+    #   body actor    : + learning progress (Oudeyer 2007 IAC; the
+    #                   epistemic value of revisiting regions the world
+    #                   model is still mastering — z-scored to unit
+    #                   variance independent of raw scale).
     #   saccade actor : + info_gain (attention-specific surprise,
     #                   Itti & Baldi 2009).
     actor_body_state, actor_saccade_state = actors_learn_step(
         state.actor_body, params.actor_body,
         state.actor_saccade, params.actor_saccade,
         rpe=rpe,
-        body_bonus=curiosity_z,
+        body_bonus=learning_progress_z,
         saccade_bonus=info_gain_z,
     )
 
@@ -1606,12 +1621,15 @@ def action_brain_cognitive_step(
         jc_out = state.m1.last_joint_command
         predicted_angles_next = state.last_predicted_joint_angles
     else:
-        cb_correction = cb_state.dn_rate @ params.w_dn_motor    # (motor_dim,)
+        # Cerebellar forward-model output: the predicted deviation of
+        # next-cycle joint angle from the commanded set-point, read from
+        # the deep-nuclei rate through the FIXED microzone→output map
+        # (Wolpert 1998; Dean & Porrill 2010 adaptive filter).
+        cb_forward = cb_state.dn_rate @ params.w_dn_motor       # (motor_dim,)
         m1_out = m1_step(
             state.m1, params.m1, cortex_l5_rate,
             key=k_m1,
             ne_level=state.neuromodulator.noradrenaline,
-            cb_motor_correction=cb_correction,
         )
         jc_out = m1_out.joint_command
         # Override the BG-selected body action with the discretised
@@ -1625,59 +1643,59 @@ def action_brain_cognitive_step(
         body_action_oh = (
             jnp.arange(params.n_body_actions) == body_action_id
         ).astype(DTYPE)
-        # Node-perturbation REINFORCE update on motor_readout: dw
-        # correlates the injected exploration noise ξ with the RPE
-        # produced by the action that committed to that ξ.  RPE here
-        # is the CURRENT cycle's RPE (the action being trained was
-        # committed by state.m1 last cycle; the noise / l5 cached on
-        # state.m1 carry that information forward through the
-        # one-cycle delay).
-        m1_new_state = m1_learn_readout(
-            state.m1, params.m1,
-            rpe=rpe,
-            l5_rate_normalised=None,        # use state.m1.last_l5_rate
-            exploration_noise=None,         # use state.m1.last_exploration_noise
-            cb_motor_err=None,
-        )
-        # Stash THIS cycle's exploration noise + L5 rate onto the
+        # Node-perturbation REINFORCE update on motor_readout (gated by
+        # ``learn_motor_readout``).  dw correlates the injected
+        # exploration noise ξ with the RPE produced by the action that
+        # committed to that ξ; RPE is the CURRENT cycle's RPE (the
+        # action being trained was committed by state.m1 last cycle; the
+        # noise / l5 / σ cached on state.m1 carry that information
+        # forward through the one-cycle delay).  During motor babbling
+        # the gate is OFF: babbling is self-supervised forward-model
+        # acquisition that precedes goal-directed reaching (Oller 1980
+        # canonical babbling; von Hofsten 2004), so the reward-driven
+        # readout must not chase the intrinsic signal — the cerebellum
+        # and world model still learn (their plasticity is not
+        # reward-gated).
+        if learn_motor_readout:
+            m1_new_state = m1_learn_readout(
+                state.m1, params.m1,
+                rpe=rpe,
+                l5_rate_normalised=None,    # use state.m1.last_l5_rate
+                exploration_noise=None,     # use state.m1.last_exploration_noise
+            )
+        else:
+            m1_new_state = state.m1
+        # Stash THIS cycle's exploration noise + L5 rate + σ onto the
         # learned-state object so next cycle's update can reach them.
         m1_new_state = eqx.tree_at(
             lambda s: (
                 s.last_joint_command,
                 s.last_exploration_noise,
                 s.last_l5_rate,
+                s.last_sigma,
             ),
             m1_new_state,
-            (jc_out, m1_out.exploration_noise, m1_out.l5_rate_normalised),
+            (
+                jc_out,
+                m1_out.exploration_noise,
+                m1_out.l5_rate_normalised,
+                m1_out.state.last_sigma,
+            ),
         )
-        # Forward-model prediction of joint angles for next-cycle
-        # motor PE.  Phase 6B architectural fix (post-D8 audit):
-        #
-        # The body (``MjxArmBody.act_continuous``) treats ``jc`` as
-        # a *normalised qpos setpoint* — ``ctrl = jc * joint_range``
-        # is fed to a MuJoCo position actuator with PD servo.  Under
-        # perfect tracking the next normalised qpos equals ``jc``;
-        # the steady-state contract of the body interface is
-        # ``q_norm → jc``.  The previous formulation
-        # ``q + 0.1·jc`` treated ``jc`` as a *velocity* command
-        # (matching the Phase-6A synthetic-proprio fallback at line
-        # ~1417) — a structural type error against the real body.
-        #
-        # Empirical evidence (D8 in colab/phase6b_diag.ipynb): the
-        # measured slope of real Δq on jc is 0.019 / 0.031 (R²≈0.04),
-        # i.e. the velocity-proxy gain is wrong by ~5×; cerebellum
-        # cannot learn its way around a constant ~80 % motor-PE bias
-        # so dn_rate saturates and dominates ``jc_out`` via
-        # ``α·tanh(cb)``.  By predicting ``jc_out`` directly we adopt
-        # the steady-state body contract as the architectural prior;
-        # the cerebellum forward model then learns the *deviation*
-        # from perfect tracking — i.e. the servo-lag transient —
-        # which is the canonical Wolpert (1998) forward-model error
-        # signal carried by climbing fibres in the inferior olive.
-        # No magic constants remain; the prediction has the same
-        # units as the proprio encoder input (normalised qpos).
+        # Close the motor-prediction loop.  The body
+        # (``MjxArmBody.act_continuous``) treats ``jc`` as a normalised
+        # qpos set-point fed to a position-servo actuator, so perfect
+        # tracking gives next-qpos = jc.  The realised next angle is
+        # ``jc + deviation``, where the servo-lag/dynamics deviation is
+        # exactly what the cerebellar forward model learns to predict
+        # (Wolpert 1998).  Predicting ``jc + cb_forward`` therefore both
+        # (i) supplies next cycle's climbing-fibre target and (ii) lets
+        # the forward-model error → 0 as ``w_gp`` learns — closing the
+        # loop that was previously open (``predicted = jc`` ignored the
+        # cerebellum entirely).  No magic constants; same normalised-qpos
+        # units as the proprio encoder input.
         predicted_angles_next = jnp.clip(
-            jc_out,
+            jc_out + cb_forward,
             jnp.asarray(-1.0, DTYPE), jnp.asarray(1.0, DTYPE),
         )
 

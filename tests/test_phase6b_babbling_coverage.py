@@ -20,7 +20,7 @@ def test_phase6b_babbling_coverage() -> None:
     n_cycles = 2000
     res = run_babbling(
         state, params, DEFAULT, body, make_key(1),
-        n_cycles=n_cycles, ou_tau=20.0, ou_sigma=0.6,
+        n_cycles=n_cycles,
         target_refresh=500,
     )
 

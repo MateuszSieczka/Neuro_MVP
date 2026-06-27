@@ -44,7 +44,7 @@ def test_phase6b_reach_success() -> None:
     # Short babbling for forward-model bootstrap.
     bab = run_babbling(
         state, params, DEFAULT, body, make_key(1),
-        n_cycles=800, ou_tau=20.0, ou_sigma=0.4,
+        n_cycles=800,
     )
     state, body = bab.brain_state, bab.body
 

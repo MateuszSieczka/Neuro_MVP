@@ -20,16 +20,16 @@ Node-perturbation REINFORCE (Williams 1992; Fiete & Seung 2006;
 biological analogue: motor-cortex variability as policy-gradient
 exploration, Tumer & Brainard 2007; Dhawale et al. 2017):
 
-    jc = tanh(raw + ξ)       with  ξ ~ 𝒩(0, σ²(NE))
-    Δw_{ij} = lr · rpe · l5_i · ξ_j
+    jc = tanh(raw + ξ)       with  ξ ~ 𝒩(0, σ²(NE)),  raw = wᵀ·l5
+    Δw_{ij} = lr · (rpe − b) · l5_i · ξ_j / σ²
 
 The injected noise ξ is the *exploration direction* the readout
-actually committed to this cycle; correlating it with subsequent RPE
-gives an unbiased policy gradient (Williams 1992 §6).  Without
-explicit exploration noise the previous rule
-``Δw ∝ rpe · l5 · jc`` self-reinforced whichever direction was
-currently produced, with no policy-gradient signal -- effectively
-untrainable when reward is a continuous shaping signal.
+committed to this cycle; ``l5·ξ/σ²`` is the score ∂lnπ/∂w of the
+Gaussian policy (Williams 1992 eq. for 𝒩(μ, σ²)), so correlating it
+with the baseline-subtracted RPE is an unbiased policy-gradient
+estimator (Williams 1992 §6; Fiete & Seung 2006).  The ``1/σ²`` factor
+makes the estimate scale-correct under NE-driven changes in the
+exploration amplitude.
 
 σ is gated by noradrenaline (Aston-Jones & Cohen 2005 LC arousal
 → motor variability): σ = σ_base · (σ_floor + ne_gain · NE).  Default
@@ -37,8 +37,10 @@ untrainable when reward is a continuous shaping signal.
 reported in songbird HVC→RA (Tumer & Brainard 2007) and rodent M1
 (Dhawale et al. 2017).
 
-``cb_motor_err`` (per-joint cerebellar supervised correction,
-Wolpert 1998) is added to the modulator when present.
+M1 produces the command only.  The cerebellum is a forward model
+(Wolpert 1998) wired in ``brain_graph`` to predict the proprioceptive
+consequence of the command, not to correct it — so no cerebellar term
+enters ``m1_step`` (see its docstring).
 
 PCA-style motor-primitive initialisation
 ----------------------------------------
@@ -84,12 +86,6 @@ class M1Params(eqx.Module):
     # homeostatically capped by recurrent inhibition in M1 L5).
     w_clip: Array
 
-    # Cerebellar-correction blend coefficient α in
-    #   jc_out = tanh(jc_raw + α · cb_motor_correction + ξ)
-    # α ~ 1/τ_cerebellum ≈ 0.2 (Medina & Lisberger 2008 ~50 ms / 250
-    # ms task-horizon).
-    cb_alpha: Array
-
     # Exploration-noise std at NE = 0 baseline (fraction of tanh
     # dynamic range).  Tumer & Brainard 2007 / Dhawale et al. 2017:
     # 5–20 % motor variability in M1.
@@ -118,6 +114,14 @@ class M1State(eqx.Module):
     # Most-recent normalised L5 rate that drove the readout (the
     # "pre" side of the eligibility outer product).
     last_l5_rate: Array             # (n_l5,)
+    # Exploration-noise std σ used to sample ``last_exploration_noise``.
+    # The Gaussian-policy score is ∂lnπ/∂μ = ξ/σ² (Williams 1992 eq.
+    # for a 𝒩(μ, σ²) policy); the REINFORCE update must therefore weight
+    # the eligibility by 1/σ² so that the per-sample gradient estimate is
+    # unbiased regardless of the NE-driven exploration amplitude.  Cached
+    # here so the next cycle's update can reach the σ that produced the
+    # action which earned the arriving RPE.
+    last_sigma: Array               # () scalar
     # EMA of recent RPE -- the policy-gradient learner's own value
     # baseline (Sutton & Barto 1998 §13.4 REINFORCE-with-baseline).
     # VTA already subtracts a slow critic V(s); however with V(s)
@@ -191,7 +195,6 @@ def init_m1_params(
     motor_dim: int,
     readout_lr: float = 1e-3,
     w_clip: float | None = None,
-    cb_alpha: float = 0.2,
     sigma_base: float = 0.15,
     sigma_floor: float = 0.5,
     sigma_ne_gain: float = 1.0,
@@ -211,7 +214,6 @@ def init_m1_params(
     return M1Params(
         readout_lr=f(readout_lr),
         w_clip=f(w_clip),
-        cb_alpha=f(cb_alpha),
         sigma_base=f(sigma_base),
         sigma_floor=f(sigma_floor),
         sigma_ne_gain=f(sigma_ne_gain),
@@ -225,11 +227,16 @@ def init_m1_state(key: PRNGKey, params: M1Params) -> M1State:
     # accepted for API symmetry with the rest of core.
     del key
     w0 = _pca_synergy_init(params.n_l5, params.motor_dim)
+    # Baseline σ at NE = 0 (Aston-Jones & Cohen 2005 tonic LC floor);
+    # never zero because ``sigma_floor`` > 0, so 1/σ² in the learning
+    # rule is always finite.
+    sigma0 = params.sigma_base * params.sigma_floor
     return M1State(
         motor_readout=w0,
         last_joint_command=jnp.zeros(params.motor_dim, DTYPE),
         last_exploration_noise=jnp.zeros(params.motor_dim, DTYPE),
         last_l5_rate=jnp.zeros(params.n_l5, DTYPE),
+        last_sigma=sigma0.astype(DTYPE),
         rpe_baseline=jnp.asarray(0.0, DTYPE),
     )
 
@@ -262,16 +269,23 @@ def m1_step(
     *,
     key: PRNGKey,
     ne_level: Array,
-    cb_motor_correction: Array | None = None,
 ) -> M1Output:
     """One dt of M1: L5 rate → bounded, *noisy* joint command.
 
-    Sample ξ ~ 𝒩(0, σ(NE)²) and emit ``jc = tanh(l5·w + α·cb + ξ)``.
-    The noise is the exploration channel for node-perturbation
-    REINFORCE (Williams 1992; biology: motor-cortex variability,
-    Tumer & Brainard 2007).  Without this noise the readout is
-    deterministic given L5 and there is no policy-gradient signal
-    → the previous rule effectively could not learn.
+    Sample ξ ~ 𝒩(0, σ(NE)²) and emit ``jc = tanh(l5·w + ξ)``.  The noise
+    is the exploration channel for node-perturbation REINFORCE
+    (Williams 1992; biology: motor-cortex variability, Tumer & Brainard
+    2007).  Without this noise the readout is deterministic given L5 and
+    there is no policy-gradient signal → the readout could not learn.
+
+    M1 emits the *command*; it receives no cerebellar term.  The
+    cerebellum is a **forward model** (Wolpert 1998): it predicts the
+    proprioceptive consequence of the command (used by ``brain_graph``
+    to close the motor-prediction loop), not an inverse controller.
+    Folding the forward-model output back into the command would have
+    the wrong sign (a predicted undershoot would *reduce* the command)
+    and would conflate the forward and inverse models; the inverse map
+    (state → command) is learned by this readout's REINFORCE rule.
 
     Parameters
     ----------
@@ -282,25 +296,9 @@ def m1_step(
     ne_level : ()
         Current noradrenaline level ∈ [0, 1] (Aston-Jones & Cohen
         2005 LC tonic discharge); scales σ multiplicatively.
-    cb_motor_correction : (motor_dim,) | None
-        Additive pre-tanh term from cerebellar deep nuclei (Wolpert
-        1998 forward-model correction).  ``None`` → zero.
     """
     l5 = _normalise_l5(l5_rate)
     raw = l5 @ state.motor_readout                          # (motor_dim,)
-    if cb_motor_correction is not None:
-        # Tanh-squash the cerebellar contribution before scaling.  The
-        # raw ``cb_motor_correction`` = dn_rate @ w_dn_motor is
-        # unbounded (Hebbian-trained, no clip in cerebellum.py); without
-        # squashing, α·cb can dominate raw and saturate tanh on its own
-        # (verified: at PCA-init |W·l5|≤2.8 yet pre_tanh ≈ 6.6, so the
-        # 3.8 residual must come from cb).  Biologically deep cerebellar
-        # nuclei have ceilinged firing rates (Person & Raman 2012 ~100
-        # Hz max in vivo); a tanh is the structural saturation analogue.
-        # After squashing, α · tanh(cb) ∈ [-α, α], guaranteed bounded.
-        raw = raw + params.cb_alpha * jnp.tanh(
-            cb_motor_correction.astype(DTYPE)
-        )
     sigma = params.sigma_base * (
         params.sigma_floor + params.sigma_ne_gain * jnp.asarray(ne_level, DTYPE)
     )
@@ -311,6 +309,7 @@ def m1_step(
         last_joint_command=jc,
         last_exploration_noise=xi.astype(DTYPE),
         last_l5_rate=l5.astype(DTYPE),
+        last_sigma=sigma.astype(DTYPE),
         rpe_baseline=state.rpe_baseline,
     )
     return M1Output(
@@ -333,17 +332,30 @@ def m1_learn_readout(
     rpe: Array,
     l5_rate_normalised: Array | None = None,
     exploration_noise: Array | None = None,
-    cb_motor_err: Array | None = None,
 ) -> M1State:
     """Node-perturbation REINFORCE update (Williams 1992; Fiete & Seung 2006).
 
-      Δw_{ij} = lr · (rpe + cb_motor_err_j) · l5_i · ξ_j
+      Δw_{ij} = lr · (rpe − b) · l5_i · ξ_j / σ²
 
-    where ξ is the exploration noise injected at the post-synapse
-    *during the action that produced this RPE*.  Correlating ξ with
-    subsequent RPE is the unbiased estimator of the policy gradient
-    ∇_w E[R | π_w] (Williams 1992 §6; biological analogue: motor
-    variability as exploration, Tumer & Brainard 2007).
+    For a Gaussian exploration policy ``a = μ + ξ`` with
+    ``ξ ~ 𝒩(0, σ²)`` and ``μ = wᵀ·l5``, the score function is
+    ``∂lnπ/∂w_{ij} = l5_i · ξ_j / σ²`` (Williams 1992 eq. for the
+    normal distribution).  Correlating that score with the
+    baseline-subtracted return is the unbiased policy-gradient estimator
+    ``∇_w E[R | π_w]`` (Fiete & Seung 2006 node perturbation; biological
+    analogue: motor-cortex variability as exploration, Tumer & Brainard
+    2007).
+
+    The ``1/σ²`` factor is essential: σ is gated by noradrenaline
+    (``m1_step``), so without it the per-sample gradient is mis-scaled
+    whenever arousal changes the exploration amplitude, inflating
+    variance and biasing learning toward high-NE episodes.  We carry the
+    reference variance ``σ_base²`` into the learning rate (the lr is
+    defined at the NE = 0 baseline σ_base·σ_floor… i.e. ``σ_base`` sets
+    the unit), so the applied scale is ``(σ_base / σ)²`` — exactly the
+    Williams score with the reference variance folded into ``lr``.  This
+    keeps the update magnitude stable at the reference arousal while
+    correctly re-weighting samples taken under different σ.
 
     ``l5_rate_normalised`` and ``exploration_noise`` default to the
     values cached on ``state`` (``last_l5_rate`` / ``last_exploration_noise``)
@@ -351,9 +363,8 @@ def m1_learn_readout(
     one-cycle delay between action and reward.
 
     The rule is local: outer product of presynaptic L5 rate and
-    postsynaptic noise, gated by the global RPE scalar (plus an
-    optional per-channel cerebellar supervised correction).  No
-    backprop, no surrogate gradient.
+    postsynaptic noise, gated by the global RPE scalar.  No backprop, no
+    surrogate gradient.
     """
     r = jnp.asarray(rpe, DTYPE)
     # REINFORCE-with-baseline (Sutton & Barto 1998 §13.4).  The EMA
@@ -381,12 +392,12 @@ def m1_learn_readout(
         state.last_exploration_noise if exploration_noise is None
         else exploration_noise
     ).astype(DTYPE)
+    # Gaussian-policy score with the reference variance folded into lr:
+    # (σ_base / σ)²  ·  l5 ⊗ ξ   (Williams 1992).  σ has a positive floor
+    # (sigma_floor > 0) so the ratio is always finite.
+    score_scale = (params.sigma_base / state.last_sigma) ** 2
     elig = jnp.outer(pre, xi)                               # (n_l5, motor_dim)
-    if cb_motor_err is None:
-        dw = params.readout_lr * r_eff * elig
-    else:
-        mod = r_eff + cb_motor_err.astype(DTYPE)            # (motor_dim,)
-        dw = params.readout_lr * elig * mod[None, :]
+    dw = params.readout_lr * r_eff * score_scale * elig
     w_new = jnp.clip(state.motor_readout + dw, -params.w_clip, params.w_clip)
     state = eqx.tree_at(lambda s: s.motor_readout, state, w_new)
     return eqx.tree_at(lambda s: s.rpe_baseline, state, new_baseline)

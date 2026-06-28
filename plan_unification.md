@@ -315,50 +315,53 @@ EFE; ablacja składnika epistemicznego mierzalnie zmienia eksplorację.
 
 ## 4. Co znika, co zostaje
 
-**Znika (realnie usunięte z kodu, nie przemianowane):**
-- node-perturbation REINFORCE w M1 (`m1.py:328`) → active inference (U.5).
-- Osobny STDP na `w_l23_l5` w korze → `w_gen` regułą wspólną (U.2).
-- Kowariancyjna LTD Marr-Albus jako osobna reguła → `Π·ε·μ` na `w_gp` (U.2).
-- Wzór TD(0) w VTA → temporalny PC węzła wartości (U.2/§6).
-- Osobne reguły aktora i krytyka w BG → precyzja polityk + węzeł wartości (U.2).
-- Reguła one-shot w HC → szybka inferencja PC + generatywny replay (U.2).
-- Ręczna sekwencja `cognitive_step`/`_perceive_substep` → relaksacja grafu (U.3).
-- Zamrożone projekcje w `Params` → uczone `w_gen` w stanie (U.4).
+**WYKONANE — cały legacy usunięty z dysku (nie przemianowany).** `core/`
+zawiera już TYLKO substrat PC (`backend`, `free_energy`, `pc_module`,
+`pc_graph`, `pc_active`, `pc_brain`, `pc_structural`). Usunięte realnie:
 
-**Zostaje (dobre priory, nie bugi):**
-- Biologiczny prior makro-architektury (jakie regiony, role) — genetyczny
-  blueprint. PC działa NA nim.
-- Stałe `w_dn_motor` (wyjście filtra móżdżku, Dean-Porrill) — uzasadniony wyjątek.
-- Sen/replay, oscylacje, ucieleśnienie (MJX), bufory opóźnień — wbudowane w FEP.
-- Spike'owy `error_neuron.py` — zostaje jako wariant biofizyczny tam, gdzie
-  potrzebny; rdzeniem inferencji staje się rate-mode `PCModule`.
+- node-perturbation REINFORCE (`m1.py`) → action-as-inference (`pc_active`).
+- STDP/anti-Hebb kory, kowariancyjna LTD móżdżku (Marr-Albus), TD(0) VTA,
+  aktor-krytyk BG, one-shot HC → JEDNA reguła `ΔW=η·Π·ε·φ(μ)` (`pc_graph`).
+- Ręczna sekwencja `cognitive_step`/`_perceive_substep` (`brain_graph.py`) →
+  relaksacja grafu (`pc_brain_cognitive_step`).
+- Zamrożone projekcje w `Params` → uczone `w_gen` w stanie grafu (każda
+  krawędź uczona jedną regułą).
+- Cały spike'owy stos per-region (`error_neuron`, `cortex`, `cerebellum`,
+  `vta`, `basal_ganglia`, `hippocampus`, `thalamus`, `neuron`, `synapse`,
+  `plasticity`, `sparse`, `precision_bus`, …), `sensory/`, `embodiment/`
+  (MJX) oraz testy phase0–6 — **usunięte**.
+
+**Zostaje:**
+- Biologiczny prior makro-architektury (jakie regiony, role) — teraz
+  zakodowany jako topologia grafu w `init_region_graph` (`pc_graph.py`).
+  PC działa NA nim; regiony to węzły jednego grafu, nie osobne reguły.
+- Wyjątki typu stałego `w_dn_motor` (Dean-Porrill) realizuje się, gdy
+  potrzebne, jako krawędź z wyłączonym uczeniem — nie ma osobnego modułu.
+
+Ucieleśnienie (ciało + enkodery sensory/proprio dla `pc_brain`) jest
+ŚWIADOMIE poza tym repo: substrate-agnostic, do zbudowania na nowo jako
+adapter sterujący `pc_brain` (§12). Stary MJX usunięty wraz z legacy.
 
 ---
 
-## 5. Mapowanie na istniejący kod
+## 5. Struktura po czyszczeniu (stan docelowy osiągnięty)
 
-| Moduł dziś | Rola w Fazie U | Akcja |
-|------------|----------------|-------|
-| **(nowy) `core/pc_module.py`** | kanoniczny `PCModule` (μ/ε/Π) z relaksacją | **utwórz (U.1)** |
-| **(nowy) `core/pc_graph.py`** | `PCGraph` + pętla relaksacji | **utwórz (U.3)** |
-| `core/error_neuron.py` | wzorzec pól; wariant spike'owy | zachowaj; nie-rdzeń |
-| `core/cortex.py` | stos PC na laminach (Bastos 2012) | przepisz na `PCModule` (U.2) |
-| `core/world_model.py` | węzeł grafu (generatywny PC) | wepnij jako pierwszy węzeł |
-| `core/cerebellum.py` | przedni model PC; `w_gp` regułą wspólną | przepisz LTD→`Π·ε·μ` (U.2) |
-| `core/precision_bus.py` | Π wektorowe w `PCModule` + kompozycja nagrody | rozszerz na wektor |
-| `core/free_energy.py` | **konsument** — `variational_free_energy` + `graph_free_energy` + EFE | przywróć/wepnij (U.3/U.5) |
-| `core/basal_ganglia.py` | precyzja polityk (Friston 2017) | przepisz aktor-krytyk (U.2/U.5) |
-| `core/vta.py` | temporalny PC wartości; DA = Π | przepisz TD (U.2/§6) |
-| `core/m1.py` | active inference: komenda = predykcja | usuń REINFORCE (U.5) |
-| `core/neuromodulator.py` | bus precyzji (ACh/NE/DA/5-HT) | przepisz na kontrolery Π (U.5) |
-| `core/hippocampus.py`, `sleep_replay.py` | szybkie PC + generatywny replay | przepisz one-shot (U.2) |
-| `core/sparse.py` | wzrost/przycinanie grafu wg ΔFE + koszt | wepnij (martwy dziś) (U.4) |
-| `core/brain_graph.py` | host grafu; relaksacja zamiast sekwencji | zastąp `cognitive_step` (U.3) |
+`core/` = wyłącznie substrat PC, zamknięty zbiór (importuje tylko siebie +
+`backend`):
 
-Wniosek: kod zawiera prymitywy strukturalne PC (populacje μ/ε, precyzja,
-generatywny world-model, kWTA), ale **brakuje rdzenia dynamicznego**
-(relaksacja, globalna FE, graf). Faza U dobudowuje rdzeń i przepisuje reguły
-na jego bazie — to scalenie pod jedną zasadą, nie kosmetyka.
+| Plik | Rola |
+|------|------|
+| `core/backend.py` | typy, DTYPE, helpery PRNG — jedyna baza |
+| `core/free_energy.py` | obiektywy: `variational_free_energy`, `expected_free_energy` |
+| `core/pc_module.py` (U.1) | kanoniczny moduł: relaksacja `μ̇=−∂F/∂μ` + jedna reguła + równoważność backprop (`pc_fixed_prediction_grads`) |
+| `core/pc_graph.py` (U.2/U.3) | graf dowolnej topologii, jedna reguła, `graph_free_energy`, `init_region_graph` (wszystkie regiony jako węzły) |
+| `core/pc_active.py` (U.5) | action-as-inference, EFE (`efe_select`), neuromod jako sterowniki precyzji (`scale_node_precision`), `epistemic_value` |
+| `core/pc_brain.py` (U.3) | cykl poznawczy = relaksacja grafu; `pc_brain_act` (reach przez inferencję) |
+| `core/pc_structural.py` (U.4b) | samo-okablowanie wg FE: wzrost/przycinanie/homeostaza |
+
+Testy: `tests/test_phaseu_pc_*` (20/20). Notebook zdolności:
+`colab/phase_u_capability.ipynb` (konsumuje całe nowe API, CPU-runnable).
+Zero martwego kodu, zero mostów, zero legacy — fundament pod neuro-AGI.
 
 ---
 
@@ -449,13 +452,11 @@ Buduj nowy rdzeń obok starego; migruj region po regionie; każdy krok ma test.
    przywrócone. Test `tests/test_phaseu_pc_graph.py` 4/4: relaksacja redukuje
    globalną FE; jedna reguła uczy głębokiego łańcucha (§9.4); topologia cykliczna/
    wielorodzicielska relaksuje (§9.5).
-3-5. **U.2 (big-bang)** ✅ substrat — `init_region_graph` instancjonuje WSZYSTKIE
-   regiony (kora L1-L3, world_model, value/VTA, policy/BG, motor/M1, móżdżek, HC)
+3-5. **U.2 (big-bang)** ✅ — `init_region_graph` instancjonuje WSZYSTKIE
+   regiony (kora L1-L3, world_model, value, policy, motor, móżdżek, HC)
    jako węzły JEDNEGO grafu pod JEDNĄ regułą `Δw=η·Π·ε·φ(μ)`; pełny cykl
-   clamp→relax→learn działa (test 4/4). **Pozostało:** (a) wpięcie grafu w żywą
-   pętlę MJX (sensory/motor) = krok 8; (b) usunięcie legacy reguł spike'owych z
-   `action_brain_cognitive_step` po dowodzie C1–C6. Legacy NIE usunięte — zostaje
-   na dysku do czasu odtworzenia zdolności (§8.5).
+   clamp→relax→learn działa. **Legacy reguły per-region USUNIĘTE** wraz z
+   całym spike'owym stosem (krok czyszczenia wykonany).
 6. **U.4a** ✅ — w grafie PC KAŻDA krawędź uczy się jedną regułą; zamrożonych
    projekcji nie ma. Spełnione z definicji substratu (krok 2). U.4b (strukturalna)
    = krok 9.
@@ -467,15 +468,13 @@ Buduj nowy rdzeń obok starego; migruj region po regionie; każdy krok ma test.
    **babble→reach BEZ REINFORCE** (forward model jedną regułą, reach błąd wzgl.
    <10%); predictions-not-commands; argmin EFE (greedy vs ciekawość); komenda
    mózgu zależna od celu.
-8. **U.3 domknięcie** ✅ substrat — `core/pc_brain.py`: `pc_brain_cognitive_step`
+8. **U.3 domknięcie** ✅ — `core/pc_brain.py`: `pc_brain_cognitive_step`
    = cykl poznawczy jako relaksacja grafu (clamp sensory → relax → odczyt
-   motoryki → jedna reguła), zamiast ręcznej sekwencji. Drop-in API zgodne z
-   driverem MJX (płaskie `sensory` in, `tanh` joint command out). Test
-   `tests/test_phaseu_pc_brain.py` 4/4: krok ograniczony/skończony; powtórna
-   ekspozycja obniża globalną FE (percepcja się uczy); `learn=False` = czysta
-   inferencja; odczyt motoryki zależy od sensory. **Pozostało (bramka C1–C6):**
-   podmiana wywołania w `embodiment/mjx_run_loop.py` + usunięcie spike'owego
-   pipeline'u — dopiero po odtworzeniu reach (§8.5).
+   motoryki → jedna reguła), zamiast ręcznej sekwencji. Płaskie `sensory` in,
+   `tanh` joint command out (gotowe pod adapter ciała). Wpięte hooki neuromod
+   (`precision_gains`→`scale_node_precision`) i ciekawości (`epistemic`→
+   `epistemic_value`) — żaden prymityw nie wisi bez konsumenta. Test
+   `tests/test_phaseu_pc_brain.py` 5/5.
 9. **U.4b** ✅ — `core/pc_structural.py`: self-wiring wg FE — wzrost gdzie
    `|∂F/∂W|` duże (ta sama reguła), przycinanie `|W|<próg` (koszt okablowania),
    twardy budżet gęstości per krawędź (homeostaza, top-k wg priorytetu).
@@ -484,9 +483,12 @@ Buduj nowy rdzeń obok starego; migruj region po regionie; każdy krok ma test.
    trzyma. (`sparse.py` zostawione — niezależny scaffolding synapsy-poziom; graf
    ma własną strukturalną na poziomie maski krawędzi.)
 
-**Czyszczenie legacy (wykonane):** usunięto/przywrócono `expected_free_energy`
-zgodnie z zasadą „brak prymitywu bez konsumenta" (martwe po U.3 → wróciło z U.5).
-Spike'owy per-region pipeline NIE usunięty: decyzja użytkownika + §8.5 (repo działa).
+**Czyszczenie legacy (WYKONANE w całości):** usunięto cały spike'owy stos
+per-region, `sensory/`, `embodiment/` (MJX) i testy phase0–6; `core/` to teraz
+wyłącznie zamknięty substrat PC. Wpięto wcześniej martwe prymitywy
+(`scale_node_precision`, `epistemic_value`) do `pc_brain`; usunięto kolizję
+eksportu `active_count`, martwy `broadcast_precision` i spike'owe helpery z
+`backend.py`. Zero mostów, zero dead code, zero ścieżki parallel.
 
 ---
 
@@ -503,16 +505,16 @@ Uzasadnienie:
 2. **Rewrite od zera to marnotrawstwo.** Embodiment (ciało MJX, kodowanie
    sensory/proprio) jest substrate-agnostic i wielokrotnego użytku; zmienia się
    tylko wywołanie mózgu.
-3. **Ścieżka: zostaw embodiment, podmień mózg.** Adapter MJX napędza `pc_brain`
-   (sensory→clamp, `pc_brain_act`→komenda, `pc_brain_learn_forward` z realnego
-   proprio). Walidacja na **reach success** (realna zdolność, nie parytet). Gdy
-   `pc_brain` przejdzie próg zdolności → usuń `brain_graph` + moduły per-region +
-   ich testy phase.
+3. **Ścieżka: zbuduj NOWY adapter ciała na czysto, sterujący `pc_brain`.**
+   Stary embodiment (skażony spike'owym mózgiem) usunięty. Adapter (sensory→
+   clamp, `pc_brain_act`→komenda, `pc_brain_learn_forward` z realnego proprio)
+   pisze się od zera na substrat-agnostycznym API `pc_brain`. Walidacja na
+   **reach success** (realna zdolność, nie parytet).
 
 To NIE jest bramka równoważności — to **próg zdolności**. Następny duży krok
-(osobny, poza Fazą U-core): adapter `embodiment/` dla `pc_brain` + eksperyment
-reach w MJX. Faza U-core (U.1–U.5, substrat) jest kompletna i przetestowana
-(19/19).
+(osobny, poza Fazą U-core): nowy `embodiment/` dla `pc_brain` + eksperyment
+reach. Faza U-core (U.1–U.5, substrat) jest kompletna i przetestowana:
+`tests/test_phaseu_pc_*` 20/20 + `colab/phase_u_capability.ipynb`.
 
 ---
 

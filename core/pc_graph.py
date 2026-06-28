@@ -19,12 +19,13 @@ The graph topology is **arbitrary** (Salvatori et al. 2022, "Learning on
 Arbitrary Graph Topologies via Predictive Coding"): multi-parent nodes,
 skip edges and cycles are all permitted — relaxation does not need a
 feedforward order.  Adding a region = adding nodes + edges; the rule does
-not change.  This replaces, in one substrate:
+not change.  This single substrate subsumes what used to be separate
+per-region rules:
 
   * cortical STDP / anti-Hebb,          * cerebellar Marr-Albus LTD,
   * VTA TD(0),                          * BG actor-critic three-factor,
   * M1 node-perturbation REINFORCE,     * HC one-shot,
-  * the hand-coded ``action_brain_cognitive_step`` sequence.
+  * a hand-coded region-call sequence.
 
 The global objective is one number, ``graph_free_energy`` (= Σ over nodes
 of :func:`core.free_energy.variational_free_energy`), which inference and
@@ -34,10 +35,9 @@ Scope of this module
 --------------------
 Pure rate-mode graph engine + a biologically-structured region assembly
 (:func:`init_region_graph`) that instantiates all the regions above as
-nodes of one graph under the one rule.  Wiring this graph to the live
-MJX sensory/motor loop (replacing ``action_brain_cognitive_step`` end to
-end) is U.3's closure (plan §10 step 8); the legacy ``brain_graph`` stays
-on disk until the graph reproduces its capabilities C1–C6.
+nodes of one graph under the one rule.  :mod:`core.pc_brain` runs it as a
+cognitive cycle; a body adapter driving that cycle is the next, external
+build (plan §12).
 
 Single canonical node math lives in :mod:`core.pc_module`; the chain
 there is the linear special case of this graph and the two share the

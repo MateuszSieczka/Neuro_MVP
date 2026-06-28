@@ -1,16 +1,12 @@
 """Free energy primitives — pure JAX (Friston 2010).
 
-Both functions here have live consumers:
+The two scalar objectives of the predictive-coding substrate:
 
-* :func:`variational_free_energy` — the single scalar objective
-  ``F = ½ Σ Π·ε²`` minimised by relaxation and learning in
-  :mod:`core.pc_module` / :mod:`core.pc_graph` (Faza U).
-* :func:`broadcast_precision` — maps zone precision to error-neuron
-  precision in ``error_neuron.en_update_weights``.
-
-:func:`expected_free_energy` (EFE) is the action-selection objective of
-U.5 (active-inference motor head): live consumer in
-:mod:`core.pc_active` (``pc_efe`` / ``efe_select``).
+* :func:`variational_free_energy` — ``F = ½ Σ Π·ε²``, minimised by
+  relaxation (perception) and learning (weights) in :mod:`core.pc_module`
+  / :mod:`core.pc_graph`.
+* :func:`expected_free_energy` — the action-selection objective of
+  active inference (:mod:`core.pc_active` ``efe_select`` / ``pc_efe``).
 """
 
 from __future__ import annotations
@@ -20,42 +16,19 @@ import jax.numpy as jnp
 from .backend import DTYPE, Array
 
 
-__all__ = [
-    "broadcast_precision", "variational_free_energy", "expected_free_energy",
-]
+__all__ = ["variational_free_energy", "expected_free_energy"]
 
 
 def variational_free_energy(precision: Array, error: Array) -> Array:
     """Gaussian variational free energy ``F = ½ Σ Π ⊙ ε²`` (Friston 2010).
 
-    The single scalar objective that *everything* in Faza U minimises:
-    perception (state relaxation), learning (weight updates) and action
-    (expected-FE). Restored from the earlier delete (it was removed as a
-    "redundant one-liner" before any consumer existed) now that
-    :mod:`core.pc_module` / :mod:`core.pc_graph` relax and learn on it.
-
+    The single scalar objective inference and learning both minimise.
     ``precision`` and ``error`` are broadcast together; pass matching
     shapes (per-error-unit precision) or a scalar precision.
     """
     precision = precision.astype(DTYPE)
     error = error.astype(DTYPE)
     return 0.5 * jnp.sum(precision * error ** 2)
-
-
-def broadcast_precision(precision: Array, target_n: int) -> Array:
-    """Map ``(n_zones,)`` precision to ``(target_n,)`` via nearest-zone index.
-
-    If shapes already match, returns the array unchanged. This mirrors
-    the legacy semantics (``np.linspace(...).astype(int)``) but is
-    fully JIT-safe because ``target_n`` is a Python int (static under
-    JIT).
-    """
-    precision = precision.astype(DTYPE)
-    n = precision.shape[0]
-    if n == target_n:
-        return precision
-    idx = jnp.linspace(0, n - 1, target_n).astype(jnp.int32)
-    return precision[idx]
 
 
 def expected_free_energy(
@@ -67,14 +40,13 @@ def expected_free_energy(
     """Expected free energy for active-inference action selection (Friston 2017).
 
     ``G(a) = −pragmatic + ambiguity − β · epistemic``; lower is better.
-    A policy is chosen by minimising ``G`` (``core.pc_active.efe_select``).
+    A policy is chosen by minimising ``G`` (:func:`core.pc_active.efe_select`).
 
     * ``pragmatic_value`` — expected progress toward preferred states
       (goal / reward); the exploitation term.
     * ``epistemic_value`` — expected information gain (curiosity); the
       exploration term, weighted by ``β`` (NE-modulated, Parr & Friston
-      2017).  ``core.world_model.wm_learning_progress`` is its standing
-      approximation in the legacy circuit.
+      2017).
     * ``ambiguity`` — expected outcome uncertainty (penalised).
 
     Broadcasts elementwise, so passing vectors of candidate-policy

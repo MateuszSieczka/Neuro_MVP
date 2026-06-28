@@ -1,9 +1,7 @@
 """Graph-driven brain — the cognitive cycle as relaxation (Faza U, U.3).
 
-This is U.3's closure: a complete brain whose one decision cycle is
-**free-energy relaxation on the region graph**, not a hand-coded sequence
-of region calls.  Where ``brain_graph.action_brain_cognitive_step`` runs
-a fixed script (perceive substep → close previous transition → act),
+A complete brain whose one decision cycle is **free-energy relaxation on
+the region graph**, not a hand-coded sequence of region calls.
 ``pc_brain_cognitive_step`` does only:
 
     1. clamp the sensory node to the afferent observation,
@@ -14,21 +12,20 @@ a fixed script (perceive substep → close previous transition → act),
 
 Adding a region or a projection changes the graph passed to
 :func:`core.pc_graph.init_region_graph`; this cognitive step does not
-change — the property the hand-coded sequence never had.
+change — the property a hand-coded region sequence never had.
 
 Scope / integration
 -------------------
-The step takes the *same* flat ``sensory`` afferent shape as
-``action_brain_cognitive_step`` and returns a bounded ``joint_command``
-in the M1 convention (``tanh`` of the motor node, ∈ [−1, 1]), so it is a
-drop-in for the MJX driver once the graph reproduces the reach
-capabilities C1–C6 (plan §10 step 8 gate).  Until then the legacy
-spiking pipeline stays live and this runs alongside.
+The step takes a flat ``sensory`` afferent vector and returns a bounded
+``joint_command`` (``tanh`` of the motor node, ∈ [−1, 1]): a
+substrate-agnostic interface a body adapter can drive directly (clamp
+sensory → step → apply command; the embodiment adapter is the next,
+external build — plan §12).
 
-Motor *learning* (driving the motor node to a desired-proprioception
-prior + expected-free-energy action selection) is U.5; this step covers
-perception, action read-out and perceptual learning — the relaxation
-that replaces the sequence.
+Goal-directed motor *action* (driving the motor node to a preferred
+outcome by inference + expected-free-energy selection) is U.5
+(:func:`pc_brain_act`); this step covers perception, action read-out and
+perceptual learning — the relaxation that replaces the sequence.
 """
 
 from __future__ import annotations
@@ -44,7 +41,10 @@ from .pc_graph import (
     init_region_graph, pc_graph_clamp, pc_graph_relax,
     pc_graph_learn, graph_free_energy, REGION_INDEX,
 )
-from .pc_active import set_action_prior, pc_act_infer, pc_act_learn_forward
+from .pc_active import (
+    set_action_prior, pc_act_infer, pc_act_learn_forward,
+    scale_node_precision, epistemic_value,
+)
 
 
 class PCBrainParams(eqx.Module):
@@ -106,6 +106,7 @@ class PCBrainOutput(NamedTuple):
     policy: Array              # (policy_dim,) — policy node belief (logits)
     free_energy: Array         # scalar — global objective at relaxation
     belief: Array              # (cortex_top,) — deep cortical cause
+    epistemic: Array           # scalar — sensory info-gain (curiosity drive)
 
 
 def pc_brain_cognitive_step(
@@ -115,6 +116,7 @@ def pc_brain_cognitive_step(
     *,
     n_relax: int | None = None,
     learn: bool = True,
+    precision_gains: dict[int, float] | None = None,
 ) -> PCBrainOutput:
     """One cycle: clamp sensory → relax graph → read motor → learn.
 
@@ -122,11 +124,24 @@ def pc_brain_cognitive_step(
     node carries the abstract cause; ``free_energy`` is the single
     objective everything minimised this cycle.  Set ``learn=False`` to
     run pure inference (e.g. evaluation / held-out probing).
+
+    ``precision_gains`` maps node index → multiplicative precision gain:
+    the neuromodulatory hook (ACh ↑ sensory Π = attention, DA ↑ reward Π;
+    Parr & Friston 2017).  Gains modulate this cycle's inference and the
+    weight of its error in learning; they do not persist (precision is an
+    EMA, restored by the learning update).  ``epistemic`` reports the
+    sensory node's information gain (mean inverse precision) — the
+    exploration term active inference would feed to :func:`efe_select`.
     """
     g = state.graph
     s_idx = params.sensory_idx
 
-    clamped = pc_graph_clamp(g, {s_idx: sensory.astype(DTYPE)})
+    g_mod = g
+    if precision_gains:
+        for idx, gain in precision_gains.items():
+            g_mod = scale_node_precision(g_mod, idx, gain)
+
+    clamped = pc_graph_clamp(g_mod, {s_idx: sensory.astype(DTYPE)})
     relaxed = pc_graph_relax(
         clamped, params.graph, clamp=(s_idx,), n_steps=n_relax,
     )
@@ -138,7 +153,15 @@ def pc_brain_cognitive_step(
     policy = relaxed.mu[params.policy_idx]
     belief = relaxed.mu[params.cortex_top_idx]
 
-    new_graph = pc_graph_learn(relaxed, params.graph) if learn else relaxed
+    if learn:
+        new_graph = pc_graph_learn(relaxed, params.graph)
+    else:
+        # Pure inference: advance only the beliefs μ; weights and the
+        # (possibly modulated) precision of the incoming state are left
+        # untouched, so a probe never mutates the model.
+        new_graph = eqx.tree_at(lambda s: s.mu, g, relaxed.mu)
+
+    epistemic = epistemic_value(new_graph, s_idx)
 
     return PCBrainOutput(
         state=PCBrainState(graph=new_graph),
@@ -147,6 +170,7 @@ def pc_brain_cognitive_step(
         policy=policy,
         free_energy=fe,
         belief=belief,
+        epistemic=epistemic,
     )
 
 

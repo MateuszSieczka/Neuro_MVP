@@ -1,48 +1,26 @@
-"""core — biologically grounded SNN primitives (JAX/Equinox)."""
+"""core — the predictive-coding substrate for neuro-AGI (JAX/Equinox).
 
-# -- JAX backend + state containers --
+One microcircuit, one learning rule, one objective (free-energy
+minimisation) on an arbitrary, self-wiring graph.  The whole public API:
+
+* :mod:`core.backend`      — JAX backend + PRNG helpers (the only base dep)
+* :mod:`core.free_energy`  — the variational / expected free-energy objectives
+* :mod:`core.pc_module`    — canonical PC module: relaxation + one rule (U.1)
+* :mod:`core.pc_graph`     — arbitrary-topology PC graph + region assembly (U.2/U.3)
+* :mod:`core.pc_brain`     — cognitive cycle as graph relaxation (U.3)
+* :mod:`core.pc_active`    — action as inference / EFE / neuromodulation (U.5)
+* :mod:`core.pc_structural`— self-wiring structural plasticity by free energy (U.4b)
+"""
+
+# -- JAX backend --
 from .backend import (
-    BackendContext, DEFAULT, DTYPE, Array, PRNGKey,
-    phi1, make_key, split_key, fold_in_step, vmap_step,
-)
-from .state import (
-    NeuronParams, NeuronState, init_neuron_state,
-    SynapticParams, SynapticState, init_synaptic_state,
-    OscillatorState, init_oscillator_state,
-    HomeostaticState, init_homeostatic_state,
-    EligibilityState, init_eligibility_state,
-    AstrocyteState, init_astrocyte_state,
+    DTYPE, Array, PRNGKey, make_key, split_key, fold_in_step,
 )
 
-# -- Ported JAX primitives --
-from .sparse import (
-    SparseConnectivity, init_random_sparse, init_distance_dependent,
-    matvec, prune_below, unmask, synaptogenesis, to_bcoo,
-    active_count, density,
-)
-from .synapse import (
-    init_synaptic_params, synapse_step, nmda_mg_block,
-    receive_excitatory, receive_inhibitory, decay_channels,
-    effective_conductances, compute_current,
-)
-from .neuron import (
-    init_neuron_params, neuron_step, AstroMod, decay_pre_trace,
-)
-from .oscillator import (
-    init_oscillator_params, oscillator_step, OscillatorOutput,
-)
-from .astrocyte import (
-    init_astrocyte_params, astrocyte_step, aggregate_to_zones,
-)
-from .plasticity import (
-    STDPParams, init_stdp_params,
-    update_pre_trace, update_post_trace,
-    stdp_pair_update, weight_update_three_factor, stdp_step,
-    PlasticityOutput,
-)
+# -- Free-energy objectives --
+from .free_energy import variational_free_energy, expected_free_energy
 
-# -- Free energy / precision --
-# NOTE: free_energy.py kept on disk for Phase 9 (EFE); not re-exported yet.
+# -- Canonical PC module (U.1): relaxation + one rule + backprop equivalence --
 from .pc_module import (
     PCNetParams, PCNetState, PCStepOutput,
     init_pc_net_params, init_pc_net_state,
@@ -50,6 +28,8 @@ from .pc_module import (
     pc_feedforward, pc_relax, pc_weight_grads, pc_learn,
     pc_clamp_bottom, pc_supervised_step, pc_fixed_prediction_grads,
 )
+
+# -- Arbitrary-topology PC graph + region assembly (U.2/U.3) --
 from .pc_graph import (
     PCGraphParams, PCGraphState, PCGraphStepOutput,
     init_pc_graph_params, init_pc_graph_state,
@@ -57,192 +37,24 @@ from .pc_graph import (
     pc_graph_relax, pc_graph_clamp, pc_graph_learn, pc_graph_step,
     init_region_graph, REGION_NODES, REGION_INDEX,
 )
-from .pc_brain import (
-    PCBrainParams, PCBrainState, PCBrainOutput,
-    init_pc_brain, pc_brain_cognitive_step,
-    pc_brain_act, pc_brain_learn_forward,
-)
+
+# -- Active inference: action / EFE / neuromodulation (U.5) --
 from .pc_active import (
     scale_node_precision, set_action_prior,
     ActInferOutput, pc_act_infer, pc_act_learn_forward,
     pc_efe, PolicyChoice, efe_select, epistemic_value,
 )
+
+# -- Graph-driven brain: cognitive cycle as relaxation (U.3) --
+from .pc_brain import (
+    PCBrainParams, PCBrainState, PCBrainOutput,
+    init_pc_brain, pc_brain_cognitive_step,
+    pc_brain_act, pc_brain_learn_forward,
+)
+
+# -- Self-wiring structural plasticity by free energy (U.4b) --
 from .pc_structural import (
     StructuralStepOutput,
     init_sparse_masks, active_fraction, active_count,
     pc_structural_learn, pc_structural_update, pc_structural_step,
 )
-from .free_energy import variational_free_energy, expected_free_energy
-from .precision_bus import (
-    PrecisionChannel,
-    init_precision_channel,
-    precision_update, precision_value, precision_mean,
-    precision_standardize,
-    precision_compose, precision_weight,
-)
-
-# -- Receptor pharmacology --
-from .receptor import (
-    ReceptorType, ReceptorParams, init_receptor_params, hill_response,
-    receptor_effects, aggregate_effects, compute_layer_modulation,
-    LayerModulation, RECEPTOR_ORDER,
-)
-
-# -- Attention --
-from .attention import (
-    AttentionParams, AttentionState, AttentionOutput,
-    init_attention_params, init_attention_state,
-    attention_step, attention_learn,
-)
-
-# -- Encoding --
-from .spike_encoder import (
-    PopulationEncoderParams, init_population_encoder,
-    gaussian_population_encode, poisson_spike, poisson_step,
-    PoissonOutput,
-)
-
-# -- Neuromodulation --
-from .neuromodulator import (
-    NeuromodulatorParams, NeuromodulatorState,
-    init_neuromodulator_params, init_neuromodulator_state,
-    neuromodulator_step, adenosine_update,
-    learning_rate_modulation, consolidation_gate,
-    bottom_up_gain, competition_sharpness, planning_horizon,
-    transmitter_vector,
-)
-from .vta import (
-    VTAParams, VTAState, VTAOutput,
-    init_vta_params, init_vta_state,
-    vta_store_prediction, vta_compute_rpe, vta_update, vta_reset_transient,
-)
-
-# -- Working memory --
-from .working_memory import (
-    WMParams, WMState, WMOutput,
-    init_wm_params, init_wm_state,
-    wm_step, wm_update_ff, wm_update_lateral, wm_reset_transient,
-)
-# -- Hippocampal memory primitives (Phase 5A exports; Phase 5B wires
-#    them into the brain graph via the hippocampus wrapper). --
-from .episodic_memory import (
-    EpisodicParams, EpisodicState, StoreOutput, RecallOutput,
-    init_episodic_params, init_episodic_state,
-    try_store, recall, mark_replayed, episodic_size, dg_encode,
-    episodic_clear,
-)
-from .sequence_memory import (
-    SeqMemParams, SeqMemState, SeqMemOutput,
-    init_seqmem_params, init_seqmem_state,
-    seqmem_step, seqmem_novelty, seqmem_reset_transient,
-)
-
-# -- Inhibitory pool / error neuron / world model / replay --
-from .interneuron import (
-    IPoolParams, IPoolState, IPoolOutput,
-    init_ipool_params, init_ipool_state, ipool_step,
-    ipool_da_gain, ipool_reset_transient,
-)
-from .error_neuron import (
-    ErrorNeuronParams, ErrorNeuronState, ErrorNeuronOutput,
-    init_error_neuron_params, init_error_neuron_state,
-    en_step, en_update_weights,
-    en_receive_prediction, en_belief, en_prediction_error_rate,
-    en_reset_transient,
-)
-from .world_model import (
-    WorldModelParams, WorldModelState, WorldModelOutput, RehearsalResult,
-    init_world_model_params, init_world_model_state,
-    wm_predict, wm_update, wm_mental_rehearsal,
-    wm_curiosity_signal, wm_boredom_signal, wm_learning_progress,
-    wm_rehearsal_depth_from_serotonin,
-    wm_reset_transient,
-)
-# NOTE: replay_buffer.py kept on disk for Phase 5 (sleep); not re-exported yet.
-
-# -- Experience-replay ring buffer (Phase 5A). --
-from .replay_buffer import (
-    ReplayParams, ReplayState, Experience,
-    init_replay_params, init_replay_state,
-    replay_store, replay_size, replay_sample_indices,
-    replay_gather, replay_mark_replayed, replay_recent_indices,
-    replay_clear,
-)
-
-# -- Sleep-phase state machine (Phase 5A). --
-from .sleep import (
-    SleepPhase, SleepParams, SleepState,
-    init_sleep_params, init_sleep_state, sleep_step,
-    is_wake, is_sws, is_rem,
-)
-
-# -- Learning pipeline (Phase 5A extraction; reused by Phase 5B
-#    SWS reverse-replay so wake-learning and replay-learning call
-#    identical plasticity primitives). --
-from .learning_pipeline import (
-    critic_learn_step, actors_learn_step,
-    cortex_learn_step, attention_learn_step,
-)
-
-# -- Basal ganglia (critic + D1/D2 actor) --
-from .basal_ganglia import (
-    CriticParams, CriticState, CriticOutput,
-    init_critic_params, init_critic_state,
-    critic_step, critic_update, critic_commit_eligibility,
-    critic_reset_transient,
-    ActorParams, ActorState, ActorOutput, ActorInputs,
-    init_actor_params, init_actor_state,
-    actor_step, actor_select_action, actor_update,
-    actor_commit_eligibility,
-    actor_reset_evidence, actor_reset_transient,
-)
-
-# -- Cortical microcircuit (L4 / L2-3 / L5) --
-from .cortex import (
-    CorticalAreaParams, CorticalAreaState, CorticalInputs, CorticalOutput,
-    init_cortical_area_params, init_cortical_area_state,
-    cortical_area_step, cortical_area_update, cortical_area_reset_transient,
-)
-
-# -- Cerebellum (generic forward model, Marr-Albus-Ito) --
-from .cerebellum import (
-    CerebellumParams, CerebellumState, CerebellumOutput,
-    init_cerebellum_params, init_cerebellum_state,
-    cerebellum_step, cerebellum_update, cerebellum_reset_transient,
-)
-
-# -- M1 (Phase 6A: continuous motor readout head) --
-from .m1 import (
-    M1Params, M1State, M1Output,
-    init_m1_params, init_m1_state,
-    m1_step, m1_learn_readout,
-)
-
-# -- Thalamus (relay nuclei + TRN) --
-from .thalamus import (
-    RelayParams, RelayState, TRNParams, TRNState, ThalamicOutput,
-    init_relay_params, init_relay_state,
-    init_trn_params, init_trn_state,
-    thalamic_step, relay_reset_transient, trn_reset_transient,
-)
-
-# -- Brain graph (wiring primitives + ActionBrain) --
-from .brain_graph import (
-    DelayBuffer, init_delay_buffer, delay_push_pop,
-    ActionBrainParams, ActionBrainState, ActionBrainOutput,
-    init_action_brain_params, init_action_brain_state,
-    action_brain_step, action_brain_cognitive_step,
-    brain_cycle,
-    SACCADE_ACTION_DIM,
-)
-
-# -- Phase 5B medial-temporal memory system + offline replay. --
-from .ec import (
-    EntorhinalParams, EntorhinalState,
-    init_ec_params, init_ec_state, ec_step,
-)
-from .hippocampus import (
-    HippocampusParams, HippocampusState, HippocampusOutput,
-    init_hippocampus_params, init_hippocampus_state, hippocampus_step,
-)
-from .sleep_replay import sws_replay_step, rem_rollout_step

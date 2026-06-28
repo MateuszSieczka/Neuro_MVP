@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 
 from core.pc_brain import init_pc_brain, pc_brain_cognitive_step
+from core.pc_graph import REGION_INDEX
 
 
 def _brain(seed=0, **kw):
@@ -40,6 +41,29 @@ def test_cognitive_step_runs_and_is_bounded():
     assert jnp.isfinite(out.value)
     assert jnp.isfinite(out.free_energy)
     assert jnp.all(jnp.isfinite(out.belief))
+    assert jnp.isfinite(out.epistemic), "epistemic info-gain not finite"
+
+
+def test_precision_gain_modulates_inference():
+    """The neuromodulatory precision hook changes the relaxed cycle."""
+    params, state = _brain(seed=7)
+    sensory = jax.random.normal(jax.random.PRNGKey(8), (params.sensory_dim,))
+
+    base = pc_brain_cognitive_step(state, params, sensory, learn=False)
+    gated = pc_brain_cognitive_step(
+        state, params, sensory, learn=False,
+        precision_gains={REGION_INDEX["sensory"]: 10.0},
+    )
+    # Boosting sensory precision sharpens the attended error → the global
+    # objective and the motor read-out shift; pure inference leaves weights.
+    assert float(jnp.sum(jnp.abs(gated.joint_command - base.joint_command))) > 1e-5, (
+        "precision gain had no effect on inference"
+    )
+    moved = sum(
+        float(jnp.sum(jnp.abs(a - b)))
+        for a, b in zip(gated.state.graph.weights, state.graph.weights)
+    )
+    assert moved == 0.0, "precision-gated inference mutated weights"
 
 
 def test_repeated_exposure_lowers_free_energy():

@@ -1,16 +1,16 @@
-"""Free energy / EFE primitives — pure JAX (Friston 2010, 2017).
+"""Free energy primitives — pure JAX (Friston 2010).
 
-Only :func:`broadcast_precision` is currently wired into the live
-circuit (via ``error_neuron.en_update_weights``). :func:`expected_free_energy`
-is retained for Phase 9 active-inference planning but is *not*
-exported from ``core.__init__`` until a live call-site is added — this
-keeps ``__all__`` truthful about what is live in the brain graph.
+Both functions here have live consumers:
 
-The earlier ``variational_free_energy`` and ``precision_weighted_update``
-helpers were removed as redundant one-liners (the former is equivalent
-to ``0.5 * jnp.sum(precision * error ** 2)``; the latter is exactly the
-STDP three-factor gradient, already implemented per-module in
-``plasticity.py`` and ``error_neuron.py``).
+* :func:`variational_free_energy` — the single scalar objective
+  ``F = ½ Σ Π·ε²`` minimised by relaxation and learning in
+  :mod:`core.pc_module` / :mod:`core.pc_graph` (Faza U).
+* :func:`broadcast_precision` — maps zone precision to error-neuron
+  precision in ``error_neuron.en_update_weights``.
+
+:func:`expected_free_energy` (EFE) is the action-selection objective of
+U.5 (active-inference motor head): live consumer in
+:mod:`core.pc_active` (``pc_efe`` / ``efe_select``).
 """
 
 from __future__ import annotations
@@ -20,7 +20,26 @@ import jax.numpy as jnp
 from .backend import DTYPE, Array
 
 
-__all__ = ["broadcast_precision"]
+__all__ = [
+    "broadcast_precision", "variational_free_energy", "expected_free_energy",
+]
+
+
+def variational_free_energy(precision: Array, error: Array) -> Array:
+    """Gaussian variational free energy ``F = ½ Σ Π ⊙ ε²`` (Friston 2010).
+
+    The single scalar objective that *everything* in Faza U minimises:
+    perception (state relaxation), learning (weight updates) and action
+    (expected-FE). Restored from the earlier delete (it was removed as a
+    "redundant one-liner" before any consumer existed) now that
+    :mod:`core.pc_module` / :mod:`core.pc_graph` relax and learn on it.
+
+    ``precision`` and ``error`` are broadcast together; pass matching
+    shapes (per-error-unit precision) or a scalar precision.
+    """
+    precision = precision.astype(DTYPE)
+    error = error.astype(DTYPE)
+    return 0.5 * jnp.sum(precision * error ** 2)
 
 
 def broadcast_precision(precision: Array, target_n: int) -> Array:
@@ -45,14 +64,21 @@ def expected_free_energy(
     ambiguity: float | Array = 0.0,
     epistemic_weight: float | Array = 1.0,
 ) -> Array:
-    """Expected free energy for action selection (Friston 2017).
+    """Expected free energy for active-inference action selection (Friston 2017).
 
-    ``G(a) = −pragmatic + ambiguity − β · epistemic``. Lower is better.
-    ``epistemic_weight`` is typically modulated by NE (curiosity).
+    ``G(a) = −pragmatic + ambiguity − β · epistemic``; lower is better.
+    A policy is chosen by minimising ``G`` (``core.pc_active.efe_select``).
 
-    NOTE: not exported from ``core.__init__`` — wire-in is scheduled
-    for Phase 9 (active-inference planner). Kept here to avoid a
-    module-delete / re-create churn when that phase lands.
+    * ``pragmatic_value`` — expected progress toward preferred states
+      (goal / reward); the exploitation term.
+    * ``epistemic_value`` — expected information gain (curiosity); the
+      exploration term, weighted by ``β`` (NE-modulated, Parr & Friston
+      2017).  ``core.world_model.wm_learning_progress`` is its standing
+      approximation in the legacy circuit.
+    * ``ambiguity`` — expected outcome uncertainty (penalised).
+
+    Broadcasts elementwise, so passing vectors of candidate-policy
+    values returns a vector of ``G`` per policy.
     """
     prag = jnp.asarray(pragmatic_value, DTYPE)
     epi = jnp.asarray(epistemic_value, DTYPE)

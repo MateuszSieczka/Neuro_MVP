@@ -43,6 +43,36 @@ from .plasticity import (
 
 # -- Free energy / precision --
 # NOTE: free_energy.py kept on disk for Phase 9 (EFE); not re-exported yet.
+from .pc_module import (
+    PCNetParams, PCNetState, PCStepOutput,
+    init_pc_net_params, init_pc_net_state,
+    pc_predictions, pc_errors, pc_free_energy,
+    pc_feedforward, pc_relax, pc_weight_grads, pc_learn,
+    pc_clamp_bottom, pc_supervised_step, pc_fixed_prediction_grads,
+)
+from .pc_graph import (
+    PCGraphParams, PCGraphState, PCGraphStepOutput,
+    init_pc_graph_params, init_pc_graph_state,
+    pc_graph_predictions, pc_graph_errors, graph_free_energy,
+    pc_graph_relax, pc_graph_clamp, pc_graph_learn, pc_graph_step,
+    init_region_graph, REGION_NODES, REGION_INDEX,
+)
+from .pc_brain import (
+    PCBrainParams, PCBrainState, PCBrainOutput,
+    init_pc_brain, pc_brain_cognitive_step,
+    pc_brain_act, pc_brain_learn_forward,
+)
+from .pc_active import (
+    scale_node_precision, set_action_prior,
+    ActInferOutput, pc_act_infer, pc_act_learn_forward,
+    pc_efe, PolicyChoice, efe_select, epistemic_value,
+)
+from .pc_structural import (
+    StructuralStepOutput,
+    init_sparse_masks, active_fraction, active_count,
+    pc_structural_learn, pc_structural_update, pc_structural_step,
+)
+from .free_energy import variational_free_energy, expected_free_energy
 from .precision_bus import (
     PrecisionChannel,
     init_precision_channel,

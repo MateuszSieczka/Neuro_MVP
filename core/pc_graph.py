@@ -469,7 +469,30 @@ def _graph_relax_step(
     mu: tuple, weights: tuple, pi: tuple, params: PCGraphParams,
     outgoing: tuple, hold: tuple, temporal: tuple,
 ) -> tuple:
-    """One inference sweep: μ_j ← μ_j − η_μ ∂F/∂μ_j on the free dimensions.
+    """One inference sweep: ``μ_j ← μ_j − η_μ ∂F/∂μ_j / L_j`` on free dims.
+
+    The raw gradient descent ``μ_j ← μ_j − η_μ ∂F/∂μ_j`` is **explicit
+    Euler**, stable only while ``η_μ·Π ≲ 1``.  But precision ``Π`` is
+    adaptive and sharpens as the model fits (up to ``1/var_floor``), so a
+    fixed ``η_μ`` eventually violates that bound and the relaxation
+    diverges — the high-precision error ``ξ = Π·ε`` of one node kicks its
+    parents through the cross term faster than the step can integrate.
+
+    The step is therefore **preconditioned by the diagonal of the
+    free-energy curvature**
+
+        L_j = ∂²F/∂μ_j² = Π_j + φ'(μ_j)² · Σ_{j→c} (W_(j→c)²)ᵀ Π_c
+
+    (own-error precision + the precision each child contributes back through
+    its edge).  Dividing the gradient by ``L_j`` is diagonal-Newton /
+    natural-gradient inference: the effective per-dimension step is ``≈ η_μ``
+    regardless of how large any ``Π`` grows, so the sweep is
+    **unconditionally stable** — when a child precision climbs, the same
+    precision appears in ``L_j`` and shrinks the step in step.  It is a
+    *preconditioner*, not a new term: it rescales the search direction and
+    leaves the stationary point ``∂F/∂μ = 0`` (hence the learned fixed point
+    and the PC≡backprop equilibrium) unchanged.  No magic constant — only
+    the existing ``η_μ`` and a ``finfo.tiny`` floor guarding the divide.
 
     ``hold[j]`` is a per-dimension boolean mask of node ``j``: ``True``
     dimensions are observations held fixed (a clamp), ``False`` ones are
@@ -482,11 +505,12 @@ def _graph_relax_step(
     ``temporal[j]`` is node ``j``'s constant temporal-edge prediction from
     the previous cycle (frozen across the sweep): it enters ``ε_j`` like
     any incoming prediction but, since its source is the carry and not a
-    live node, contributes no up-term — only the spatial ``outgoing``
-    edges propagate error to their sources.
+    live node, contributes no up-term and no curvature — only the spatial
+    ``outgoing`` edges propagate error and curvature to their sources.
     """
     act = params.act
     N = params.n_nodes
+    tiny = jnp.asarray(jnp.finfo(DTYPE).tiny, DTYPE)
     # Predictions + precision-weighted errors (spatial now + temporal past).
     preds = [jnp.zeros(n, DTYPE) for n in params.node_sizes]
     for e, (src, dst) in enumerate(params.edges):
@@ -496,18 +520,25 @@ def _graph_relax_step(
 
     new_mu = list(mu)
     for j in range(N):
-        # value term: this node carries its own error ε_j.
+        # value term: this node carries its own error ε_j (curvature Π_j).
         g = xi[j]
-        # source term: this node predicts each of its children.
+        L = pi[j]
+        # source term: this node predicts each of its children — the error
+        # propagates up (g) and the child precision adds to the curvature (L).
         if outgoing[j]:
             phip = _phi_prime(act, mu[j])
             acc = jnp.zeros_like(mu[j])
+            curv = jnp.zeros_like(mu[j])
             for e in outgoing[j]:
                 dst = params.edges[e][1]
                 acc = acc + weights[e].T @ xi[dst]
+                curv = curv + (weights[e] ** 2).T @ pi[dst]
             g = g - phip * acc
+            L = L + phip ** 2 * curv
         g = g + params.leak * mu[j]
-        updated = mu[j] - params.eta_mu * g
+        L = L + params.leak
+        # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
+        updated = mu[j] - params.eta_mu * g / (L + tiny)
         # Free dimensions descend the gradient; held ones keep their value.
         new_mu[j] = jnp.where(hold[j], mu[j], updated)
     return tuple(new_mu)

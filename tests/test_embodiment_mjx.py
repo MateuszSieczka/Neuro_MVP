@@ -32,11 +32,27 @@ def test_arm_body_drives_a_matching_brain():
     assert body.motor_dim == params.motor_dim
 
 
-def test_reach_goal_pins_only_target_error_channels():
+def test_reach_goal_pins_only_tip_channels():
     _, _, body = _tiny_reacher(jax.random.PRNGKey(0))
     pref, mask = body.reach_goal()
     assert pref.shape == (body.sensory_size,)
     assert int(jnp.sum(mask)) == 2 * body.cfg.n_target_cells   # exactly the goal axes
+
+
+def test_reach_goal_is_target_specific():
+    """The goal must carry the target — different targets ⇒ different preference.
+
+    (The bug this guards: a target-independent goal makes the inferred command
+    target-blind, so reaching can only succeed by chance.)
+    """
+    import equinox as eqx
+    from embodiment.mjx_arm_body import _sample_target
+    _, _, body = _tiny_reacher(jax.random.PRNGKey(0))
+    body_a = body._set_target(_sample_target(jax.random.PRNGKey(10), body.cfg))
+    body_b = body._set_target(_sample_target(jax.random.PRNGKey(11), body.cfg))
+    pref_a, _ = body_a.reach_goal()
+    pref_b, _ = body_b.reach_goal()
+    assert not jnp.allclose(pref_a, pref_b)
 
 
 def test_babble_then_reach_smoke():

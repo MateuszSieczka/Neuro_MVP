@@ -12,8 +12,7 @@ from .body_interface import (
 )
 from .mjx_arm_body import (
     ArmConfig, MjxArmBody, default_arm_config,
-    SEG_PROPRIOCEPTION, SEG_TARGET_ERROR_X, SEG_TARGET_ERROR_Y,
-    TARGET_ERROR_SEGMENTS,
+    SEG_PROPRIOCEPTION, SEG_TIP_X, SEG_TIP_Y, TIP_SEGMENTS,
 )
 from .babbling import BabbleConfig, BabbleResult, ou_babble_step, run_babbling
 from .reach import (
@@ -26,8 +25,7 @@ __all__ = [
     "zero_value_code_in",
     # MJX arm
     "ArmConfig", "MjxArmBody", "default_arm_config",
-    "SEG_PROPRIOCEPTION", "SEG_TARGET_ERROR_X", "SEG_TARGET_ERROR_Y",
-    "TARGET_ERROR_SEGMENTS",
+    "SEG_PROPRIOCEPTION", "SEG_TIP_X", "SEG_TIP_Y", "TIP_SEGMENTS",
     # babble
     "BabbleConfig", "BabbleResult", "ou_babble_step", "run_babbling",
     # reach

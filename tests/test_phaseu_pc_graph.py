@@ -16,6 +16,7 @@ substrate's load-bearing properties:
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 
@@ -163,3 +164,37 @@ def test_region_graph_runs_one_cycle():
         float(jnp.sum(jnp.abs(a - b))) for a, b in zip(out.state.weights, state.weights)
     )
     assert moved > 0.0, "one rule did not update any edge"
+
+
+def test_sustained_inference_stays_bounded_under_adaptive_precision():
+    """Many clamp→relax→learn cycles must not blow up (precision stability).
+
+    Regression for the explicit-Euler instability: with a fixed ``eta_mu``
+    the raw step ``μ -= eta_mu·∂F/∂μ`` diverges once adaptive precision Π
+    sharpens past ``η_μ·Π ≈ 1`` — sustained babbling drove ``cortex_l1`` μ
+    to ~900 and then NaN.  The curvature-preconditioned step
+    (:func:`core.pc_graph._graph_relax_step`) keeps the effective step ``≈
+    eta_mu`` for any Π, so beliefs stay bounded with no leak.  Here a
+    persisted-belief loop with under-relaxation (``n_steps=1``) and adaptive
+    precision is the stress that used to diverge.
+    """
+    params, state = init_region_graph(
+        jax.random.PRNGKey(0), eta_mu=0.1, eta_w=1e-2, leak=0.0, n_relax=20,
+    )
+    s_idx = REGION_INDEX["sensory"]
+    sens_dim = params.node_sizes[s_idx]
+
+    def cycle(st, key):
+        obs = jax.random.normal(key, (sens_dim,))            # fresh clamp each step
+        st = pc_graph_step(st, params, {s_idx: obs}, n_steps=1).state
+        max_mu = jnp.max(jnp.stack([jnp.max(jnp.abs(m)) for m in st.mu]))
+        return st, max_mu
+
+    keys = jax.random.split(jax.random.PRNGKey(1), 2000)
+    state, max_mu = eqx.filter_jit(
+        lambda st, ks: jax.lax.scan(cycle, st, ks)
+    )(state, keys)
+
+    assert jnp.all(jnp.isfinite(max_mu)), "beliefs went non-finite during sustained inference"
+    # Pre-fix this reached the hundreds; preconditioned it sits near O(1).
+    assert float(max_mu[-1]) < 50.0, f"beliefs diverged: max|mu|={float(max_mu[-1])}"

@@ -7,9 +7,9 @@ the brain's ``joint_command`` is a *desired joint angle* — tanh-bounded in
 ``[−1, 1]`` and rescaled to the anatomical range.
 
 This is a pure :class:`~embodiment.body_interface.BodyInterface`: continuous
-command in, a named sensory vector out (proprioception + target-error
-population codes).  The brain cannot tell a "target-error bump" from any
-other cortical belief — the interface stays body-agnostic.
+command in, a named sensory vector out (proprioception + absolute tip-position
+population codes).  The brain cannot tell a "tip bump" from any other cortical
+belief — the interface stays body-agnostic.
 
 Import posture
 --------------
@@ -36,19 +36,15 @@ from sensory import (
 )
 
 from .body_interface import (
-    BodyInterface, SensorySample, SensoryLayout, zero_value_code_in,
+    BodyInterface, SensorySample, SensoryLayout,
 )
 
 
 # Sensory segment names — goals address channels by these, never by index.
 SEG_PROPRIOCEPTION = "proprioception"
-SEG_TARGET_ERROR_X = "target_error_x"
-SEG_TARGET_ERROR_Y = "target_error_y"
-TARGET_ERROR_SEGMENTS = (SEG_TARGET_ERROR_X, SEG_TARGET_ERROR_Y)
-
-# The tip→target error is clipped to ±(this · workspace_half) before being
-# population-coded, so a far tip cannot push the bump off the coded range.
-TARGET_ERROR_CLIP_FACTOR = 2.0
+SEG_TIP_X = "tip_x"
+SEG_TIP_Y = "tip_y"
+TIP_SEGMENTS = (SEG_TIP_X, SEG_TIP_Y)
 
 
 # A compact 2-link planar reacher.  Geometry is in metres (forearm +
@@ -151,12 +147,20 @@ def default_arm_config(
 
 
 def _arm_sensory_layout(cfg: ArmConfig) -> SensoryLayout:
-    """Named partition: proprioception, then per-axis target-error codes."""
+    """Named partition: proprioception, then per-axis absolute tip-position codes.
+
+    The tip channels are the *controllable, learnable* coordinate frame the
+    reach goal lives in: ``tip = FK(joint angles)`` is a pure function of the
+    motor command, so the ``motor→sensory`` forward model can predict it (and
+    active inference can invert it) — unlike an absolute target, which is
+    exogenous.  The goal ("tip at target") is then a target-specific clamp on
+    these channels (:meth:`MjxArmBody.reach_goal`).
+    """
     proprio_size = cfg.n_joints * 2 * cfg.n_cells_per_joint
     named: list[tuple[str, int]] = [(SEG_PROPRIOCEPTION, proprio_size)]
     if cfg.include_target_in_sensory:
-        named.append((SEG_TARGET_ERROR_X, cfg.n_target_cells))
-        named.append((SEG_TARGET_ERROR_Y, cfg.n_target_cells))
+        named.append((SEG_TIP_X, cfg.n_target_cells))
+        named.append((SEG_TIP_Y, cfg.n_target_cells))
     return SensoryLayout.from_sizes(tuple(named))
 
 
@@ -332,24 +336,37 @@ class MjxArmBody(eqx.Module, BodyInterface):
         """Partial sensory preference for "tip on target" + its pin mask.
 
         Returns ``(preference, mask)`` for :func:`core.pc_brain.pc_brain_act`:
-        the target-error channels are pinned to the *zero-error* population
-        code (tip coincident with target); proprioception is left free for
-        the brain to infer.  Target-independent — zero error always means
-        "on target", whatever the target position.
+        the absolute tip-position channels are pinned to the population code of
+        the **observed target** position; proprioception is left free for the
+        brain to infer.  Target-**specific** — the goal carries the target in
+        the tip coordinate frame, so relaxing the (flat-prior) motor node
+        inverts the ``motor→tip`` forward model to a target-dependent command.
+
+        This is the active-inference reach of Adams, Shipp & Friston (2013):
+        set the desired (proprioceptive/tip) outcome, infer the command that
+        realises it.  Encoding the goal as *absolute tip* (a function of the
+        command) rather than *target-error* (which mixes in the exogenous
+        target) is what makes the forward model learnable and the inferred
+        command actually steer to different targets.
         """
         if not self.cfg.include_target_in_sensory:
             raise ValueError(
-                "reach_goal requires a target-conditioned sensory vector; "
+                "reach_goal requires the tip-position sensory channels; "
                 "build the body with include_target=True"
             )
         half = self.cfg.workspace_half
-        zero_error_code = gaussian_population_encode(
-            0.0, self.cfg.n_target_cells, x_min=-half, x_max=half,
+        tgt_x_code = gaussian_population_encode(
+            self.target_xy[0], self.cfg.n_target_cells, x_min=-half, x_max=half,
         )
-        preference = zero_value_code_in(
-            self.sensory_layout, TARGET_ERROR_SEGMENTS, zero_error_code,
+        tgt_y_code = gaussian_population_encode(
+            self.target_xy[1], self.cfg.n_target_cells, x_min=-half, x_max=half,
         )
-        mask = self.sensory_layout.mask(TARGET_ERROR_SEGMENTS)
+        preference = jnp.zeros(self.sensory_layout.total, DTYPE)
+        seg_x = self.sensory_layout.segment(SEG_TIP_X)
+        seg_y = self.sensory_layout.segment(SEG_TIP_Y)
+        preference = preference.at[seg_x.start:seg_x.stop].set(tgt_x_code)
+        preference = preference.at[seg_y.start:seg_y.stop].set(tgt_y_code)
+        mask = self.sensory_layout.mask(TIP_SEGMENTS)
         return preference, mask
 
     # ------------------------------------------------------------ #
@@ -374,15 +391,16 @@ class MjxArmBody(eqx.Module, BodyInterface):
 
         if self.cfg.include_target_in_sensory:
             half = self.cfg.workspace_half
-            clip = TARGET_ERROR_CLIP_FACTOR * half
-            dxy = jnp.clip(self.target_xy - tip_xy, -clip, clip)
-            dx_code = gaussian_population_encode(
-                dxy[0], self.cfg.n_target_cells, x_min=-half, x_max=half,
+            # Absolute tip position (a pure function of the joint angles, hence
+            # of the motor command) — the learnable frame the reach goal lives
+            # in.  Tip ∈ [−(L1+L2), L1+L2] = [−half, half] for this arm.
+            tx_code = gaussian_population_encode(
+                tip_xy[0], self.cfg.n_target_cells, x_min=-half, x_max=half,
             )
-            dy_code = gaussian_population_encode(
-                dxy[1], self.cfg.n_target_cells, x_min=-half, x_max=half,
+            ty_code = gaussian_population_encode(
+                tip_xy[1], self.cfg.n_target_cells, x_min=-half, x_max=half,
             )
-            sensory = jnp.concatenate([proprio, dx_code, dy_code])
+            sensory = jnp.concatenate([proprio, tx_code, ty_code])
         else:
             sensory = proprio
 

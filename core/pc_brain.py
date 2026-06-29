@@ -39,7 +39,7 @@ from .backend import DTYPE, Array, PRNGKey
 from .pc_graph import (
     PCGraphParams, PCGraphState,
     init_region_graph, pc_graph_clamp, pc_graph_relax,
-    pc_graph_learn, graph_free_energy, REGION_INDEX,
+    pc_graph_learn, pc_graph_roll, graph_free_energy, REGION_INDEX,
 )
 from .pc_active import (
     set_action_prior, pc_act_infer, pc_act_learn_forward,
@@ -101,7 +101,8 @@ def init_pc_brain(
 
 class PCBrainOutput(NamedTuple):
     state: PCBrainState
-    joint_command: Array       # (motor_dim,) ∈ [−1, 1]
+    joint_command: Array       # (motor_dim,) ∈ [−1, 1] — tanh(motor belief)
+    motor_belief: Array        # (motor_dim,) pre-tanh motor μ (forward-model input)
     value: Array               # scalar — expected value node belief
     policy: Array              # (policy_dim,) — policy node belief (logits)
     free_energy: Array         # scalar — global objective at relaxation
@@ -116,7 +117,7 @@ def pc_brain_cognitive_step(
     *,
     n_relax: int | None = None,
     learn: bool = True,
-    precision_gains: dict[int, float] | None = None,
+    precision_gains: dict[int, float | Array] | None = None,
 ) -> PCBrainOutput:
     """One cycle: clamp sensory → relax graph → read motor → learn.
 
@@ -127,9 +128,12 @@ def pc_brain_cognitive_step(
 
     ``precision_gains`` maps node index → multiplicative precision gain:
     the neuromodulatory hook (ACh ↑ sensory Π = attention, DA ↑ reward Π;
-    Parr & Friston 2017).  Gains modulate this cycle's inference and the
-    weight of its error in learning; they do not persist (precision is an
-    EMA, restored by the learning update).  ``epistemic`` reports the
+    Parr & Friston 2017).  A gain is a scalar (whole-node neuromodulation,
+    :mod:`core.pc_neuromod`) or a per-dimension array (spatial attention
+    over sensory sub-fields, :mod:`core.pc_attention`) — both flow through
+    ``scale_node_precision`` unchanged.  Gains modulate this cycle's
+    inference and the weight of its error in learning; they do not persist
+    (precision is an EMA, restored by the learning update).  ``epistemic`` reports the
     sensory node's information gain (mean inverse precision) — the
     exploration term active inference would feed to :func:`efe_select`.
     """
@@ -149,6 +153,7 @@ def pc_brain_cognitive_step(
 
     motor_belief = relaxed.mu[params.motor_idx]
     joint_command = jnp.tanh(motor_belief).astype(DTYPE)
+    motor_belief = motor_belief.astype(DTYPE)
     value = jnp.mean(relaxed.mu[params.value_idx])
     policy = relaxed.mu[params.policy_idx]
     belief = relaxed.mu[params.cortex_top_idx]
@@ -161,11 +166,18 @@ def pc_brain_cognitive_step(
         # untouched, so a probe never mutates the model.
         new_graph = eqx.tree_at(lambda s: s.mu, g, relaxed.mu)
 
+    # Roll the temporal carry so the next cycle's temporal edges (§6) read
+    # this cycle's relaxed belief as their source.  Belief-level state (like
+    # μ itself), so it advances on a probe too; only weights stay frozen
+    # when ``learn=False``.  Inert when the graph has no temporal edges.
+    new_graph = pc_graph_roll(new_graph)
+
     epistemic = epistemic_value(new_graph, s_idx)
 
     return PCBrainOutput(
         state=PCBrainState(graph=new_graph),
         joint_command=joint_command,
+        motor_belief=motor_belief,
         value=value,
         policy=policy,
         free_energy=fe,
@@ -179,28 +191,56 @@ def pc_brain_cognitive_step(
 # =====================================================================
 
 
+class PCBrainActOutput(NamedTuple):
+    """Read-out of one goal-directed action inference.
+
+    Action is inference, not a state transition: this read-out is taken
+    off an *ephemeral* planning relaxation and does not mutate the brain
+    (perception via :func:`pc_brain_cognitive_step` is the sole
+    belief-advancing op).  ``motor_belief`` is the pre-``tanh`` command —
+    feed it back to :func:`pc_brain_learn_forward` to keep the forward
+    model adapting closed-loop.
+    """
+
+    joint_command: Array       # (motor_dim,) ∈ [−1, 1] — sent to the body
+    motor_belief: Array        # (motor_dim,) pre-tanh motor μ
+    predicted_sensory: Array   # (sensory_dim,) reafference the model expects
+
+
 def pc_brain_act(
     state: PCBrainState,
     params: PCBrainParams,
     preferred_sensory: Array,
     *,
+    preference_mask: Array | None = None,
+    observations: dict[int, Array] | None = None,
     n_relax: int | None = None,
-) -> Array:
+) -> PCBrainActOutput:
     """Infer the command realising a preferred sensory outcome (no REINFORCE).
 
-    Active inference: clamp the *preferred* proprioceptive reafference on
-    the sensory node, relax with the (flat-prior) motor node free; the
-    motor belief that explains the preference through the motor→sensory
-    forward model is the command (Adams, Shipp & Friston 2013 —
-    "predictions, not commands").  Requires a trained forward model
+    Active inference: clamp the *preferred* reafference on the sensory
+    node, relax with the (flat-prior) motor node free; the motor belief
+    that explains the preference through the motor→sensory forward model
+    is the command (Adams, Shipp & Friston 2013 — "predictions, not
+    commands").  Requires a trained forward model
     (:func:`pc_brain_learn_forward` during babbling).
+
+    ``preference_mask`` makes the goal *partial* — pin only some sensory
+    channels (e.g. the target-error channels to "on target") and leave
+    the rest (proprioception) to be inferred.  ``observations`` clamps
+    further sensory context whole.
     """
     out = pc_act_infer(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
-        preference=preferred_sensory, n_steps=n_relax,
+        preference=preferred_sensory, preference_mask=preference_mask,
+        observations=observations, n_steps=n_relax,
     )
-    return jnp.tanh(out.command).astype(DTYPE)
+    return PCBrainActOutput(
+        joint_command=jnp.tanh(out.command).astype(DTYPE),
+        motor_belief=out.command.astype(DTYPE),
+        predicted_sensory=out.predicted_outcome.astype(DTYPE),
+    )
 
 
 def pc_brain_learn_forward(
@@ -208,17 +248,23 @@ def pc_brain_learn_forward(
     params: PCBrainParams,
     command: Array,
     realised_sensory: Array,
+    *,
+    n_relax: int | None = None,
 ) -> PCBrainState:
     """Self-supervised forward-model update from a (command → reafference) pair.
 
     The motor→sensory edge learns by the one rule; used during babbling
     (random commands) so the active-inference action of
-    :func:`pc_brain_act` has a forward model to invert.  ``command`` is
-    the executed motor belief (pre-``tanh``).
+    :func:`pc_brain_act` has a forward model to invert, and continuously
+    during reaching for closed-loop adaptation.  ``command`` is the
+    executed motor belief (pre-``tanh``).  ``n_relax`` settling steps let
+    the deeper region graph infer its intermediate causes before the
+    Hebbian step (``None`` = substrate default).
     """
     new_graph = pc_act_learn_forward(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
         command=command, realised_outcome=realised_sensory,
+        **({} if n_relax is None else {"n_relax": int(n_relax)}),
     )
     return PCBrainState(graph=new_graph)

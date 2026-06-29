@@ -72,6 +72,29 @@ def test_babble_then_reach_no_reinforce():
 # ---------------------------------------------------------------------
 
 
+def test_partial_preference_realises_pinned_channels():
+    """A masked goal pins only some outcome channels; the rest are inferred."""
+    d = 6
+    p = init_pc_graph_params(
+        (d, d), ((1, 0),), act="linear", eta_mu=0.3, n_relax=300,
+    )
+    s = init_pc_graph_state(jax.random.PRNGKey(11), p)
+    s = eqx.tree_at(lambda z: z.weights, s, (jnp.eye(d),))  # identity forward model
+    s = set_action_prior(s, 1, precision=1e-4)
+
+    pref = jax.random.normal(jax.random.PRNGKey(12), (d,))
+    mask = jnp.array([True, True, True, False, False, False])
+    out = pc_act_infer(s, p, 1, 0, pref, preference_mask=mask, n_steps=300)
+
+    # The inferred command must realise the preference on the *pinned*
+    # channels; the unpinned ones are free and carry no such constraint.
+    rel = float(
+        jnp.linalg.norm(out.predicted_outcome[mask] - pref[mask])
+        / jnp.linalg.norm(pref[mask])
+    )
+    assert rel < 0.05, f"pinned channels not realised: rel {rel:.3f}"
+
+
 def test_action_as_inference_matches_preference():
     d = 5
     p = init_pc_graph_params(
@@ -131,11 +154,14 @@ def test_pc_brain_act_is_goal_directed():
 
     pref_a = jnp.ones(sensory) * 0.5
     pref_b = -jnp.ones(sensory) * 0.5
-    cmd_a = pc_brain_act(state, params, pref_a, n_relax=80)
-    cmd_b = pc_brain_act(state, params, pref_b, n_relax=80)
+    act_a = pc_brain_act(state, params, pref_a, n_relax=80)
+    act_b = pc_brain_act(state, params, pref_b, n_relax=80)
+    cmd_a, cmd_b = act_a.joint_command, act_b.joint_command
 
     assert cmd_a.shape == (motor,)
     assert jnp.all(jnp.abs(cmd_a) <= 1.0)
+    # The pre-tanh belief is the forward-model input for closed-loop learning.
+    assert act_a.motor_belief.shape == (motor,)
     assert float(jnp.sum(jnp.abs(cmd_a - cmd_b))) > 1e-3, (
         "active-inference command not goal-sensitive"
     )

@@ -51,6 +51,12 @@ from .pc_graph import (
     pc_graph_clamp, pc_graph_relax, pc_graph_learn, pc_graph_predictions,
 )
 
+# With both the action and the outcome nodes clamped, the intermediate
+# causes have little to infer, so the forward-model update needs only a
+# short settle before the Hebbian step.  Exposed (not inlined) so a deep
+# region graph can lengthen it without a magic literal at the call site.
+DEFAULT_FORWARD_SETTLE_STEPS = 1
+
 
 # =====================================================================
 # Precision control (neuromodulation hook) + flat action priors
@@ -103,6 +109,7 @@ def pc_act_infer(
     motor_idx: int, outcome_idx: int,
     preference: Array,
     *,
+    preference_mask: Array | None = None,
     observations: dict | None = None,
     n_steps: int | None = None,
 ) -> ActInferOutput:
@@ -113,15 +120,39 @@ def pc_act_infer(
     the graph with the motor node free.  The relaxed motor belief is the
     command (predictions-not-commands); the body fulfils it downstream.
 
+    ``preference_mask`` makes the preference *partial*: a per-dimension
+    boolean over the outcome node, ``True`` = pinned to ``preference``,
+    ``False`` = free.  A goal is usually a partial specification (e.g.
+    "zero target-error" on the goal channels while proprioception is left
+    to be inferred); the unpinned dimensions relax from their current
+    belief.  ``None`` pins the whole outcome node.
+
     Assumes the motor node has a flat prior (:func:`set_action_prior`)
     and the motor→outcome (forward-model) edge is trained
     (:func:`pc_act_learn_forward`).
     """
-    clamp = dict(observations) if observations else {}
-    clamp[outcome_idx] = preference.astype(DTYPE)
-    clamped = pc_graph_clamp(state, clamp)
+    clamp_values = {
+        idx: jnp.asarray(val, DTYPE) for idx, val in (observations or {}).items()
+    }
+    whole_clamp = list(clamp_values.keys())
+    clamp_masks: dict[int, Array] = {}
+
+    pref = jnp.asarray(preference, DTYPE)
+    if preference_mask is None:
+        clamp_values[outcome_idx] = pref
+        whole_clamp.append(outcome_idx)
+    else:
+        mask = jnp.asarray(preference_mask, bool)
+        # Pin only the masked dimensions; leave the rest at their belief.
+        clamp_values[outcome_idx] = jnp.where(mask, pref, state.mu[outcome_idx])
+        clamp_masks[outcome_idx] = mask
+
+    clamped = pc_graph_clamp(state, clamp_values)
     relaxed = pc_graph_relax(
-        clamped, params, clamp=tuple(clamp.keys()), n_steps=n_steps,
+        clamped, params,
+        clamp=tuple(whole_clamp),
+        clamp_masks=clamp_masks or None,
+        n_steps=n_steps,
     )
     preds = pc_graph_predictions(relaxed, params)
     return ActInferOutput(
@@ -136,21 +167,23 @@ def pc_act_learn_forward(
     motor_idx: int, outcome_idx: int,
     command: Array, realised_outcome: Array,
     *,
+    n_relax: int = DEFAULT_FORWARD_SETTLE_STEPS,
     update_precision: bool = True,
 ) -> PCGraphState:
     """Learn the forward model from a realised (command → outcome) pair.
 
     Clamps the motor node to the executed command and the outcome node to
-    the realised outcome, then applies the one rule — the motor→outcome
-    edge descends ``½‖realised − W φ(command)‖²``.  Used during babbling
+    the realised outcome, relaxes the intermediate causes for ``n_relax``
+    settling steps, then applies the one rule — the motor→outcome edge
+    descends ``½‖realised − W φ(command)‖²``.  Used during babbling
     (random commands) and continuously during reaching.
     """
     clamped = pc_graph_clamp(
-        state, {motor_idx: command.astype(DTYPE),
-                outcome_idx: realised_outcome.astype(DTYPE)},
+        state, {motor_idx: jnp.asarray(command, DTYPE),
+                outcome_idx: jnp.asarray(realised_outcome, DTYPE)},
     )
     relaxed = pc_graph_relax(
-        clamped, params, clamp=(motor_idx, outcome_idx), n_steps=1,
+        clamped, params, clamp=(motor_idx, outcome_idx), n_steps=n_relax,
     )
     return pc_graph_learn(relaxed, params, update_precision=update_precision)
 
@@ -192,11 +225,29 @@ def efe_select(
     return PolicyChoice(index=jnp.argmin(G), G=G)
 
 
-def epistemic_value(state: PCGraphState, node_idx: int) -> Array:
-    """Expected information gain at a node ≈ mean inverse precision.
+def epistemic_value(
+    state: PCGraphState, node_idx: int,
+    *,
+    learning_progress: float | Array | None = None,
+    lp_weight: float | Array = 1.0,
+) -> Array:
+    """Expected information gain at a node — the exploration term of EFE.
 
-    Low-precision (uncertain) outcomes carry the most to learn (Friston
-    2017 epistemic value / salience); use as the exploration term of
-    :func:`efe_select` when an explicit info-gain estimate is unavailable.
+    Default (``learning_progress=None``): the inverse-precision proxy
+    ``mean(1/Π)`` — low-precision (uncertain) outcomes carry the most to
+    learn (Friston 2017 epistemic value / salience).  Cheap, but
+    noise-blind: irreducible noise also reads as low precision (the
+    "noisy-TV" trap).
+
+    When a ``learning_progress`` signal is supplied (the world model's
+    ``pe_long − pe_short`` from :func:`core.pc_neuromod.neuromod_curiosity`,
+    Oudeyer 2007), its rectified value is added with weight ``lp_weight``:
+    curiosity is then drawn to regions whose error is actually *falling*
+    (genuinely learnable), not merely uncertain.  Additive and opt-in, so
+    existing callers are unchanged.
     """
-    return jnp.mean(1.0 / (state.pi[node_idx] + jnp.asarray(1e-6, DTYPE)))
+    inv_precision = jnp.mean(1.0 / (state.pi[node_idx] + jnp.asarray(1e-6, DTYPE)))
+    if learning_progress is None:
+        return inv_precision
+    lp = jnp.maximum(jnp.asarray(learning_progress, DTYPE), 0.0)
+    return inv_precision + jnp.asarray(lp_weight, DTYPE) * lp

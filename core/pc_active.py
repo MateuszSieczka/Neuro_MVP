@@ -123,7 +123,7 @@ def pc_act_infer(
     *,
     preference_mask: Array | None = None,
     observations: dict | None = None,
-    free_nodes: tuple[int, ...] | None = None,
+    hold_nodes: tuple[int, ...] | None = None,
     n_steps: int | None = None,
 ) -> ActInferOutput:
     """Infer the motor command that would realise ``preference``.
@@ -140,19 +140,20 @@ def pc_act_infer(
     to be inferred); the unpinned dimensions relax from their current
     belief.  ``None`` pins the whole outcome node.
 
-    ``free_nodes`` restricts inference to the **action pathway** — only
-    these nodes (the motor node and its forward-model hidden layer, the
-    cerebellum) relax; every other node is held at its current perceptual
-    belief.  This is the defining move of active inference: *perception is
-    fixed, action varies* (Friston 2010).  Without it the clamped goal is
-    an outcome the whole generative model relaxes to explain, and the
-    cortical/world-model causes simply re-explain the preferred outcome
-    among themselves — driving the outcome error to zero **without moving
-    the motor command** (explaining-away).  Holding perception leaves the
-    forward model ``motor→cerebellum→outcome`` as the *only* path that can
-    satisfy the goal, so the command is actually inferred.  ``None`` (the
-    default) frees every non-clamped node (whole-graph inference, the
-    behaviour used by hierarchical-goal inference and the unit tests).
+    ``hold_nodes`` are held at their current belief during the relaxation —
+    the **perceptual generators of the outcome** (the cortical hierarchy and
+    the world model that also predict the outcome node).  This is the
+    defining move of active inference: *perception is fixed, action varies*
+    (Friston 2010).  Without it the clamped goal is an outcome the whole
+    generative model relaxes to explain, and those perceptual causes simply
+    re-explain the preferred outcome among themselves — driving the outcome
+    error to zero **without moving the command** (explaining-away).  Holding
+    exactly the outcome's perceptual parents leaves the forward model
+    ``motor→cerebellum→outcome`` as the only remaining way to satisfy the
+    goal, so the command is inferred; the action's *downstream* consequences
+    (efference targets, value) stay free, so they follow the command instead
+    of anchoring it.  ``None`` (the default) frees every non-clamped node
+    (whole-graph inference, used by hierarchical-goal inference and tests).
 
     Assumes the motor node has a flat prior (:func:`set_action_prior`)
     and the forward-model edges are trained (:func:`pc_act_learn_forward`).
@@ -173,17 +174,9 @@ def pc_act_infer(
         clamp_values[outcome_idx] = jnp.where(mask, pref, state.mu[outcome_idx])
         clamp_masks[outcome_idx] = mask
 
-    if free_nodes is not None:
-        # Hold every node outside the action pathway at its current belief —
-        # they keep their (perceptual) μ, so only the action pathway relaxes
-        # to satisfy the goal.  The outcome node is excluded: it is the goal
-        # carrier (pinned whole, or partially via the mask with free dims).
-        free = set(int(j) for j in free_nodes)
+    if hold_nodes is not None:
         already = set(whole_clamp) | set(clamp_masks)
-        whole_clamp.extend(
-            j for j in range(params.n_nodes)
-            if j not in free and j != outcome_idx and j not in already
-        )
+        whole_clamp.extend(int(j) for j in hold_nodes if int(j) not in already)
 
     clamped = pc_graph_clamp(state, clamp_values)
     relaxed = pc_graph_relax(
@@ -205,7 +198,7 @@ def pc_act_learn_forward(
     motor_idx: int, outcome_idx: int,
     command: Array, realised_outcome: Array,
     *,
-    free_nodes: tuple[int, ...] | None = None,
+    hold_nodes: tuple[int, ...] | None = None,
     n_relax: int | None = DEFAULT_FORWARD_SETTLE_STEPS,
     update_precision: bool = True,
 ) -> PCGraphState:
@@ -219,15 +212,15 @@ def pc_act_learn_forward(
     along the ``motor→cerebellum→outcome`` path.  Used during babbling
     (random commands) and continuously during reaching.
 
-    ``free_nodes`` confines the settle to the **action pathway** (the
-    forward-model hidden layer), holding every other node — so the forward
-    model learns the *full* command→reafference map instead of only the
-    residual the perceptual hierarchy leaves unexplained.  Without it the
-    cortical/world-model causes (free) co-explain the clamped reafference
-    during babbling and the ``cerebellum→outcome`` edge learns almost
-    nothing, so there is no accurate model left to invert at reach.  ``None``
-    (the default) frees every non-clamped node (the behaviour used by the
-    unit tests and any caller that wants perception to learn here too).
+    ``hold_nodes`` holds the outcome's **perceptual parents** (the cortical
+    hierarchy + world model) during the settle, so the forward model learns
+    the *full* command→reafference map rather than only the residual those
+    perceptual causes leave unexplained — the same hold used at inference, so
+    babbling fits exactly the model that reaching inverts.  Without it the
+    free perceptual causes co-explain the clamped reafference and the
+    ``cerebellum→outcome`` edge learns almost nothing.  ``None`` (the
+    default) frees every non-clamped node (the unit-test behaviour, and any
+    caller that wants perception to learn here too).
     """
     steps = params.n_relax if n_relax is None else int(n_relax)
     clamped = pc_graph_clamp(
@@ -235,13 +228,9 @@ def pc_act_learn_forward(
                 outcome_idx: jnp.asarray(realised_outcome, DTYPE)},
     )
     whole_clamp = [motor_idx, outcome_idx]
-    if free_nodes is not None:
-        free = set(int(j) for j in free_nodes)
+    if hold_nodes is not None:
         clamp_set = {motor_idx, outcome_idx}
-        whole_clamp.extend(
-            j for j in range(params.n_nodes)
-            if j not in free and j not in clamp_set
-        )
+        whole_clamp.extend(int(j) for j in hold_nodes if int(j) not in clamp_set)
     relaxed = pc_graph_relax(
         clamped, params, clamp=tuple(whole_clamp), n_steps=steps,
     )

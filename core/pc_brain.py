@@ -58,17 +58,14 @@ class PCBrainParams(eqx.Module):
     value_idx: int = eqx.field(static=True)
     policy_idx: int = eqx.field(static=True)
     cortex_top_idx: int = eqx.field(static=True)
-
-    @property
-    def action_pathway(self) -> tuple[int, ...]:
-        """Nodes that relax during goal-directed action (active inference).
-
-        The motor command and its forward-model hidden layer (the
-        cerebellum); every other node is held at its perceptual belief so the
-        goal is satisfied by *action*, not by re-explaining perception
-        (:func:`core.pc_active.pc_act_infer` ``free_nodes``).
-        """
-        return (self.motor_idx, self.cerebellum_idx)
+    #: The sensory node's **perceptual parents** — the cortical hierarchy and
+    #: the world model that also generate the sensory outcome.  Held fixed
+    #: during goal-directed action and forward-model learning so the only
+    #: thing free to satisfy a sensory goal is the forward model
+    #: ``motor→cerebellum→sensory`` (perception fixed, action varies); the
+    #: action's downstream consequences (cerebellum, efference targets, value)
+    #: stay free and follow the command rather than anchoring it.
+    perceptual_nodes: tuple = eqx.field(static=True)
 
     @property
     def sensory_dim(self) -> int:
@@ -108,6 +105,14 @@ def init_pc_brain(
         value_idx=REGION_INDEX["value"],
         policy_idx=REGION_INDEX["policy"],
         cortex_top_idx=REGION_INDEX["cortex_l3"],
+        # The sensory node's perceptual parents: the cortical hierarchy and
+        # the world model (every generative ancestor of sensory except the
+        # action pathway motor→cerebellum).  Held during action / forward
+        # learning so the forward model is the only path to a sensory goal.
+        perceptual_nodes=(
+            REGION_INDEX["cortex_l1"], REGION_INDEX["cortex_l2"],
+            REGION_INDEX["cortex_l3"], REGION_INDEX["world_model"],
+        ),
     )
     return params, PCBrainState(graph=gs)
 
@@ -243,16 +248,17 @@ def pc_brain_act(
     the rest (proprioception) to be inferred.  ``observations`` clamps
     further sensory context whole.
 
-    Inference is confined to the **action pathway** (``params.action_pathway``
-    = motor + cerebellum); the perceptual hierarchy is held at its current
-    belief so the goal is met by inferring a command, not by re-explaining
-    the preferred outcome with the cortical causes (:func:`pc_act_infer`).
+    The perceptual parents of the sensory node (``params.perceptual_nodes``)
+    are held at their current belief, so the goal is met by inferring a
+    command through the ``motor→cerebellum→sensory`` forward model, not by
+    re-explaining the preferred outcome with the cortical causes
+    (:func:`pc_act_infer`).
     """
     out = pc_act_infer(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
         preference=preferred_sensory, preference_mask=preference_mask,
-        observations=observations, free_nodes=params.action_pathway,
+        observations=observations, hold_nodes=params.perceptual_nodes,
         n_steps=n_relax,
     )
     return PCBrainActOutput(
@@ -284,7 +290,7 @@ def pc_brain_learn_forward(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
         command=command, realised_outcome=realised_sensory,
-        free_nodes=params.action_pathway,
+        hold_nodes=params.perceptual_nodes,
         **({} if n_relax is None else {"n_relax": int(n_relax)}),
     )
     return PCBrainState(graph=new_graph)

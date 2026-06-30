@@ -117,11 +117,50 @@ class PCGraphParams(eqx.Module):
     #: Empty by default ⇒ ``bias`` stays zero everywhere and every prediction
     #: is byte-identical to the bias-free model.  Enabled only where the
     #: generative target is non-zero-mean and a node must reconstruct it — the
-    #: forward-model output (``sensory``) and its hidden layer (``cerebellum``)
-    #: — *not* abstract/value nodes, where an always-on baseline would absorb
-    #: a reward and steal credit from the intermittent edges that should learn
-    #: it (the temporal-credit edges).
+    #: forward-model output (``sensory``) — *not* abstract/value nodes, where an
+    #: always-on baseline would absorb a reward and steal credit from the
+    #: intermittent edges that should learn it (the temporal-credit edges), and
+    #: *not* a frozen granule layer (``cerebellum``) whose ``bias`` is its fixed
+    #: random threshold, not a learnable DC term.
     bias_nodes: tuple = eqx.field(static=True)
+    #: Edges whose ``W`` is **never** updated by the learning rule — a frozen
+    #: generative projection.  The canonical use is the cerebellar granule
+    #: layer ``motor→cerebellum``: in Marr–Albus the mossy→granule expansion is
+    #: a *fixed* high-dimensional random non-linearity and only the
+    #: granule→Purkinje (``cerebellum→sensory``) synapse is plastic
+    #: (:func:`apply_granule_expansion_init`).  Making the deep edge plastic
+    #: *and* feeding a free hidden layer is exactly what collapses the forward
+    #: model to predict-the-mean (the local rule drives ``ΔW=−η·W·φφᵀ`` →
+    #: ``W→0``); freezing the expansion removes the edge that would decay.
+    #: Empty by default ⇒ every edge learns, byte-identical to before.
+    frozen_edges: tuple = eqx.field(static=True)
+    #: Nodes whose belief μ is a **deterministic function of its top-down
+    #: prediction** each relaxation step (``μ_j ← Σ_{i→j} W φ(μ_i) + bias_j``)
+    #: instead of being freely inferred — an *amortised / feedforward
+    #: recognition* node, not an iterative latent.  Error and curvature still
+    #: backprop **through** it to its parents by the exact chain rule (it is the
+    #: zero-relaxation-time limit of a free node: its effective upstream message
+    #: is ``φ'(μ_j)·Σ_{j→c} W_{j→c}ᵀ ξ_c``), so a goal on a descendant still
+    #: drives the node's ancestors.  This is the load-bearing half of the
+    #: Marr–Albus fix: a frozen ``motor→cerebellum`` edge is *not enough* if the
+    #: cerebellum stays a free latent — the over-complete latent reconstructs
+    #: the clamped target off the motor manifold and the readout trains at a
+    #: different operating point than inference uses.  Making the granule layer
+    #: feedforward pins it to ``g(motor)`` during both learning and inversion.
+    #: Empty by default ⇒ every node is a free latent, byte-identical to before.
+    feedforward_nodes: tuple = eqx.field(static=True)
+    #: Edges whose weight step is **normalised by presynaptic feature energy**
+    #: (NLMS: ``ΔW = η_w·ε ⊗ φ / (‖φ‖²+δ)``) — the curvature-complete
+    #: (natural-gradient) form of the one rule, the input-side twin of the
+    #: existing output-side ``÷Π`` preconditioning.  Plain LMS on a fixed rich
+    #: basis is stable only for ``η < 2/‖φ‖²``; a dense ``cb_size``-wide granule
+    #: readout (``‖φ‖² ~ cb_size``) at the substrate ``η_w`` diverges, so the
+    #: granule→Purkinje readout uses NLMS, which is unconditionally stable for
+    #: ``η_w < 2`` regardless of feature energy.  The normaliser rescales the
+    #: whole edge update by one positive scalar, so the gradient *direction*
+    #: (and the ``∂F/∂W=0`` fixed point) is unchanged; only the rate adapts.
+    #: Empty by default ⇒ plain LMS everywhere, byte-identical to before.
+    nlms_edges: tuple = eqx.field(static=True)
 
     @property
     def n_nodes(self) -> int:
@@ -152,6 +191,46 @@ def _outgoing(edges: tuple, n_nodes: int) -> tuple:
     return tuple(tuple(x) for x in out)
 
 
+def _feedforward_topo_order(feedforward_nodes: tuple, edges: tuple) -> tuple:
+    """Topological order (parents before children) over the feedforward nodes.
+
+    A feedforward node is a deterministic function of its top-down prediction,
+    so when one feedforward node feeds another the upstream one must be
+    evaluated first.  Only edges *between* feedforward nodes constrain the
+    order; edges from/to free nodes do not (a free parent's belief is read
+    as-is, a free child consumes the result downstream).  Returns the order as
+    a tuple of node indices.  Raises if the feedforward sub-graph has a cycle —
+    a deterministic node cannot depend (even transitively) on itself.
+    """
+    ff = set(int(j) for j in feedforward_nodes)
+    if not ff:
+        return ()
+    # Adjacency restricted to the feedforward sub-graph.
+    children = {j: set() for j in ff}
+    indeg = {j: 0 for j in ff}
+    for (src, dst) in edges:
+        if src in ff and dst in ff and dst not in children[src]:
+            children[src].add(dst)
+            indeg[dst] += 1
+    # Kahn's algorithm (deterministic: process in ascending index order).
+    ready = sorted(j for j in ff if indeg[j] == 0)
+    order: list[int] = []
+    while ready:
+        j = ready.pop(0)
+        order.append(j)
+        for c in sorted(children[j]):
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                ready.append(c)
+        ready.sort()
+    if len(order) != len(ff):
+        raise ValueError(
+            "feedforward nodes form a cycle — a deterministic feedforward node "
+            "cannot depend on itself (directly or transitively)"
+        )
+    return tuple(order)
+
+
 def init_pc_graph_params(
     node_sizes: tuple[int, ...],
     edges: tuple[tuple[int, int], ...],
@@ -169,15 +248,42 @@ def init_pc_graph_params(
     tau_elig_steps: float = 4.0,
     fixed_pi_nodes: tuple[int, ...] = (),
     bias_nodes: tuple[int, ...] = (),
+    frozen_edges: tuple[int, ...] = (),
+    feedforward_nodes: tuple[int, ...] = (),
+    nlms_edges: tuple[int, ...] = (),
 ) -> PCGraphParams:
     sizes = tuple(int(s) for s in node_sizes)
     edges = tuple((int(a), int(b)) for (a, b) in edges)
     dyn_edges = tuple((int(a), int(b)) for (a, b) in dyn_edges)
     fixed_pi_nodes = tuple(sorted(int(j) for j in fixed_pi_nodes))
     bias_nodes = tuple(sorted(int(j) for j in bias_nodes))
+    frozen_edges = tuple(sorted(int(e) for e in frozen_edges))
+    feedforward_nodes = tuple(sorted(int(j) for j in feedforward_nodes))
+    nlms_edges = tuple(sorted(int(e) for e in nlms_edges))
     for (a, b) in edges + dyn_edges:
         if not (0 <= a < len(sizes) and 0 <= b < len(sizes)):
             raise ValueError(f"edge ({a},{b}) out of range for {len(sizes)} nodes")
+    for e in frozen_edges + nlms_edges:
+        if not (0 <= e < len(edges)):
+            raise ValueError(f"edge index {e} out of range for {len(edges)} edges")
+    for j in feedforward_nodes:
+        if not (0 <= j < len(sizes)):
+            raise ValueError(f"feedforward node {j} out of range for {len(sizes)} nodes")
+    # A feedforward node is set to its top-down prediction, so it must have a
+    # source: a feedforward node with no incoming spatial edge would be pinned
+    # to its bias alone (a constant), which is never the intent.
+    _ff = set(feedforward_nodes)
+    _have_parent = {dst for (_s, dst) in edges}
+    orphan_ff = sorted(_ff - _have_parent)
+    if orphan_ff:
+        raise ValueError(
+            f"feedforward node(s) {orphan_ff} have no incoming spatial edge to "
+            f"predict them — a feedforward node needs a generative parent"
+        )
+    # Compute a topological order over the feedforward sub-graph (parents
+    # before children) up front so the relaxation never re-derives it; a cycle
+    # among feedforward nodes makes the deterministic recursion ill-defined.
+    _feedforward_topo_order(feedforward_nodes, edges)
     if precision_mode not in (PRECISION_EMA, PRECISION_WELFORD):
         raise ValueError(
             f"precision_mode must be {PRECISION_EMA!r} or {PRECISION_WELFORD!r}, "
@@ -195,6 +301,8 @@ def init_pc_graph_params(
         act=act, n_relax=int(n_relax),
         precision_mode=precision_mode, elig_mode=bool(eligibility),
         fixed_pi_nodes=fixed_pi_nodes, bias_nodes=bias_nodes,
+        frozen_edges=frozen_edges, feedforward_nodes=feedforward_nodes,
+        nlms_edges=nlms_edges,
     )
 
 
@@ -412,6 +520,51 @@ def apply_foveal_gabor_init(
 
 
 # =====================================================================
+# Marr–Albus granule expansion — fixed random init of a frozen edge
+# =====================================================================
+
+
+def apply_granule_expansion_init(
+    state: PCGraphState, params: PCGraphParams,
+    src_idx: int, dst_idx: int, key: PRNGKey, *, gain: float = 1.3,
+) -> PCGraphState:
+    """Seed ``src→dst`` as a fixed random Marr–Albus granule expansion.
+
+    Marr–Albus (Marr 1969; Albus 1971): the mossy-fibre → granule projection
+    is a **fixed, high-dimensional, random non-linear expansion** of its input;
+    only the downstream granule → Purkinje synapse is plastic.  This init makes
+    the ``motor → cerebellum`` edge that expansion — a random ``(dst, src)``
+    weight plus a random per-unit threshold (the destination node's ``bias``,
+    the granule rheobase diversity).  Pair it with ``frozen_edges`` (the edge
+    never learns) and ``feedforward_nodes`` (the granule layer is a
+    deterministic function of its input, not a free latent); the bias must then
+    *not* be in ``bias_nodes`` (it is the fixed threshold, not a learnable DC
+    term).
+
+    ``gain`` is the random-feature / ELM scale: large enough that the granule
+    pre-activations span the informative range of their ``tanh`` non-linearity
+    (pre-activation std ≈ 1 over the command distribution) — a *representational*
+    criterion, not tuned to any downstream task.  A fixed expansion + a plastic
+    readout has **no deep plastic edge to collapse**, so the one rule learns the
+    forward model without decaying it to predict-the-mean.
+    """
+    e = _edge_index(params.edges, int(src_idx), int(dst_idx))
+    n_out, n_in = state.weights[e].shape
+    kw, kb = split_key(key, 2)
+    g = jnp.asarray(gain, DTYPE)
+    W = (jax.random.normal(kw, (n_out, n_in), DTYPE) * g).astype(DTYPE)
+    b = (jax.random.normal(kb, (n_out,), DTYPE) * g).astype(DTYPE)
+    new_weights = list(state.weights)
+    new_weights[e] = W
+    new_bias = list(state.bias)
+    new_bias[int(dst_idx)] = b
+    return eqx.tree_at(
+        lambda s: (s.weights, s.bias), state,
+        (tuple(new_weights), tuple(new_bias)),
+    )
+
+
+# =====================================================================
 # Working-memory persistence — opt-in init of a temporal self-edge
 # =====================================================================
 
@@ -504,7 +657,8 @@ def graph_free_energy(state: PCGraphState, params: PCGraphParams) -> Array:
 
 def _graph_relax_step(
     mu: tuple, weights: tuple, pi: tuple, params: PCGraphParams,
-    outgoing: tuple, hold: tuple, temporal: tuple,
+    incoming: tuple, outgoing: tuple, hold: tuple, temporal: tuple,
+    ff_set: frozenset, ff_fwd_order: tuple, ff_rev_order: tuple,
 ) -> tuple:
     """One inference sweep: ``μ_j ← μ_j − η_μ ∂F/∂μ_j / L_j`` on free dims.
 
@@ -539,39 +693,91 @@ def _graph_relax_step(
     needs.  Held dimensions still contribute their error ε to children, so
     a pinned channel drives the nodes that predict it.
 
-    ``temporal[j]`` is node ``j``'s constant temporal-edge prediction from
-    the previous cycle (frozen across the sweep): it enters ``ε_j`` like
-    any incoming prediction but, since its source is the carry and not a
-    live node, contributes no up-term and no curvature — only the spatial
-    ``outgoing`` edges propagate error and curvature to their sources.
+    ``temporal[j]`` is node ``j``'s constant additive drive across the sweep
+    — the temporal-edge prediction from the previous cycle plus the node bias
+    (an always-on unit).  It enters ``ε_j`` like any incoming prediction but,
+    having a constant source, contributes no up-term and no curvature.
+
+    **Feedforward nodes** (``ff_set``) are not freely inferred: each is set to
+    its own top-down prediction ``μ_j ← Σ_{i→j} W φ(μ_i) + temporal_j``
+    (deterministic recognition activity), in ``ff_fwd_order`` so a feedforward
+    node sees already-updated feedforward parents.  Such a node has ``ε_j ≡ 0``
+    and so contributes nothing to its own free energy, but it still relays the
+    chain-rule message of its children to its parents: in ``ff_rev_order``
+    (children first) its *effective* upstream error and curvature are
+
+        ξ_eff_j   = φ'(μ_j) · Σ_{j→c} W_(j→c)ᵀ ξ_c
+        curv_eff_j = φ'(μ_j)² · Σ_{j→c} (W_(j→c)²)ᵀ curv_c
+
+    — exactly the values a *free* node would settle to (the zero-relaxation
+    limit), so error and curvature backprop through it without it absorbing the
+    goal as a free latent.  This is what lets a frozen, feedforward Marr–Albus
+    granule layer carry a sensory goal back to the motor command: the command's
+    inference curvature ``L_motor`` stays strictly positive (through the
+    granule's ``curv_eff``) even with a flat action prior ``Π_motor = 0``.
     """
     act = params.act
     N = params.n_nodes
     tiny = jnp.asarray(jnp.finfo(DTYPE).tiny, DTYPE)
-    # Predictions + precision-weighted errors (spatial now + temporal past).
+    mu = list(mu)
+
+    def _spatial_pred(mu_: list, j: int) -> Array:
+        acc = jnp.zeros(params.node_sizes[j], DTYPE)
+        for e in incoming[j]:
+            acc = acc + weights[e] @ _phi(act, mu_[params.edges[e][0]])
+        return acc
+
+    # Feedforward forward pass: pin each feedforward node to its prediction
+    # (parents before children); held dims keep their clamped value.
+    for j in ff_fwd_order:
+        pred_j = _spatial_pred(mu, j) + temporal[j]
+        mu[j] = jnp.where(hold[j], mu[j], pred_j)
+
+    # Predictions + own errors for every node from the (feedforward-updated) μ.
     preds = [jnp.zeros(n, DTYPE) for n in params.node_sizes]
     for e, (src, dst) in enumerate(params.edges):
         preds[dst] = preds[dst] + weights[e] @ _phi(act, mu[src])
-    eps = [mu[j] - preds[j] - temporal[j] for j in range(N)]
-    xi = [pi[j] * eps[j] for j in range(N)]
+    pred_full = [preds[j] + temporal[j] for j in range(N)]
+    phip = [_phi_prime(act, mu[j]) for j in range(N)]
 
+    # Per-node upstream messages: free nodes send ξ = Π·ε and curvature Π;
+    # feedforward nodes (ε ≡ 0) relay their children's chain-rule message.
+    xi: list = [None] * N
+    curv: list = [None] * N
+    for j in range(N):
+        if j in ff_set:
+            continue
+        xi[j] = pi[j] * (mu[j] - pred_full[j])
+        curv[j] = pi[j]
+    for j in ff_rev_order:                       # children first
+        acc = jnp.zeros_like(mu[j])
+        cacc = jnp.zeros_like(mu[j])
+        for e in outgoing[j]:
+            dst = params.edges[e][1]
+            acc = acc + weights[e].T @ xi[dst]
+            cacc = cacc + (weights[e] ** 2).T @ curv[dst]
+        xi[j] = phip[j] * acc
+        curv[j] = phip[j] ** 2 * cacc
+
+    # Update free nodes by the curvature-preconditioned gradient step.
     new_mu = list(mu)
     for j in range(N):
-        # value term: this node carries its own error ε_j (curvature Π_j).
+        if j in ff_set:
+            continue                             # already set to its prediction
         g = xi[j]
         L = pi[j]
         # source term: this node predicts each of its children — the error
-        # propagates up (g) and the child precision adds to the curvature (L).
+        # propagates up (g) and the child curvature adds to L (a feedforward
+        # child contributes its relayed curv_eff, a free child its Π).
         if outgoing[j]:
-            phip = _phi_prime(act, mu[j])
             acc = jnp.zeros_like(mu[j])
-            curv = jnp.zeros_like(mu[j])
+            cu = jnp.zeros_like(mu[j])
             for e in outgoing[j]:
                 dst = params.edges[e][1]
                 acc = acc + weights[e].T @ xi[dst]
-                curv = curv + (weights[e] ** 2).T @ pi[dst]
-            g = g - phip * acc
-            L = L + phip ** 2 * curv
+                cu = cu + (weights[e] ** 2).T @ curv[dst]
+            g = g - phip[j] * acc
+            L = L + phip[j] ** 2 * cu
         g = g + params.leak * mu[j]
         L = L + params.leak
         # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
@@ -630,7 +836,11 @@ def pc_graph_relax(
     """
     steps = params.n_relax if n_steps is None else int(n_steps)
     hold = _build_hold(params, clamp, clamp_masks)
+    incoming = _incoming(params.edges, params.n_nodes)
     outgoing = _outgoing(params.edges, params.n_nodes)
+    ff_set = frozenset(params.feedforward_nodes)
+    ff_fwd_order = _feedforward_topo_order(params.feedforward_nodes, params.edges)
+    ff_rev_order = tuple(reversed(ff_fwd_order))
     weights, pi = state.weights, state.pi
     # Constant additive drive on each node across the sweep: the temporal-edge
     # prediction (μ_prev frozen) plus the node bias (an always-on unit).  Both
@@ -640,7 +850,10 @@ def pc_graph_relax(
     temporal = tuple(temporal[j] + state.bias[j] for j in range(params.n_nodes))
 
     def body(_, mu):
-        return _graph_relax_step(mu, weights, pi, params, outgoing, hold, temporal)
+        return _graph_relax_step(
+            mu, weights, pi, params, incoming, outgoing, hold, temporal,
+            ff_set, ff_fwd_order, ff_rev_order,
+        )
 
     mu = jax.lax.fori_loop(0, steps, body, state.mu)
     return eqx.tree_at(lambda s: s.mu, state, mu)
@@ -688,14 +901,28 @@ def pc_graph_learn(
     """
     act = params.act
     N, E = params.n_nodes, params.n_edges
+    ff_set = frozenset(params.feedforward_nodes)
+    frozen = frozenset(params.frozen_edges)
+    nlms = frozenset(params.nlms_edges)
+    # NLMS regulariser δ: one unit of feature energy, guarding the divide for a
+    # (near-)silent presynaptic population.  Negligible against a dense granule
+    # readout (‖φ‖² ~ cb_size) yet keeps the step finite when ‖φ‖² → 0.
+    nlms_delta = jnp.asarray(1.0, DTYPE)
     preds = pc_graph_predictions(state, params)
     eps = [state.mu[j] - preds[j] for j in range(N)]
 
     new_weights = list(state.weights)
     for e, (src, dst) in enumerate(params.edges):
-        new_weights[e] = state.weights[e] + params.eta_w * jnp.outer(
-            eps[dst], _phi(act, state.mu[src]),
-        )
+        if e in frozen:
+            continue                             # frozen projection (e.g. granule)
+        phi_src = _phi(act, state.mu[src])
+        step = params.eta_w * jnp.outer(eps[dst], phi_src)
+        if e in nlms:
+            # Natural-gradient (NLMS) step: normalise by presynaptic energy so
+            # a fixed η_w is stable for any feature scale.  One positive scalar
+            # ⇒ the gradient direction (and ∂F/∂W=0 fixed point) is unchanged.
+            step = step / (jnp.sum(phi_src ** 2) + nlms_delta)
+        new_weights[e] = state.weights[e] + step
 
     # Per-node generative bias = weight of an always-on (φ ≡ 1) unit, same
     # rule, only on the opted-in ``bias_nodes`` (elsewhere bias stays zero).
@@ -733,9 +960,13 @@ def pc_graph_learn(
         a = params.pi_alpha
         welford = params.precision_mode == PRECISION_WELFORD
         for j in range(N):
-            if j in params.fixed_pi_nodes:
+            if j in params.fixed_pi_nodes or j in ff_set:
                 # Flat-prior action node: precision held (not learned), so the
                 # goal can always move it (see PCGraphParams.fixed_pi_nodes).
+                # Feedforward node: ε ≡ 0 by construction, so there is no error
+                # stream to track — its precision stays at init (and is unused,
+                # since a feedforward node relays φ'-scaled child messages, not
+                # its own Π).
                 continue
             if welford:
                 # Mean-centred Welford EMA: tracks ε's running mean so a
@@ -841,6 +1072,8 @@ def init_region_graph(
     laminar_cortex: bool = False,
     working_memory: bool = False,
     wm_persistence_gain: float = 0.9,
+    marr_albus_cerebellum: bool = True,
+    granule_gain: float = 1.3,
     **graph_kwargs,
 ) -> tuple[PCGraphParams, PCGraphState]:
     """Instantiate every region as a node of a single PC graph (U.2).
@@ -919,6 +1152,18 @@ def init_region_graph(
     leaky integrator; Goldman-Rakic 1995).  ``(cortex_l3→pfc)`` feeds it the
     deep cortical cause, ``(pfc→cortex_l3)`` returns the held context.  No
     new rule, no new state type — only the named persistence gain.
+
+    ``marr_albus_cerebellum`` (opt-in, **default ``True``**) builds the forward
+    model as a true Marr–Albus circuit: the ``motor→cerebellum`` edge is a
+    *frozen* random granule expansion (:func:`apply_granule_expansion_init`,
+    scaled by ``granule_gain``), the cerebellum is a *feedforward* deterministic
+    layer (``feedforward_nodes``), and only ``cerebellum→sensory`` (Purkinje) is
+    plastic (NLMS-stabilised).  This is the fix for the forward-model collapse:
+    a plastic deep edge feeding a *free* wide cerebellum decays to predict-the-
+    mean under the one rule (the over-complete latent reconstructs the clamped
+    reafference off the motor manifold, and ``ΔW_mc ≈ −η·W_mc·φφᵀ`` drives the
+    edge to zero).  Set ``False`` for the legacy free-latent cerebellum
+    (diagnostics / ablation only).
 
     Multi-cycle **eligibility traces** (§6) are enabled with
     ``eligibility=True`` (flows through to :func:`init_pc_graph_params`):
@@ -1020,19 +1265,49 @@ def init_region_graph(
         edges.append((pfc_idx, gran("cortex_l3")))
         dyn_edges.append((pfc_idx, pfc_idx))
 
+    edges_t = tuple(edges)
+    mc_edge = _edge_index(edges_t, R["motor"], R["cerebellum"])
+    cs_edge = _edge_index(edges_t, R["cerebellum"], R["sensory"])
+
+    if marr_albus_cerebellum:
+        # Marr–Albus forward model: the motor→cerebellum granule expansion is a
+        # FROZEN random non-linearity and the cerebellum is a FEEDFORWARD
+        # (deterministic) layer, so there is no deep *plastic* edge into a free
+        # hidden layer to collapse to predict-the-mean.  Only the
+        # cerebellum→sensory Purkinje readout is plastic, learned on a fixed
+        # rich basis (NLMS-stabilised: ‖φ‖² ~ cb_size makes plain LMS diverge).
+        # The cerebellum's bias is the fixed random granule threshold, so it is
+        # NOT a learnable bias node — only the readout DC term (sensory) is.
+        frozen_edges = (mc_edge,)
+        feedforward_nodes = (R["cerebellum"],)
+        nlms_edges = (cs_edge,)
+        bias_nodes = (R["sensory"],)
+    else:
+        # Legacy free-latent cerebellum with a plastic deep edge (collapses —
+        # kept only for diagnostics / ablation).
+        frozen_edges = ()
+        feedforward_nodes = ()
+        nlms_edges = ()
+        bias_nodes = (R["sensory"], R["cerebellum"])
+
     params = init_pc_graph_params(
-        tuple(sizes), tuple(edges), dyn_edges=tuple(dyn_edges),
+        tuple(sizes), edges_t, dyn_edges=tuple(dyn_edges),
         # The motor node is the action variable of active inference: its flat
         # prior must not be overwritten by precision learning (see
         # PCGraphParams.fixed_pi_nodes / core.pc_active.set_action_prior).
         fixed_pi_nodes=(R["motor"],),
-        # The forward-model output (sensory) and its hidden layer (cerebellum)
-        # carry a learnable DC bias so they can reconstruct the non-zero-mean
-        # population-coded reafference (see PCGraphParams.bias_nodes).
-        bias_nodes=(R["sensory"], R["cerebellum"]),
+        bias_nodes=bias_nodes,
+        frozen_edges=frozen_edges,
+        feedforward_nodes=feedforward_nodes,
+        nlms_edges=nlms_edges,
         **graph_kwargs,
     )
-    state = init_pc_graph_state(key, params)
+    k_state, k_granule = split_key(key, 2)
+    state = init_pc_graph_state(k_state, params)
+    if marr_albus_cerebellum:
+        state = apply_granule_expansion_init(
+            state, params, R["motor"], R["cerebellum"], k_granule, gain=granule_gain,
+        )
     if gabor_foveal_init is not None:
         state = apply_foveal_gabor_init(
             state, params, out("cortex_l1"), R["sensory"], gabor_foveal_init,

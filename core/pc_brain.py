@@ -54,9 +54,21 @@ class PCBrainParams(eqx.Module):
 
     sensory_idx: int = eqx.field(static=True)
     motor_idx: int = eqx.field(static=True)
+    cerebellum_idx: int = eqx.field(static=True)
     value_idx: int = eqx.field(static=True)
     policy_idx: int = eqx.field(static=True)
     cortex_top_idx: int = eqx.field(static=True)
+
+    @property
+    def action_pathway(self) -> tuple[int, ...]:
+        """Nodes that relax during goal-directed action (active inference).
+
+        The motor command and its forward-model hidden layer (the
+        cerebellum); every other node is held at its perceptual belief so the
+        goal is satisfied by *action*, not by re-explaining perception
+        (:func:`core.pc_active.pc_act_infer` ``free_nodes``).
+        """
+        return (self.motor_idx, self.cerebellum_idx)
 
     @property
     def sensory_dim(self) -> int:
@@ -92,6 +104,7 @@ def init_pc_brain(
         graph=gp,
         sensory_idx=REGION_INDEX["sensory"],
         motor_idx=REGION_INDEX["motor"],
+        cerebellum_idx=REGION_INDEX["cerebellum"],
         value_idx=REGION_INDEX["value"],
         policy_idx=REGION_INDEX["policy"],
         cortex_top_idx=REGION_INDEX["cortex_l3"],
@@ -220,21 +233,27 @@ def pc_brain_act(
 
     Active inference: clamp the *preferred* reafference on the sensory
     node, relax with the (flat-prior) motor node free; the motor belief
-    that explains the preference through the motor→sensory forward model
-    is the command (Adams, Shipp & Friston 2013 — "predictions, not
-    commands").  Requires a trained forward model
+    that explains the preference through the motor→cerebellum→sensory
+    forward model is the command (Adams, Shipp & Friston 2013 —
+    "predictions, not commands").  Requires a trained forward model
     (:func:`pc_brain_learn_forward` during babbling).
 
     ``preference_mask`` makes the goal *partial* — pin only some sensory
     channels (e.g. the target-error channels to "on target") and leave
     the rest (proprioception) to be inferred.  ``observations`` clamps
     further sensory context whole.
+
+    Inference is confined to the **action pathway** (``params.action_pathway``
+    = motor + cerebellum); the perceptual hierarchy is held at its current
+    belief so the goal is met by inferring a command, not by re-explaining
+    the preferred outcome with the cortical causes (:func:`pc_act_infer`).
     """
     out = pc_act_infer(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
         preference=preferred_sensory, preference_mask=preference_mask,
-        observations=observations, n_steps=n_relax,
+        observations=observations, free_nodes=params.action_pathway,
+        n_steps=n_relax,
     )
     return PCBrainActOutput(
         joint_command=jnp.tanh(out.command).astype(DTYPE),
@@ -265,6 +284,7 @@ def pc_brain_learn_forward(
         state.graph, params.graph,
         motor_idx=params.motor_idx, outcome_idx=params.sensory_idx,
         command=command, realised_outcome=realised_sensory,
+        free_nodes=params.action_pathway,
         **({} if n_relax is None else {"n_relax": int(n_relax)}),
     )
     return PCBrainState(graph=new_graph)

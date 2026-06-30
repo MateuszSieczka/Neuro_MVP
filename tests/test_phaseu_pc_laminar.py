@@ -45,9 +45,9 @@ def test_laminar_is_additive_and_preserves_readouts():
     gp0, _ = init_region_graph(jax.random.PRNGKey(0))
     gp1, _ = init_region_graph(jax.random.PRNGKey(0), laminar_cortex=True)
 
-    assert gp0.n_nodes == 11 and gp0.n_edges == 15
+    assert gp0.n_nodes == 11 and gp0.n_edges == 14
     # +2 nodes per cortical region (L4, L5) and +2 intra edges per region.
-    assert gp1.n_nodes == 17 and gp1.n_edges == 21
+    assert gp1.n_nodes == 17 and gp1.n_edges == 20
 
     # Base region names/sizes (incl. the cortex_l* read-outs) unchanged.
     for name in REGION_NODES:

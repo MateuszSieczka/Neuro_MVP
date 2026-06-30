@@ -45,11 +45,10 @@ def test_reach_goal_is_target_specific():
     (The bug this guards: a target-independent goal makes the inferred command
     target-blind, so reaching can only succeed by chance.)
     """
-    import equinox as eqx
-    from embodiment.mjx_arm_body import _sample_target
     _, _, body = _tiny_reacher(jax.random.PRNGKey(0))
-    body_a = body._set_target(_sample_target(jax.random.PRNGKey(10), body.cfg))
-    body_b = body._set_target(_sample_target(jax.random.PRNGKey(11), body.cfg))
+    body_a, _ = body.reset(jax.random.PRNGKey(10))
+    body_b, _ = body.reset(jax.random.PRNGKey(11))
+    assert not jnp.allclose(body_a.target_xy, body_b.target_xy)   # sanity: diff targets
     pref_a, _ = body_a.reach_goal()
     pref_b, _ = body_b.reach_goal()
     assert not jnp.allclose(pref_a, pref_b)

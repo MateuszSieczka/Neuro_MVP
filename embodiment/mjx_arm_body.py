@@ -32,7 +32,7 @@ from core.backend import DTYPE, Array, PRNGKey
 from sensory import (
     DEFAULT_VELOCITY_RANGE_FACTOR,
     ProprioceptionParams, init_proprioception_params,
-    proprio_encode, gaussian_population_encode,
+    proprio_encode, monotonic_population_encode,
 )
 
 from .body_interface import (
@@ -151,10 +151,13 @@ def _arm_sensory_layout(cfg: ArmConfig) -> SensoryLayout:
 
     The tip channels are the *controllable, learnable* coordinate frame the
     reach goal lives in: ``tip = FK(joint angles)`` is a pure function of the
-    motor command, so the ``motor→sensory`` forward model can predict it (and
-    active inference can invert it) — unlike an absolute target, which is
-    exogenous.  The goal ("tip at target") is then a target-specific clamp on
-    these channels (:meth:`MjxArmBody.reach_goal`).
+    motor command, so the ``motor→cerebellum→sensory`` forward model can
+    predict it (and active inference can invert it) — unlike an absolute
+    target, which is exogenous.  The tip uses a **monotonic** population code
+    (:func:`sensory.monotonic_population_encode`) so the clamped reach goal is
+    invertible everywhere; proprioception stays a Gaussian code (it is an
+    afferent read-out, not an inversion target).  The goal ("tip at target")
+    is a target-specific clamp on these channels (:meth:`MjxArmBody.reach_goal`).
     """
     proprio_size = cfg.n_joints * 2 * cfg.n_cells_per_joint
     named: list[tuple[str, int]] = [(SEG_PROPRIOCEPTION, proprio_size)]
@@ -336,18 +339,21 @@ class MjxArmBody(eqx.Module, BodyInterface):
         """Partial sensory preference for "tip on target" + its pin mask.
 
         Returns ``(preference, mask)`` for :func:`core.pc_brain.pc_brain_act`:
-        the absolute tip-position channels are pinned to the population code of
-        the **observed target** position; proprioception is left free for the
-        brain to infer.  Target-**specific** — the goal carries the target in
-        the tip coordinate frame, so relaxing the (flat-prior) motor node
-        inverts the ``motor→tip`` forward model to a target-dependent command.
+        the absolute tip-position channels are pinned to the **monotonic**
+        population code of the **observed target** position; proprioception is
+        left free for the brain to infer.  Target-**specific** — the goal
+        carries the target in the tip coordinate frame, so relaxing the
+        (flat-prior) motor node inverts the ``motor→cerebellum→tip`` forward
+        model to a target-dependent command.
 
         This is the active-inference reach of Adams, Shipp & Friston (2013):
         set the desired (proprioceptive/tip) outcome, infer the command that
-        realises it.  Encoding the goal as *absolute tip* (a function of the
-        command) rather than *target-error* (which mixes in the exogenous
-        target) is what makes the forward model learnable and the inferred
-        command actually steer to different targets.
+        realises it.  The tip uses the *monotonic* code (not a Gaussian bump)
+        precisely because active inference inverts it: a bump goal makes the
+        free-energy (L2) gradient vanish wherever the predicted tip is off the
+        target bump, so the command is never driven; the monotonic code keeps
+        the gradient non-zero across the whole workspace
+        (:func:`sensory.monotonic_population_encode`).
         """
         if not self.cfg.include_target_in_sensory:
             raise ValueError(
@@ -355,10 +361,10 @@ class MjxArmBody(eqx.Module, BodyInterface):
                 "build the body with include_target=True"
             )
         half = self.cfg.workspace_half
-        tgt_x_code = gaussian_population_encode(
+        tgt_x_code = monotonic_population_encode(
             self.target_xy[0], self.cfg.n_target_cells, x_min=-half, x_max=half,
         )
-        tgt_y_code = gaussian_population_encode(
+        tgt_y_code = monotonic_population_encode(
             self.target_xy[1], self.cfg.n_target_cells, x_min=-half, x_max=half,
         )
         preference = jnp.zeros(self.sensory_layout.total, DTYPE)
@@ -393,11 +399,14 @@ class MjxArmBody(eqx.Module, BodyInterface):
             half = self.cfg.workspace_half
             # Absolute tip position (a pure function of the joint angles, hence
             # of the motor command) — the learnable frame the reach goal lives
-            # in.  Tip ∈ [−(L1+L2), L1+L2] = [−half, half] for this arm.
-            tx_code = gaussian_population_encode(
+            # in.  Tip ∈ [−(L1+L2), L1+L2] = [−half, half] for this arm.  The
+            # *monotonic* code (not a Gaussian bump) so the reach goal clamped
+            # on these channels stays invertible (non-vanishing free-energy
+            # gradient) across the whole workspace.
+            tx_code = monotonic_population_encode(
                 tip_xy[0], self.cfg.n_target_cells, x_min=-half, x_max=half,
             )
-            ty_code = gaussian_population_encode(
+            ty_code = monotonic_population_encode(
                 tip_xy[1], self.cfg.n_target_cells, x_min=-half, x_max=half,
             )
             sensory = jnp.concatenate([proprio, tx_code, ty_code])

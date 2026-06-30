@@ -4,9 +4,14 @@ This is the big-bang of Faza U: **one rule on a shared graph**.  Every
 biological region becomes a node (a :class:`~core.pc_module` value
 population μ with its own precision Π); every projection becomes a
 generative edge with weights ``W``; the *only* plasticity rule anywhere
-is the local, precision-weighted Hebbian descent on free energy
+is the local, curvature-preconditioned Hebbian descent on free energy
 
-    ΔW_(i→j) = η_w · ξ_j ⊗ φ(μ_i)            ξ_j = Π_j ⊙ ε_j
+    ΔW_(i→j) = η_w · ε_j ⊗ φ(μ_i)
+
+(raw gradient ``−ξ_j ⊗ φ(μ_i)``, ``ξ_j = Π_j ⊙ ε_j``; dividing by the edge
+curvature ``∝ Π_j`` cancels the precision so the step is stable for any ``Π``
+— the learning twin of the preconditioned μ-step below, same fixed point
+``∂F/∂W = 0``; precision still sets the inference metric)
 
 and the *only* inference is relaxation of the value nodes on the same
 free energy
@@ -101,6 +106,22 @@ class PCGraphParams(eqx.Module):
     n_relax: int = eqx.field(static=True)
     precision_mode: str = eqx.field(static=True)  # PRECISION_EMA | PRECISION_WELFORD
     elig_mode: bool = eqx.field(static=True)      # multi-cycle eligibility on w_dyn edges
+    #: Nodes whose precision Π is held fixed (not tracked by the ε² EMA) — the
+    #: flat-prior *action* nodes of active inference (:func:`set_action_prior`).
+    #: An action variable carries no prior preference and is inferred purely to
+    #: satisfy a goal, so its precision must stay flat; without this the first
+    #: learning step overwrites the flat prior with the ε² EMA and the action
+    #: node becomes a stiff perceptual node that the goal can no longer move.
+    fixed_pi_nodes: tuple = eqx.field(static=True)
+    #: Nodes whose generative prediction carries a learnable DC ``bias`` term.
+    #: Empty by default ⇒ ``bias`` stays zero everywhere and every prediction
+    #: is byte-identical to the bias-free model.  Enabled only where the
+    #: generative target is non-zero-mean and a node must reconstruct it — the
+    #: forward-model output (``sensory``) and its hidden layer (``cerebellum``)
+    #: — *not* abstract/value nodes, where an always-on baseline would absorb
+    #: a reward and steal credit from the intermittent edges that should learn
+    #: it (the temporal-credit edges).
+    bias_nodes: tuple = eqx.field(static=True)
 
     @property
     def n_nodes(self) -> int:
@@ -146,10 +167,14 @@ def init_pc_graph_params(
     precision_mode: str = PRECISION_EMA,
     eligibility: bool = False,
     tau_elig_steps: float = 4.0,
+    fixed_pi_nodes: tuple[int, ...] = (),
+    bias_nodes: tuple[int, ...] = (),
 ) -> PCGraphParams:
     sizes = tuple(int(s) for s in node_sizes)
     edges = tuple((int(a), int(b)) for (a, b) in edges)
     dyn_edges = tuple((int(a), int(b)) for (a, b) in dyn_edges)
+    fixed_pi_nodes = tuple(sorted(int(j) for j in fixed_pi_nodes))
+    bias_nodes = tuple(sorted(int(j) for j in bias_nodes))
     for (a, b) in edges + dyn_edges:
         if not (0 <= a < len(sizes) and 0 <= b < len(sizes)):
             raise ValueError(f"edge ({a},{b}) out of range for {len(sizes)} nodes")
@@ -169,11 +194,21 @@ def init_pc_graph_params(
         node_sizes=sizes, edges=edges, dyn_edges=dyn_edges,
         act=act, n_relax=int(n_relax),
         precision_mode=precision_mode, elig_mode=bool(eligibility),
+        fixed_pi_nodes=fixed_pi_nodes, bias_nodes=bias_nodes,
     )
 
 
 class PCGraphState(eqx.Module):
     """Dynamic graph state: node beliefs μ, edge weights, node precision.
+
+    ``bias`` holds one vector per node — the generative prediction's DC term:
+    a node's top-down prediction is ``Σ_{i→j} W φ(μ_i) + bias_j``.  It is the
+    weight of an implicit always-on unit (``φ ≡ 1``) and learns by the same
+    one rule (``Δbias_j = η ε_j``); without it the generative model is forced
+    through the origin and cannot fit a non-zero-mean target (e.g. a
+    population code, whose activations are non-negative).  Initialised to 0,
+    so a freshly built graph is byte-identical to the bias-free model until it
+    learns.
 
     ``w_dyn`` holds one weight matrix per temporal edge
     (:attr:`PCGraphParams.dyn_edges`); ``mu_prev`` is the 1-cycle delayed
@@ -195,6 +230,7 @@ class PCGraphState(eqx.Module):
 
     mu: tuple              # (n_nodes) arrays, mu[j] shape (node_sizes[j],)
     weights: tuple         # (n_edges) arrays, W[e] shape (size[dst], size[src])
+    bias: tuple            # (n_nodes) arrays, bias[j] shape (node_sizes[j],)
     pi: tuple              # (n_nodes) arrays, pi[j] shape (node_sizes[j],)
     pe_var: tuple          # (n_nodes) arrays — EMA of ε² (Π = 1/(pe_var+floor))
     pe_mean: tuple         # (n_nodes) arrays — EMA of ε (Welford mode only; else 0)
@@ -219,13 +255,14 @@ def init_pc_graph_state(
     weights = [_lecun(keys[e], src, dst) for e, (src, dst) in enumerate(params.edges)]
     w_dyn = [_lecun(keys[E + e], src, dst) for e, (src, dst) in enumerate(params.dyn_edges)]
     mu = tuple(jnp.zeros(s, dtype) for s in sizes)
+    bias = tuple(jnp.zeros(s, dtype) for s in sizes)
     pi = tuple(jnp.ones(s, dtype) for s in sizes)
     pe_var = tuple(jnp.ones(s, dtype) for s in sizes)
     pe_mean = tuple(jnp.zeros(s, dtype) for s in sizes)
     mu_prev = tuple(jnp.zeros(s, dtype) for s in sizes)
     elig = tuple(jnp.zeros(sizes[src], dtype) for (src, _dst) in params.dyn_edges)
     return PCGraphState(
-        mu=mu, weights=tuple(weights), pi=pi, pe_var=pe_var, pe_mean=pe_mean,
+        mu=mu, weights=tuple(weights), bias=bias, pi=pi, pe_var=pe_var, pe_mean=pe_mean,
         w_dyn=tuple(w_dyn), mu_prev=mu_prev, elig=elig,
     )
 
@@ -436,13 +473,13 @@ def _temporal_predictions(
 
 
 def pc_graph_predictions(state: PCGraphState, params: PCGraphParams) -> tuple:
-    """Top-down prediction of each node = Σ over incoming spatial+temporal edges."""
+    """Top-down prediction of each node = Σ incoming spatial+temporal edges + bias."""
     act = params.act
     preds = [jnp.zeros(n, DTYPE) for n in params.node_sizes]
     for e, (src, dst) in enumerate(params.edges):
         preds[dst] = preds[dst] + state.weights[e] @ _phi(act, state.mu[src])
     temporal = _temporal_predictions(state.mu_prev, state.w_dyn, params)
-    return tuple(preds[j] + temporal[j] for j in range(params.n_nodes))
+    return tuple(preds[j] + temporal[j] + state.bias[j] for j in range(params.n_nodes))
 
 
 def pc_graph_errors(state: PCGraphState, params: PCGraphParams) -> tuple:
@@ -595,8 +632,12 @@ def pc_graph_relax(
     hold = _build_hold(params, clamp, clamp_masks)
     outgoing = _outgoing(params.edges, params.n_nodes)
     weights, pi = state.weights, state.pi
-    # Temporal-edge drive is constant across the sweep (μ_prev is frozen).
+    # Constant additive drive on each node across the sweep: the temporal-edge
+    # prediction (μ_prev frozen) plus the node bias (an always-on unit).  Both
+    # enter ε like an incoming prediction but, having a constant source,
+    # contribute no up-term and no curvature.
     temporal = _temporal_predictions(state.mu_prev, state.w_dyn, params)
+    temporal = tuple(temporal[j] + state.bias[j] for j in range(params.n_nodes))
 
     def body(_, mu):
         return _graph_relax_step(mu, weights, pi, params, outgoing, hold, temporal)
@@ -623,35 +664,56 @@ def pc_graph_learn(
     *,
     update_precision: bool = True,
 ) -> PCGraphState:
-    """One Hebbian step ``ΔW_(i→j) = η_w ξ_j ⊗ φ(μ_i)`` on every edge.
+    """One Hebbian step ``ΔW_(i→j) = η_w ε_j ⊗ φ(μ_i)`` on every edge.
 
-    The single plasticity rule of the whole brain.  Precision per node
-    tracks the EMA of ε² (Friston 2010 inverse-variance weighting).
-    Call after :func:`pc_graph_relax` so μ sits at the inference
-    equilibrium.
+    The single plasticity rule of the whole brain, **curvature-preconditioned**
+    — the learning analogue of the preconditioned μ-step in
+    :func:`_graph_relax_step`.  The raw free-energy gradient is
+    ``∂F/∂W_(i→j) = −ξ_j ⊗ φ(μ_i)`` with ``ξ_j = Π_j ε_j``; descending it with
+    a fixed ``η_w`` is **explicit Euler**, unstable once ``Π_j`` sharpens
+    (``Π → 1/var_floor``), so the precision-weighted error of a well-fit node
+    keeps driving its incoming weights even as ε → 0 — ``|W|`` then drifts
+    without bound (worst on a recurrent loop).  Dividing the step by the
+    edge's free-energy curvature ``∂²F/∂W² ∝ Π_j`` cancels that factor and
+    leaves ``ΔW = η_w ε_j ⊗ φ(μ_i)``: the effective step is ``≈ η_w`` for any
+    ``Π``, exactly as the μ-step's division by ``L_j`` makes the belief step
+    ``≈ η_μ``.  It is the same preconditioner, not a new rule — the stationary
+    point ``∂F/∂W = 0`` (hence the learned fixed point) is unchanged, and
+    precision still sets the *inference* metric (which μ, hence which ε, is
+    learned).  The per-node ``bias`` learns by the same rule with a constant
+    ``φ ≡ 1`` presynaptic factor.  Precision per node still tracks the EMA of
+    ε² for inference (Friston 2010), except for ``fixed_pi_nodes`` (flat-prior
+    action nodes) whose precision is held.  Call after :func:`pc_graph_relax`
+    so μ sits at the inference equilibrium.
     """
     act = params.act
     N, E = params.n_nodes, params.n_edges
     preds = pc_graph_predictions(state, params)
     eps = [state.mu[j] - preds[j] for j in range(N)]
-    xi = [state.pi[j] * eps[j] for j in range(N)]
 
     new_weights = list(state.weights)
     for e, (src, dst) in enumerate(params.edges):
         new_weights[e] = state.weights[e] + params.eta_w * jnp.outer(
-            xi[dst], _phi(act, state.mu[src]),
+            eps[dst], _phi(act, state.mu[src]),
         )
 
-    # Temporal edges learn by the *same* rule — the only difference is the
-    # presynaptic factor is the previous cycle's belief φ(μ_prev[src]).
-    # With ``elig_mode`` that presynaptic factor becomes a *decaying trace*
-    # of φ(μ_prev[src]) (§6 multi-cycle credit, the rate e-prop analogue):
-    # the commit ``ΔW = η·ξ_dst ⊗ elig`` then credits the edge for a
-    # presynaptic event several cycles before the error ξ_dst arrived — the
-    # destination's own precision-weighted error is the learning signal, so
-    # for the value / policy temporal edges that ξ *is* the RPE (DA), with
-    # no separate global modulator.  The trace is the one rule extended in
-    # time, not a second mechanism.
+    # Per-node generative bias = weight of an always-on (φ ≡ 1) unit, same
+    # rule, only on the opted-in ``bias_nodes`` (elsewhere bias stays zero).
+    new_bias = [
+        state.bias[j] + params.eta_w * eps[j] if j in params.bias_nodes
+        else state.bias[j]
+        for j in range(N)
+    ]
+
+    # Temporal edges learn by the *same* (preconditioned) rule — the only
+    # difference is the presynaptic factor is the previous cycle's belief
+    # φ(μ_prev[src]).  With ``elig_mode`` it becomes a *decaying trace* of
+    # φ(μ_prev[src]) (§6 multi-cycle credit, the rate e-prop analogue): the
+    # commit ``ΔW = η·ε_dst ⊗ elig`` then credits the edge for a presynaptic
+    # event several cycles before the error arrived — the destination's own
+    # error ε_dst is the learning signal, so for the value / policy temporal
+    # edges that ε *is* the RPE (DA / temporal-difference error itself, no
+    # longer scaled by precision), with no separate global modulator.
     new_w_dyn = list(state.w_dyn)
     new_elig = list(state.elig)
     for e, (src, dst) in enumerate(params.dyn_edges):
@@ -662,7 +724,7 @@ def pc_graph_learn(
             presyn = trace
         else:
             presyn = phi_prev
-        new_w_dyn[e] = state.w_dyn[e] + params.eta_w * jnp.outer(xi[dst], presyn)
+        new_w_dyn[e] = state.w_dyn[e] + params.eta_w * jnp.outer(eps[dst], presyn)
 
     new_pi = list(state.pi)
     new_pe_var = list(state.pe_var)
@@ -671,6 +733,10 @@ def pc_graph_learn(
         a = params.pi_alpha
         welford = params.precision_mode == PRECISION_WELFORD
         for j in range(N):
+            if j in params.fixed_pi_nodes:
+                # Flat-prior action node: precision held (not learned), so the
+                # goal can always move it (see PCGraphParams.fixed_pi_nodes).
+                continue
             if welford:
                 # Mean-centred Welford EMA: tracks ε's running mean so a
                 # biased error stream is not permanently low-precision.
@@ -686,7 +752,7 @@ def pc_graph_learn(
                 new_pi[j] = 1.0 / (pe_var_j + params.var_floor)
 
     return PCGraphState(
-        mu=state.mu, weights=tuple(new_weights),
+        mu=state.mu, weights=tuple(new_weights), bias=tuple(new_bias),
         pi=tuple(new_pi), pe_var=tuple(new_pe_var), pe_mean=tuple(new_pe_mean),
         w_dyn=tuple(new_w_dyn), mu_prev=state.mu_prev, elig=tuple(new_elig),
     )
@@ -763,7 +829,10 @@ def init_region_graph(
     motor_size: int = 8,
     value_size: int = 1,
     policy_size: int = 4,
-    cb_size: int = 8,
+    # Cerebellum = hidden nonlinear layer of the motor→sensory forward model
+    # (Marr-Albus granule expansion): wide enough to represent the
+    # population-coded reafference as a tanh basis for the linear readout.
+    cb_size: int = 64,
     hc_size: int = 16,
     ec_size: int = 32,
     pfc_size: int = 32,
@@ -780,21 +849,24 @@ def init_region_graph(
       cortical hierarchy generates sensory : c1→sensory, c2→c1, c3→c2
       world model is a cortical cause of sensory : c3→wm, wm→sensory
       value & policy read the deep cortical cause : c3→value, c3→policy
-      motor predicted by cortex + cerebellum : c3→motor, cb→motor
-      efference copy closes a forward-model loop : motor→cb   (cycle!)
-      motor predicts its proprioceptive reafference : motor→sensory
-        (the forward model used by active inference, U.5 — preferring a
-         sensory outcome infers the motor command, Adams 2013)
+      motor predicted by cortex : c3→motor
+      forward model = motor → cerebellum → sensory : motor→cb, cb→sensory
+        (the cerebellum is the hidden nonlinear layer — Marr-Albus granule
+         expansion — that makes the motor→reafference map representable, so
+         active inference can invert a preferred sensory outcome to a motor
+         command, Adams 2013; a direct linear motor→sensory edge cannot
+         generate the population-coded reafference)
       entorhinal convergence feeds the hippocampus : c3→ec, motor→ec, ec→hc
         (EC is a multi-parent hub integrating the deep cortical cause and
          the motor efference, Witter 2007; the hippocampus reads it and
          completes back to cortex)
       hippocampal completion feedback : hc→c1
 
-    The motor↔cerebellum cycle and the multi-parent EC node both exercise
-    the arbitrary-topology claim (Salvatori 2022) — relaxation handles
-    them without a feedforward order.  Every edge learns by the one rule;
-    there are no per-region rules.
+    The motor→cerebellum→sensory→…→motor loop (closed through the cortical
+    generative model) and the multi-parent EC node both exercise the
+    arbitrary-topology claim (Salvatori 2022) — relaxation handles them
+    without a feedforward order.  Every edge learns by the one rule; there
+    are no per-region rules.
 
     ``gabor_foveal_init`` (opt-in, default ``None`` ⇒ unchanged LeCun init)
     seeds the ``cortex_l1→sensory`` generative edge with a foveal Gabor
@@ -892,8 +964,7 @@ def init_region_graph(
 
     # Inter-region generative edges: descend from a region's L5 output into
     # the lower region's L4 granular layer; deep consumers read L5_cortex_l3.
-    # With ``laminar_cortex=False`` every out()/gran() is the base node, so
-    # this reproduces the original 15-edge graph in the original order.
+    # With ``laminar_cortex=False`` every out()/gran() is the base node.
     edges = [
         (out("cortex_l1"), R["sensory"]),
         (out("cortex_l2"), gran("cortex_l1")),
@@ -903,9 +974,19 @@ def init_region_graph(
         (out("cortex_l3"), R["value"]),
         (out("cortex_l3"), R["policy"]),
         (out("cortex_l3"), R["motor"]),
-        (R["cerebellum"], R["motor"]),
+        # Forward model = motor → cerebellum → sensory: the cerebellum is the
+        # *hidden nonlinear layer* (Marr-Albus granule expansion) that makes
+        # the motor→reafference map representable.  A single direct
+        # motor→sensory edge is linear in φ(motor) and cannot generate the
+        # population-coded (nonlinear) reafference, so active inference had
+        # nothing accurate to invert; routing through the cerebellum's tanh
+        # nonlinearity does.  Generative/top-down: the motor command (cause)
+        # predicts the cerebellar state, which predicts the sensory effect
+        # (Adams, Shipp & Friston 2013).  No cerebellum→motor edge — that made
+        # a recurrent motor↔cerebellum cycle whose precision-weighted weights
+        # ran away and gave the goal a second, action-free way to be explained.
         (R["motor"], R["cerebellum"]),
-        (R["motor"], R["sensory"]),
+        (R["cerebellum"], R["sensory"]),
         (out("cortex_l3"), R["entorhinal"]),
         (R["motor"], R["entorhinal"]),
         (R["entorhinal"], R["hippocampus"]),
@@ -940,7 +1021,16 @@ def init_region_graph(
         dyn_edges.append((pfc_idx, pfc_idx))
 
     params = init_pc_graph_params(
-        tuple(sizes), tuple(edges), dyn_edges=tuple(dyn_edges), **graph_kwargs,
+        tuple(sizes), tuple(edges), dyn_edges=tuple(dyn_edges),
+        # The motor node is the action variable of active inference: its flat
+        # prior must not be overwritten by precision learning (see
+        # PCGraphParams.fixed_pi_nodes / core.pc_active.set_action_prior).
+        fixed_pi_nodes=(R["motor"],),
+        # The forward-model output (sensory) and its hidden layer (cerebellum)
+        # carry a learnable DC bias so they can reconstruct the non-zero-mean
+        # population-coded reafference (see PCGraphParams.bias_nodes).
+        bias_nodes=(R["sensory"], R["cerebellum"]),
+        **graph_kwargs,
     )
     state = init_pc_graph_state(key, params)
     if gabor_foveal_init is not None:

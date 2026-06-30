@@ -13,7 +13,9 @@ Audio (cochlea/MGN) is deferred to a later milestone; ``mgn_normalize``
 reduces to :func:`lgn_normalize`, so it is mostly free once needed.
 """
 
-from .population_code import gaussian_population_encode
+from .population_code import (
+    gaussian_population_encode, monotonic_population_encode,
+)
 from .proprioception import (
     DEFAULT_VELOCITY_RANGE_FACTOR,
     ProprioceptionParams,
@@ -51,6 +53,7 @@ from .vision import (
 __all__ = [
     # proprioception (§1)
     "gaussian_population_encode",
+    "monotonic_population_encode",
     "DEFAULT_VELOCITY_RANGE_FACTOR",
     "ProprioceptionParams",
     "init_proprioception_params",

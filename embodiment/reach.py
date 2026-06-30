@@ -40,8 +40,9 @@ class ReachConfig(NamedTuple):
     success_bonus: float = 1.0
     #: Relaxation steps for the action-inference (planning) relaxation.
     act_relax_steps: int = 80
-    #: Settling steps inside each closed-loop forward-model update.
-    forward_settle_steps: int = 1
+    #: Settling steps inside each closed-loop forward-model update.  ``None``
+    #: ⇒ the graph's ``n_relax`` (the cerebellar hidden cause must settle).
+    forward_settle_steps: int | None = None
 
 
 def build_reacher(

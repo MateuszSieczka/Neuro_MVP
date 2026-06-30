@@ -52,7 +52,9 @@ def test_region_graph_temporal_opt_in_is_additive():
     gp1, gs1 = init_region_graph(jax.random.PRNGKey(0), temporal_edges=True)
 
     # Spatial topology is identical; temporal edges are the only addition.
-    assert gp0.n_edges == gp1.n_edges == 15
+    # 14 spatial edges: the forward model is motor→cerebellum→sensory (two
+    # edges, no direct motor→sensory and no cerebellum→motor cycle).
+    assert gp0.n_edges == gp1.n_edges == 14
     assert gp0.n_dyn_edges == 0 and len(gs0.w_dyn) == 0
     assert gp1.n_dyn_edges == 2 and len(gs1.w_dyn) == 2
 

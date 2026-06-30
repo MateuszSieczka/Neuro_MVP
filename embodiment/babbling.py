@@ -47,8 +47,11 @@ class BabbleConfig(NamedTuple):
     #: Steady-state std of the OU process in *belief* (pre-tanh) units; large
     #: enough that ``tanh`` spans most of the actuator range.
     sigma: float = 1.5
-    #: Settling steps inside each forward-model update (both ends clamped).
-    forward_settle_steps: int = 1
+    #: Settling steps inside each forward-model update.  ``None`` ⇒ the graph's
+    #: ``n_relax`` — the motor→cerebellum→sensory forward model has a hidden
+    #: cerebellar cause that must settle like any latent (a 1-step settle
+    #: leaves it unsettled and the model mis-fit).
+    forward_settle_steps: int | None = None
 
 
 def ou_babble_step(

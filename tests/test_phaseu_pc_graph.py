@@ -147,7 +147,7 @@ def test_region_graph_runs_one_cycle():
     )
     # Every region is present as a node.
     assert params.n_nodes == 11
-    assert params.n_edges == 15
+    assert params.n_edges == 14
 
     s_idx = REGION_INDEX["sensory"]
     obs = jax.random.normal(jax.random.PRNGKey(7), (params.node_sizes[s_idx],))

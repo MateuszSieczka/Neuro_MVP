@@ -46,6 +46,17 @@ from .pc_active import (
     scale_node_precision, epistemic_value,
 )
 
+#: Motor **effort/cost precision** — the action node's weak zero-mean prior
+#: (Todorov 2004; Friston 2010 action priors).  Set two orders of magnitude
+#: below the outcome precision (Π_sensory = 1) so it is sub-dominant to the
+#: goal once the forward model has any gain — it does not bias the reach — yet
+#: floors the action's Gauss–Newton Hessian ``H ⪰ effort·I > 0``, so the
+#: inferred command can never freeze on the tanh saturation rails (where the
+#: Jacobian collapses and a strictly flat Π = 0 prior would leave ``H``
+#: singular).  Not a tuning knob: it is a scale separation between effort and
+#: outcome, the canonical motor-cost term of optimal control / active inference.
+MOTOR_EFFORT_PRECISION = 0.01
+
 
 class PCBrainParams(eqx.Module):
     """Region graph + the read-out node indices (static)."""
@@ -93,10 +104,12 @@ def init_pc_brain(
     gp, gs = init_region_graph(
         key, sensory_size=sensory_size, motor_size=motor_size, **graph_kwargs,
     )
-    # Action node carries a flat prior (active inference: the command is
-    # inferred to satisfy preferences, it has no prior preference of its
-    # own — Friston 2010).  Set once at construction (U.5).
-    gs = set_action_prior(gs, REGION_INDEX["motor"])
+    # Action node carries a weak effort prior (active inference: the command is
+    # inferred to satisfy preferences and has no prior *preference* of its own,
+    # only a small zero-mean motor-cost precision — Friston 2010; Todorov 2004).
+    # Set once at construction (U.5); kept fixed by ``fixed_pi_nodes`` and used
+    # by the full Gauss–Newton action step (``action_nodes``).
+    gs = set_action_prior(gs, REGION_INDEX["motor"], precision=MOTOR_EFFORT_PRECISION)
     params = PCBrainParams(
         graph=gp,
         sensory_idx=REGION_INDEX["sensory"],

@@ -897,14 +897,32 @@ def _graph_relax_step(
         xi[j] = phip[j] * acc
         curv[j] = phip[j] ** 2 * cacc
 
-    def _action_hessian(j: int) -> Array:
-        """Full Gauss–Newton Hessian ``H = JᵀΠJ (+ leak·I)`` of action node ``j``.
+    def _action_gn(j: int) -> tuple[Array, Array]:
+        """Gauss–Newton ``(H, g_child)`` of action node ``j`` over its cone.
 
         One forward pass pushes the tangent ``S`` (``∂φ/∂μ_j``, seeded as
-        ``diag(φ'(μ_j))``) down the node's feedforward cone; at each free leaf
-        the accumulated prediction-Jacobian ``Jpred`` contributes ``Jpredᵀ Π
-        Jpred``.  The ``leak·I`` term is the flat prior's minimum-norm
-        regulariser (identical to the ``+leak`` on the diagonal step).
+        ``diag(φ'(μ_j))``) down the node's feedforward cone; at each leaf the
+        accumulated prediction-Jacobian ``Jpred = ∂ŷ_leaf/∂μ_j`` yields both the
+        metric contribution ``Jpredᵀ (Π⊙hold) Jpred`` and the matching gradient
+        contribution ``Jpredᵀ (Π⊙hold) ε_leaf`` — assembled together so ``H``
+        and ``g`` are the *same* linearisation (an ``H`` from one operator and a
+        ``g`` from another gives a meaningless step).
+
+        Only **held** (clamped) leaf dimensions enter: a goal or observation is
+        a genuine constraint the command must satisfy, whereas a *free*
+        descendant co-relaxes to follow the command (its error → 0 at the joint
+        minimum) and contributes nothing to the action's effective inversion —
+        the Schur complement of marginalising the free descendants out
+        (envelope theorem).  This is what makes the step an inversion of the
+        *goal* rather than a compromise with the command's own free consequences
+        (proprioceptive reafference, efference copy) — which, mixed into an
+        unmasked gradient, decorrelate the command from the true inverse
+        entirely.  ``g_child`` is ``∂(child free energy)/∂μ_j``; the caller adds
+        the own-prior term.  The ``(leak+Π_j)·I`` diagonal is the action's weak
+        effort/cost prior (Todorov 2004; Friston 2010): negligible against the
+        goal curvature once the forward model has any gain, but it keeps ``H``
+        non-singular and pulls the command off the tanh rails, where φ'→0
+        collapses the Jacobian and a purely flat prior freezes it at saturation.
         """
         d = params.node_sizes[j]
         eye = jnp.eye(d, dtype=DTYPE)
@@ -915,19 +933,44 @@ def _graph_relax_step(
             for e in cone_edges:
                 jp = jp + weights[e] @ tangent[params.edges[e][0]]
             tangent[c] = phip[c][:, None] * jp
-        H = params.leak * eye
+        H = (params.leak + pi[j]) * eye
+        g_child = jnp.zeros(d, DTYPE)
         for leaf, cone_edges in leaves:
             jp = jnp.zeros((params.node_sizes[leaf], d), DTYPE)
             for e in cone_edges:
                 jp = jp + weights[e] @ tangent[params.edges[e][0]]
-            H = H + jp.T @ (pi[leaf][:, None] * jp)
-        return H
+            weight = pi[leaf] * hold[leaf].astype(DTYPE)   # constrained dims only
+            eps_leaf = mu[leaf] - pred_full[leaf]
+            H = H + jp.T @ (weight[:, None] * jp)
+            # ∂F/∂μ_j through this leaf: ε = μ_leaf − pred_leaf, ∂ε/∂μ_j = −Jpred.
+            g_child = g_child - jp.T @ (weight * eps_leaf)
+        return H, g_child
 
     # Update free nodes by the curvature-preconditioned gradient step.
     new_mu = list(mu)
     for j in range(N):
         if j in ff_set:
             continue                             # already set to its prediction
+        if j in action_set:
+            # Flat-prior action: the diagonal metric is degenerate (step
+            # ∝ ε/‖W‖², freezes as the model sharpens).  Step by the full
+            # Gauss–Newton natural gradient over the node's cone — the
+            # (minimum-norm) pseudo-inverse of ``H = JᵀΠJ`` — with ``g`` and
+            # ``H`` from the *same* linearisation and both restricted to the
+            # held (goal/observation) leaf dims.  Scale-covariant: the
+            # forward-model gain carried by ``g`` and ``H`` cancels in ``H⁺g``,
+            # so the command no longer vanishes as the model sharpens.  Scaled
+            # by the same ``η_μ`` as every node — the graph relaxes all free
+            # nodes together (Jacobi), so a uniform sub-unit step keeps the
+            # action in lock-step with its co-relaxing children; a full Newton
+            # jump on one coordinate desynchronises that coupled system.  The
+            # scale-freeness is in the direction/magnitude of ``H⁺g``; ``η_μ``
+            # only rescales it uniformly.
+            H, g_child = _action_gn(j)
+            g = xi[j] + params.leak * mu[j] + g_child
+            updated = mu[j] - params.eta_mu * (jnp.linalg.pinv(H) @ g)
+            new_mu[j] = jnp.where(hold[j], mu[j], updated)
+            continue
         g = xi[j]
         L = pi[j]
         # source term: this node predicts each of its children — the error
@@ -944,16 +987,8 @@ def _graph_relax_step(
             L = L + phip[j] ** 2 * cu
         g = g + params.leak * mu[j]
         L = L + params.leak
-        if j in action_set:
-            # Flat-prior action: the diagonal metric ``L`` is degenerate (step
-            # ∝ ε/‖W‖², freezes as the model sharpens).  Step by the full
-            # Gauss–Newton natural gradient, scale-covariant via the
-            # (minimum-norm) pseudo-inverse of ``H = JᵀΠJ``.
-            H = _action_hessian(j)
-            updated = mu[j] - params.eta_mu * (jnp.linalg.pinv(H) @ g)
-        else:
-            # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
-            updated = mu[j] - params.eta_mu * g / (L + tiny)
+        # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
+        updated = mu[j] - params.eta_mu * g / (L + tiny)
         # Free dimensions descend the gradient; held ones keep their value.
         new_mu[j] = jnp.where(hold[j], mu[j], updated)
     return tuple(new_mu)

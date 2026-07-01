@@ -161,6 +161,35 @@ class PCGraphParams(eqx.Module):
     #: (and the ``∂F/∂W=0`` fixed point) is unchanged; only the rate adapts.
     #: Empty by default ⇒ plain LMS everywhere, byte-identical to before.
     nlms_edges: tuple = eqx.field(static=True)
+    #: **Action nodes** — flat-prior causes inferred by the *full Gauss–Newton*
+    #: natural gradient instead of the diagonal-Newton step every other node
+    #: uses.  The per-node update ``μ ← μ − η_μ·L_j⁻¹ g_j`` is diagonal-Newton
+    #: only because ``L_j`` is taken as the *diagonal* of the free-energy
+    #: curvature — an approximation that is exact enough for a perceptual node,
+    #: where the node's own precision ``Π_j`` dominates ``L_j``.  An action node
+    #: has a flat prior (``Π = 0``, :func:`core.pc_active.set_action_prior`), so
+    #: its curvature is *entirely* the child-relayed term ``JᵀΠ_childJ`` of a
+    #: low-dimensional cause fanning into a high-gain forward model.  The
+    #: diagonal of that matrix is a **degenerate metric**: it drops the
+    #: off-diagonal cross-coupling between action dimensions and scales as the
+    #: square of the forward-model gain, so the inferred command ``∝ ε/‖W‖²``
+    #: freezes as the model sharpens — a *better* forward model yields a *more*
+    #: frozen command (the reach-inversion pathology).  For these nodes the
+    #: step therefore uses the **full** Gauss–Newton Hessian ``H_j = JᵀΠJ`` (the
+    #: exact natural metric for inverting ``y = f(μ_j)``), assembled by one
+    #: matrix-tangent forward pass down the node's feedforward cone and solved
+    #: by a scale-covariant pseudo-inverse (minimum-norm command in the
+    #: forward model's null space — the correct treatment of a flat prior).  The
+    #: action dimension is the number of actuators (tiny and model-independent),
+    #: so ``H_j`` is a small dense ``d×d`` solve while the Jacobian assembly is
+    #: linear in the cone's edge count — the metric stays exact at any model
+    #: depth/width, where the cheaper diagonal-relay approximation would
+    #: compound its error through every layer.  Must be a subset of
+    #: ``fixed_pi_nodes`` (a flat prior that gets relearned is not flat) and
+    #: each must have at least one outgoing edge (its curvature comes wholly
+    #: from children).  Empty by default ⇒ every node is diagonal-Newton,
+    #: byte-identical to before.
+    action_nodes: tuple = eqx.field(static=True)
 
     @property
     def n_nodes(self) -> int:
@@ -231,6 +260,69 @@ def _feedforward_topo_order(feedforward_nodes: tuple, edges: tuple) -> tuple:
     return tuple(order)
 
 
+def _action_cone(
+    action_nodes: tuple, feedforward_nodes: tuple, edges: tuple, n_nodes: int,
+) -> dict:
+    """Per-action-node plan for assembling its full Gauss–Newton Hessian.
+
+    An action node's inference curvature is the natural metric ``H = JᵀΠJ`` of
+    the forward model ``y = f(μ_action)``, where ``J = ∂ŷ/∂μ_action`` is the
+    Jacobian of every likelihood prediction reachable from the action through
+    the *feedforward* recognition path (a free node is held fixed within the
+    coordinate step, so the derivative flows only through deterministic
+    feedforward nodes, exactly as error/curvature relay does).  ``H`` is
+    assembled by one forward pass that pushes the ``(size × d)`` tangent
+    ``Jpred = ∂ŷ/∂μ_action`` down that path — this routine returns the static
+    traversal plan so the JIT'd relaxation never re-derives the topology.
+
+    For each action node ``a`` the plan is ``(interior, leaves)``:
+
+    * ``interior`` — the feedforward nodes on paths out of ``a``, in
+      parents-before-children order; each carries the tangent onward
+      (``S_c = diag(φ'(μ_c))·Jpred_c``).
+    * ``leaves`` — the *free* nodes the cone reaches (the likelihood
+      endpoints, e.g. sensory); each contributes ``Jpred_leafᵀ Π Jpred_leaf``
+      to ``H`` and terminates that branch (a free node is not differentiated
+      through, matching the coordinate step).
+
+    Each entry lists only the **cone edges** feeding the node — those whose
+    source is the action root or an interior node — so a node with parents
+    outside the cone (held fixed) contributes no spurious tangent.
+    """
+    ff = set(int(j) for j in feedforward_nodes)
+    outgoing = _outgoing(edges, n_nodes)
+    incoming = _incoming(edges, n_nodes)
+    ff_order = _feedforward_topo_order(feedforward_nodes, edges)
+    cone: dict[int, tuple] = {}
+    for a in action_nodes:
+        # Discover the cone: walk out of the action root and out of interior
+        # feedforward nodes only; free children are likelihood leaves (not
+        # traversed further, mirroring the relay's stop at a free node).
+        interior: set[int] = set()
+        leaves: set[int] = set()
+        stack = [a]
+        while stack:
+            p = stack.pop()
+            for e in outgoing[p]:
+                c = edges[e][1]
+                if c in ff:
+                    if c not in interior:
+                        interior.add(c)
+                        stack.append(c)
+                else:
+                    leaves.add(c)
+        sources = interior | {a}
+        cone_edges = lambda node: tuple(
+            e for e in incoming[node] if edges[e][0] in sources
+        )
+        interior_plan = tuple(
+            (c, cone_edges(c)) for c in ff_order if c in interior
+        )
+        leaf_plan = tuple((L, cone_edges(L)) for L in sorted(leaves))
+        cone[a] = (interior_plan, leaf_plan)
+    return cone
+
+
 def init_pc_graph_params(
     node_sizes: tuple[int, ...],
     edges: tuple[tuple[int, int], ...],
@@ -251,6 +343,7 @@ def init_pc_graph_params(
     frozen_edges: tuple[int, ...] = (),
     feedforward_nodes: tuple[int, ...] = (),
     nlms_edges: tuple[int, ...] = (),
+    action_nodes: tuple[int, ...] = (),
 ) -> PCGraphParams:
     sizes = tuple(int(s) for s in node_sizes)
     edges = tuple((int(a), int(b)) for (a, b) in edges)
@@ -260,6 +353,7 @@ def init_pc_graph_params(
     frozen_edges = tuple(sorted(int(e) for e in frozen_edges))
     feedforward_nodes = tuple(sorted(int(j) for j in feedforward_nodes))
     nlms_edges = tuple(sorted(int(e) for e in nlms_edges))
+    action_nodes = tuple(sorted(int(j) for j in action_nodes))
     for (a, b) in edges + dyn_edges:
         if not (0 <= a < len(sizes) and 0 <= b < len(sizes)):
             raise ValueError(f"edge ({a},{b}) out of range for {len(sizes)} nodes")
@@ -284,6 +378,37 @@ def init_pc_graph_params(
     # before children) up front so the relaxation never re-derives it; a cycle
     # among feedforward nodes makes the deterministic recursion ill-defined.
     _feedforward_topo_order(feedforward_nodes, edges)
+    # Action nodes are inferred by the full Gauss–Newton natural gradient
+    # (PCGraphParams.action_nodes).  Their whole curvature is the child-relayed
+    # forward-model Hessian, so each needs an outgoing edge; their flat prior
+    # must be preserved, so each must also be a fixed-precision node; and a
+    # deterministic feedforward node is not a freely inferred cause, so the two
+    # roles are mutually exclusive.
+    _fpi = set(fixed_pi_nodes)
+    _ffn = set(feedforward_nodes)
+    _have_child = {src for (src, _d) in edges}
+    for j in action_nodes:
+        if not (0 <= j < len(sizes)):
+            raise ValueError(f"action node {j} out of range for {len(sizes)} nodes")
+        if j not in _have_child:
+            raise ValueError(
+                f"action node {j} has no outgoing edge — a flat-prior action's "
+                f"inference curvature comes entirely from its children"
+            )
+        if j not in _fpi:
+            raise ValueError(
+                f"action node {j} must also be a fixed_pi node — a flat prior "
+                f"that precision-learning overwrites is no longer flat"
+            )
+        if j in _ffn:
+            raise ValueError(
+                f"node {j} cannot be both an action node (a freely inferred "
+                f"cause) and a feedforward node (a deterministic function)"
+            )
+    # Pre-compute the feedforward cone of each action node (the sub-graph its
+    # Gauss–Newton Jacobian threads through) once, so the relaxation never
+    # re-derives it; validates the cone is well-formed up front.
+    _action_cone(action_nodes, feedforward_nodes, edges, len(sizes))
     if precision_mode not in (PRECISION_EMA, PRECISION_WELFORD):
         raise ValueError(
             f"precision_mode must be {PRECISION_EMA!r} or {PRECISION_WELFORD!r}, "
@@ -302,7 +427,7 @@ def init_pc_graph_params(
         precision_mode=precision_mode, elig_mode=bool(eligibility),
         fixed_pi_nodes=fixed_pi_nodes, bias_nodes=bias_nodes,
         frozen_edges=frozen_edges, feedforward_nodes=feedforward_nodes,
-        nlms_edges=nlms_edges,
+        nlms_edges=nlms_edges, action_nodes=action_nodes,
     )
 
 
@@ -659,6 +784,7 @@ def _graph_relax_step(
     mu: tuple, weights: tuple, pi: tuple, params: PCGraphParams,
     incoming: tuple, outgoing: tuple, hold: tuple, temporal: tuple,
     ff_set: frozenset, ff_fwd_order: tuple, ff_rev_order: tuple,
+    action_set: frozenset, action_cone: dict,
 ) -> tuple:
     """One inference sweep: ``μ_j ← μ_j − η_μ ∂F/∂μ_j / L_j`` on free dims.
 
@@ -712,9 +838,21 @@ def _graph_relax_step(
     — exactly the values a *free* node would settle to (the zero-relaxation
     limit), so error and curvature backprop through it without it absorbing the
     goal as a free latent.  This is what lets a frozen, feedforward Marr–Albus
-    granule layer carry a sensory goal back to the motor command: the command's
-    inference curvature ``L_motor`` stays strictly positive (through the
-    granule's ``curv_eff``) even with a flat action prior ``Π_motor = 0``.
+    granule layer carry a sensory goal back to the motor command.
+
+    **Action nodes** (``action_set``) are free causes carrying a flat prior
+    (``Π_j = 0``), so their entire inference curvature is the child-relayed
+    forward-model term.  The diagonal of that term is a degenerate metric for a
+    low-dimensional cause fanning into a high-gain likelihood — its step scales
+    as ``ε/‖W‖²`` and freezes as the forward model sharpens.  So an action node
+    is *not* stepped by the diagonal-Newton rule; instead its **full**
+    Gauss–Newton Hessian ``H_j = JᵀΠJ`` is assembled from the tangents pushed
+    down its feedforward cone (``action_cone``) and the step is the
+    scale-covariant minimum-norm solve ``Δμ_j = η_μ·H_j⁺ g_j``.  ``H_j⁺`` (the
+    pseudo-inverse) gives the least-squares command in the forward model's
+    range and the minimum-norm command in its null space — the correct
+    inversion of a flat-prior action, and invariant to the forward-model gain
+    (the whole point: a sharper model no longer freezes the command).
     """
     act = params.act
     N = params.n_nodes
@@ -759,6 +897,32 @@ def _graph_relax_step(
         xi[j] = phip[j] * acc
         curv[j] = phip[j] ** 2 * cacc
 
+    def _action_hessian(j: int) -> Array:
+        """Full Gauss–Newton Hessian ``H = JᵀΠJ (+ leak·I)`` of action node ``j``.
+
+        One forward pass pushes the tangent ``S`` (``∂φ/∂μ_j``, seeded as
+        ``diag(φ'(μ_j))``) down the node's feedforward cone; at each free leaf
+        the accumulated prediction-Jacobian ``Jpred`` contributes ``Jpredᵀ Π
+        Jpred``.  The ``leak·I`` term is the flat prior's minimum-norm
+        regulariser (identical to the ``+leak`` on the diagonal step).
+        """
+        d = params.node_sizes[j]
+        eye = jnp.eye(d, dtype=DTYPE)
+        interior, leaves = action_cone[j]
+        tangent = {j: phip[j][:, None] * eye}    # (size_j, d) = diag(φ'(μ_j))
+        for c, cone_edges in interior:
+            jp = jnp.zeros((params.node_sizes[c], d), DTYPE)
+            for e in cone_edges:
+                jp = jp + weights[e] @ tangent[params.edges[e][0]]
+            tangent[c] = phip[c][:, None] * jp
+        H = params.leak * eye
+        for leaf, cone_edges in leaves:
+            jp = jnp.zeros((params.node_sizes[leaf], d), DTYPE)
+            for e in cone_edges:
+                jp = jp + weights[e] @ tangent[params.edges[e][0]]
+            H = H + jp.T @ (pi[leaf][:, None] * jp)
+        return H
+
     # Update free nodes by the curvature-preconditioned gradient step.
     new_mu = list(mu)
     for j in range(N):
@@ -780,8 +944,16 @@ def _graph_relax_step(
             L = L + phip[j] ** 2 * cu
         g = g + params.leak * mu[j]
         L = L + params.leak
-        # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
-        updated = mu[j] - params.eta_mu * g / (L + tiny)
+        if j in action_set:
+            # Flat-prior action: the diagonal metric ``L`` is degenerate (step
+            # ∝ ε/‖W‖², freezes as the model sharpens).  Step by the full
+            # Gauss–Newton natural gradient, scale-covariant via the
+            # (minimum-norm) pseudo-inverse of ``H = JᵀΠJ``.
+            H = _action_hessian(j)
+            updated = mu[j] - params.eta_mu * (jnp.linalg.pinv(H) @ g)
+        else:
+            # Diagonal-Newton step: divide by the curvature ⇒ stable for any Π.
+            updated = mu[j] - params.eta_mu * g / (L + tiny)
         # Free dimensions descend the gradient; held ones keep their value.
         new_mu[j] = jnp.where(hold[j], mu[j], updated)
     return tuple(new_mu)
@@ -841,6 +1013,10 @@ def pc_graph_relax(
     ff_set = frozenset(params.feedforward_nodes)
     ff_fwd_order = _feedforward_topo_order(params.feedforward_nodes, params.edges)
     ff_rev_order = tuple(reversed(ff_fwd_order))
+    action_set = frozenset(params.action_nodes)
+    action_cone = _action_cone(
+        params.action_nodes, params.feedforward_nodes, params.edges, params.n_nodes,
+    )
     weights, pi = state.weights, state.pi
     # Constant additive drive on each node across the sweep: the temporal-edge
     # prediction (μ_prev frozen) plus the node bias (an always-on unit).  Both
@@ -852,7 +1028,7 @@ def pc_graph_relax(
     def body(_, mu):
         return _graph_relax_step(
             mu, weights, pi, params, incoming, outgoing, hold, temporal,
-            ff_set, ff_fwd_order, ff_rev_order,
+            ff_set, ff_fwd_order, ff_rev_order, action_set, action_cone,
         )
 
     mu = jax.lax.fori_loop(0, steps, body, state.mu)
@@ -1294,17 +1470,26 @@ def init_region_graph(
         tuple(sizes), edges_t, dyn_edges=tuple(dyn_edges),
         # The motor node is the action variable of active inference: its flat
         # prior must not be overwritten by precision learning (see
-        # PCGraphParams.fixed_pi_nodes / core.pc_active.set_action_prior).
+        # PCGraphParams.fixed_pi_nodes / core.pc_active.set_action_prior), and
+        # it is inferred by the full Gauss–Newton natural gradient rather than
+        # the diagonal-Newton step — the diagonal metric of a low-D flat-prior
+        # command fanning into the sharp motor→cerebellum→sensory forward model
+        # is degenerate and freezes the command as the model sharpens (see
+        # PCGraphParams.action_nodes).
         fixed_pi_nodes=(R["motor"],),
+        action_nodes=(R["motor"],),
         bias_nodes=bias_nodes,
         frozen_edges=frozen_edges,
         feedforward_nodes=feedforward_nodes,
         nlms_edges=nlms_edges,
         **graph_kwargs,
     )
-    k_state, k_granule = split_key(key, 2)
-    state = init_pc_graph_state(k_state, params)
+    state = init_pc_graph_state(key, params)
     if marr_albus_cerebellum:
+        # Independent key for the fixed granule expansion, derived by fold_in so
+        # the generative-edge RNG stream of init_pc_graph_state is byte-identical
+        # whether or not the expansion is applied (off ⇒ unchanged graph).
+        k_granule = jax.random.fold_in(key, 0xCB)
         state = apply_granule_expansion_init(
             state, params, R["motor"], R["cerebellum"], k_granule, gain=granule_gain,
         )

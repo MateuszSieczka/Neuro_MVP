@@ -91,11 +91,13 @@ def set_action_prior(
     are inferred purely to satisfy the preferred outcome (Friston 2010).
     A nonzero prior precision would regularise the inferred command toward
     0 and bias reaching, so the prior is genuinely **flat** (Π = 0).  This
-    is admissible only because the relaxation is curvature-preconditioned
-    *and* the action node has a child (the forward-model edge
-    ``motor→cerebellum``): its inference curvature ``L = Π + φ'²·Σ_child W²Π``
-    is then strictly positive even at Π = 0, so the step stays finite — the
-    old ``1e-3`` floor (a magic stabiliser) is no longer needed.  Pair with
+    is admissible because the action node is stepped by the full Gauss–Newton
+    natural gradient (:attr:`core.pc_graph.PCGraphParams.action_nodes`): its
+    curvature is the child-relayed forward-model Hessian ``H = JᵀΠJ``, solved
+    by a scale-covariant pseudo-inverse, which stays well-posed at Π = 0 (the
+    forward-model edge ``motor→cerebellum→sensory`` supplies the metric) and,
+    unlike the diagonal-Newton step, does not freeze the command as the model
+    sharpens.  Pair with ``action_nodes`` (the full-GN metric) and
     ``fixed_pi_nodes`` (the node must not have its precision learned back,
     :func:`core.pc_graph.pc_graph_learn`), else the first learning step
     overwrites this flat prior.

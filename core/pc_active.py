@@ -94,18 +94,20 @@ def set_action_prior(
     orders of magnitude below the outcome precision (see
     :data:`core.pc_brain.MOTOR_EFFORT_PRECISION`) and it is sub-dominant to the
     goal once the forward model has any gain — the reach is unbiased — while it
-    floors the action's Gauss–Newton Hessian ``H = JᵀΠJ + effort·I ⪰ effort·I``
-    so the command can never freeze on the tanh saturation rails, where φ'→0
-    collapses the Jacobian and a strictly flat Π = 0 would leave ``H``
-    singular.  The action is stepped by the full Gauss–Newton natural gradient
-    (:attr:`core.pc_graph.PCGraphParams.action_nodes`), scale-covariant via the
-    pseudo-inverse, so — unlike the diagonal-Newton step — the command does not
-    vanish as the forward model sharpens.  Pair with ``action_nodes`` (the
-    full-GN metric) and ``fixed_pi_nodes`` (the node must not have its precision
-    learned back, :func:`core.pc_graph.pc_graph_learn`), else the first learning
-    step overwrites the effort prior.  ``precision=0`` gives a strictly flat
-    prior (admissible, but then only the goal/leaf curvature keeps ``H``
-    non-singular — an all-saturated command can stall).
+    floors the action's block Gauss–Newton Hessian ``H = JᵀΠJ + effort·I ⪰
+    effort·I`` so the command can never freeze on the tanh saturation rails,
+    where φ'→0 collapses the Jacobian and a strictly flat Π = 0 would leave
+    ``H`` singular.  A small Π is also what makes the relaxation route this node
+    to the *full* block Gauss–Newton solve rather than the diagonal-Newton step
+    (its own precision does not dominate the child-relay curvature — see
+    :func:`core.pc_graph._graph_relax_step`), scale-covariant via the
+    pseudo-inverse, so — unlike the diagonal step — the command does not vanish
+    as the forward model sharpens.  The metric is chosen at runtime from Π, not
+    a builder tag; pair only with ``fixed_pi_nodes`` (the node must not have its
+    precision learned back, :func:`core.pc_graph.pc_graph_learn`), else the
+    first learning step overwrites the effort prior.  ``precision=0`` gives a
+    strictly flat prior (admissible, but then only the goal/leaf curvature keeps
+    ``H`` non-singular — an all-saturated command can stall).
     """
     pi = list(state.pi)
     pi[motor_idx] = jnp.full_like(pi[motor_idx], jnp.asarray(precision, DTYPE))

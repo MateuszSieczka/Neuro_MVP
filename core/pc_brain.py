@@ -107,8 +107,9 @@ def init_pc_brain(
     # Action node carries a weak effort prior (active inference: the command is
     # inferred to satisfy preferences and has no prior *preference* of its own,
     # only a small zero-mean motor-cost precision — Friston 2010; Todorov 2004).
-    # Set once at construction (U.5); kept fixed by ``fixed_pi_nodes`` and used
-    # by the full Gauss–Newton action step (``action_nodes``).
+    # Set once at construction (U.5); kept fixed by ``fixed_pi_nodes``.  Its
+    # small Π is what routes the motor node to the full block Gauss–Newton solve
+    # at runtime (no action tag — see core.pc_graph._graph_relax_step).
     gs = set_action_prior(gs, REGION_INDEX["motor"], precision=MOTOR_EFFORT_PRECISION)
     params = PCBrainParams(
         graph=gp,
